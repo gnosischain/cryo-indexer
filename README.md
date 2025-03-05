@@ -1,4 +1,4 @@
-# Cryo Indexer with Multi-Mode Support
+# Cryo Indexer
 
 ![Cryo Indexer Header](img/header-cryo-indexer.png)
 
@@ -8,9 +8,9 @@ A service for continuously indexing blockchain data using Cryo and storing it in
 
 Cryo Indexer extracts blockchain data using the [Cryo](https://github.com/paradigmxyz/cryo) tool and stores it in a ClickHouse database for easy querying and analysis. It supports automatic handling of chain reorganizations and can extract various types of blockchain data such as blocks, transactions, logs, and more.
 
-## New Multi-Mode Functionality
+## Multi-Mode Functionality
 
-The enhanced Cryo Indexer now supports running multiple instances with different dataset configurations and starting blocks. This enables the following capabilities:
+The cryo indexer supports running multiple instances with different dataset configurations and starting blocks. This enables the following capabilities:
 
 - Run different datasets in separate processes to balance resource usage
 - Start different dataset types from different block heights
