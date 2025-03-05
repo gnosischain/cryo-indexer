@@ -112,8 +112,8 @@ class IndexerSettings:
             
             # Mode for all transaction-related data
             "tx_data": IndexerMode(
-                name="tx_data",
-                datasets=["blocks", "transactions", "logs", "contracts", "native_transfers"],
+                name="tx_data", 
+                datasets=["blocks", "transactions", "logs", "contracts", "traces", "native_transfers"],
                 start_block=0,
                 description="Index all transaction-related data"
             ),

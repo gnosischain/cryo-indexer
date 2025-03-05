@@ -1,4 +1,4 @@
-.PHONY: build run-migrations run-indexer stop-indexer logs clean help force-migrations run-state run-traces run-tokens run-multi stop-multi
+.PHONY: build run-migrations run-indexer stop-indexer logs clean help force-migrations run-state run-traces run-tokens run-multi stop-multi purge-volumes purge-all purge-state purge-indexer purge-migrations
 
 # Default environment file
 ENV_FILE := .env
@@ -25,6 +25,12 @@ help:
 	@echo "  make logs             - View logs from the indexer"
 	@echo "  make logs-service S=<service> - View logs for a specific service"
 	@echo "  make clean            - Remove all containers and volumes"
+	@echo ""
+	@echo "Volume Management Commands:"
+	@echo "  make purge-all         - Delete all Docker volumes (complete reset)"
+	@echo "  make purge-indexer     - Delete only the default indexer volumes"
+	@echo "  make purge-state       - Delete only the state diffs indexer volumes"
+	@echo "  make purge-migrations  - Delete only the migrations volumes"
 
 build:
 	@echo "Building Docker containers..."
@@ -96,3 +102,67 @@ clean:
 	docker compose -f docker-compose.tokens.yml down -v
 	docker compose -f docker-compose.multi.yml down -v
 	@echo "Cleanup complete."
+
+# Volume purge commands
+purge-indexer:
+	@echo "Stopping default indexer containers..."
+	docker compose down
+	@echo "Deleting default indexer volumes..."
+	docker volume rm -f cryo-indexer_indexer_data cryo-indexer_indexer_logs cryo-indexer_indexer_state
+	@echo "Default indexer volumes purged."
+
+purge-state:
+	@echo "Stopping state diffs indexer containers..."
+	docker compose -f docker-compose.state.yml down
+	@echo "Deleting state diffs indexer volumes..."
+	docker volume rm -f cryo-indexer_state_data cryo-indexer_state_logs cryo-indexer_state_state
+	@echo "State diffs indexer volumes purged."
+
+purge-traces:
+	@echo "Stopping traces indexer containers..."
+	docker compose -f docker-compose.traces.yml down
+	@echo "Deleting traces indexer volumes..."
+	docker volume rm -f cryo-indexer_traces_data cryo-indexer_traces_logs cryo-indexer_traces_state
+	@echo "Traces indexer volumes purged."
+
+purge-tokens:
+	@echo "Stopping tokens indexer containers..."
+	docker compose -f docker-compose.tokens.yml down
+	@echo "Deleting tokens indexer volumes..."
+	docker volume rm -f cryo-indexer_tokens_data cryo-indexer_tokens_logs cryo-indexer_tokens_state
+	@echo "Tokens indexer volumes purged."
+
+purge-migrations:
+	@echo "Stopping migration containers..."
+	docker compose -f docker-compose.migrations.yml down
+	@echo "Deleting migration volumes..."
+	docker volume rm -f cryo-indexer_migration_data cryo-indexer_migration_logs cryo-indexer_migration_state
+	@echo "Migration volumes purged."
+
+purge-all:
+	@echo "Stopping all containers..."
+	docker compose down -v || true
+	docker compose -f docker-compose.migrations.yml down -v || true
+	docker compose -f docker-compose.state.yml down -v || true
+	docker compose -f docker-compose.traces.yml down -v || true
+	docker compose -f docker-compose.tokens.yml down -v || true
+	docker compose -f docker-compose.multi.yml down -v || true
+	
+	@echo "Forcibly removing any remaining containers..."
+	docker ps -a | grep 'cryo-' | awk '{print $$1}' | xargs -r docker rm -f || true
+	
+	@echo "Deleting all Docker volumes..."
+	@sleep 2  # Give Docker a moment to clean up
+	docker volume ls -q | grep cryo-indexer | xargs -r docker volume rm -f || true
+	
+	@if [ $$(docker volume ls -q | grep cryo-indexer | wc -l) -gt 0 ]; then \
+		echo "Some volumes could not be removed. Trying with force..."; \
+		docker volume ls -q | grep cryo-indexer | xargs -r docker volume rm -f; \
+	fi
+	
+	@if [ $$(docker volume ls -q | grep cryo-indexer | wc -l) -gt 0 ]; then \
+		echo "WARNING: Some volumes still remain and might require manual Docker pruning"; \
+		echo "You can try: docker system prune -a --volumes"; \
+	else \
+		echo "All volumes successfully purged. The system has been completely reset."; \
+	fi
