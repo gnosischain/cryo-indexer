@@ -1,14 +1,14 @@
 services:
-  # Main indexer service - configurable via environment variables
-  cryo-indexer:
+  # Token Data Indexer (ERC20 & ERC721)
+  cryo-indexer-tokens:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: cryo-indexer
+    container_name: cryo-indexer-tokens
     volumes:
-      - indexer_data:/app/data
-      - indexer_logs:/app/logs
-      - indexer_state:/app/state
+      - tokens_data:/app/data
+      - tokens_logs:/app/logs
+      - tokens_state:/app/state
       - ./migrations:/app/migrations
     environment:
       - ETH_RPC_URL=${ETH_RPC_URL}
@@ -22,14 +22,15 @@ services:
       - POLL_INTERVAL=${POLL_INTERVAL:-15}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - CHAIN_ID=${CHAIN_ID:-1}
-      - START_BLOCK=${START_BLOCK:-0}
+      - START_BLOCK=${TOKENS_START_BLOCK:-0}  # Default to block 0 for token data
       - MAX_BLOCKS_PER_BATCH=${MAX_BLOCKS_PER_BATCH:-1000}
       - OPERATION_MODE=scraper
-      - INDEXER_MODE=${INDEXER_MODE:-default}
-      - DATASETS=${DATASETS:-blocks,transactions,logs}
+      - INDEXER_MODE=custom  # Custom mode with specified datasets
+      - DATASETS=erc20_transfers,erc20_metadata,erc721_transfers,erc721_metadata
+      - INDEXER_STATE_FILE=indexer_state_tokens.json
     restart: unless-stopped
 
 volumes:
-  indexer_data:
-  indexer_logs:
-  indexer_state:
+  tokens_data:
+  tokens_logs:
+  tokens_state:

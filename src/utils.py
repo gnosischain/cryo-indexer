@@ -31,38 +31,48 @@ def setup_logging(log_level: str, log_dir: str) -> None:
     
     logger.info(f"Logging initialized at level {log_level}")
 
-def load_state(state_dir: str) -> Dict[str, Any]:
+def load_state(state_dir: str, state_file: Optional[str] = None) -> Dict[str, Any]:
     """Load indexer state from file."""
-    state_file = os.path.join(state_dir, "indexer_state.json")
+    if state_file:
+        file_path = os.path.join(state_dir, state_file)
+    else:
+        file_path = os.path.join(state_dir, "indexer_state.json")
+    
     try:
-        if os.path.exists(state_file):
-            with open(state_file, 'r') as f:
+        if os.path.exists(file_path):
+            with open(file_path, 'r') as f:
                 return json.load(f)
         else:
-            logger.warning(f"State file {state_file} not found, initializing with default state")
+            logger.warning(f"State file {file_path} not found, initializing with default state")
             return {
                 'last_block': 0,
                 'last_indexed_timestamp': 0,
-                'chain_id': 1
+                'chain_id': 1,
+                'mode': 'default'
             }
     except Exception as e:
-        logger.error(f"Error loading state: {e}")
+        logger.error(f"Error loading state from {file_path}: {e}")
         return {
             'last_block': 0,
             'last_indexed_timestamp': 0,
-            'chain_id': 1
+            'chain_id': 1,
+            'mode': 'default'
         }
 
-def save_state(state: Dict[str, Any], state_dir: str) -> None:
+def save_state(state: Dict[str, Any], state_dir: str, state_file: Optional[str] = None) -> None:
     """Save indexer state to file."""
-    state_file = os.path.join(state_dir, "indexer_state.json")
+    if state_file:
+        file_path = os.path.join(state_dir, state_file)
+    else:
+        file_path = os.path.join(state_dir, "indexer_state.json")
+    
     try:
         os.makedirs(state_dir, exist_ok=True)
-        with open(state_file, 'w') as f:
+        with open(file_path, 'w') as f:
             json.dump(state, f, indent=2)
-        logger.debug(f"State saved: last_block={state.get('last_block', 0)}")
+        logger.debug(f"State saved to {file_path}: last_block={state.get('last_block', 0)}, mode={state.get('mode', 'default')}")
     except Exception as e:
-        logger.error(f"Error saving state: {e}")
+        logger.error(f"Error saving state to {file_path}: {e}")
 
 def find_parquet_files(data_dir: str, dataset: str) -> List[str]:
     """Find all parquet files for a dataset in the data directory."""
@@ -148,3 +158,20 @@ def parse_dataset_name_from_file(file_path: str) -> str:
             return dataset
     
     return "unknown"
+
+def list_modes() -> None:
+    """Utility function to list all available indexer modes."""
+    try:
+        from .config import settings
+        
+        print("Available indexer modes:")
+        print("=" * 80)
+        
+        for name, mode in settings.get_available_modes().items():
+            print(f"Mode: {name}")
+            print(f"  Description: {mode.description}")
+            print(f"  Datasets: {', '.join(mode.datasets)}")
+            print(f"  Start Block: {mode.start_block}")
+            print("-" * 80)
+    except ImportError:
+        print("Could not import settings. Make sure you're running this from the correct directory.")

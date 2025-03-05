@@ -173,6 +173,10 @@ if [ ! -d "/app/migrations" ]; then
     exit 1
 fi
 
+# List migration files
+echo "Available migration files:"
+ls -la /app/migrations/
+
 # Test connection to ClickHouse before proceeding
 echo "Testing connection to ClickHouse..."
 if execute_query "SELECT 1"; then
@@ -200,7 +204,20 @@ fi
 
 echo "Found $(echo "$migration_files" | wc -l) migration files to process"
 
+# First create migrations table if needed
+echo "Creating migrations table if it doesn't exist..."
+execute_query "CREATE TABLE IF NOT EXISTS ${CLICKHOUSE_DATABASE}.migrations
+(
+    name String,
+    executed_at DateTime DEFAULT now(),
+    success UInt8 DEFAULT 1
+) 
+ENGINE = MergeTree()
+ORDER BY name;"
+
+# Process each migration file
 for file in $migration_files; do
+    echo "Processing file: $file"
     if ! execute_file "$file"; then
         echo "ERROR: Migration failed for file: $file"
         exit 5

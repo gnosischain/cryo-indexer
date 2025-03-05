@@ -6,12 +6,10 @@ services:
       dockerfile: Dockerfile
     container_name: cryo-migrations
     volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./state:/app/state
+      - migration_data:/app/data
+      - migration_logs:/app/logs
+      - migration_state:/app/state
       - ./migrations:/app/migrations
-      - ./scripts/entrypoint.sh:/app/entrypoint.sh
-      - ./scripts/run_migrations.sh:/app/scripts/run_migrations.sh
     environment:
       - ETH_RPC_URL=${ETH_RPC_URL}
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
@@ -25,3 +23,8 @@ services:
       - FORCE_RUN_MIGRATIONS=${FORCE_RUN_MIGRATIONS:-false}
     # This service is intended to run once and exit
     restart: "no"
+
+volumes:
+  migration_data:
+  migration_logs:
+  migration_state:

@@ -18,6 +18,7 @@ echo "START_BLOCK: ${START_BLOCK:-0}"
 echo "MAX_BLOCKS_PER_BATCH: ${MAX_BLOCKS_PER_BATCH:-1000}"
 echo "DATASETS: ${DATASETS_BACKUP}"
 echo "OPERATION_MODE: ${OPERATION_MODE:-scraper}"
+echo "INDEXER_MODE: ${INDEXER_MODE:-custom}"
 
 # Verify that required environment variables are set
 if [ -z "$ETH_RPC_URL" ]; then
@@ -60,62 +61,39 @@ cryo --version
 # Create state directory
 mkdir -p /app/state
 
-# Migration state file to track if migrations have been applied
+# Create a unique state file for each indexer mode
+INDEXER_ID="${INDEXER_MODE:-custom}"
 MIGRATION_STATE_FILE="/app/state/migrations_applied"
+INDEXER_STATE_FILE="/app/state/indexer_state_${INDEXER_ID}.json"
 
-# Function to check if ClickHouse database and migration table exists
-check_database_exists() {
-    echo "Checking if database and migrations exist..."
-    
-    # Check if database exists
-    local db_result=$(curl -s -X POST "${protocol}://${CLICKHOUSE_HOST}:${port}" \
+echo "Using state file: ${INDEXER_STATE_FILE}"
+
+# Create the state file if it doesn't exist
+if [ ! -f "$INDEXER_STATE_FILE" ]; then
+    echo "Creating new state file for indexer mode: ${INDEXER_ID}"
+    echo '{
+        "last_block": 0,
+        "last_indexed_timestamp": 0,
+        "chain_id": 1,
+        "mode": "'"${INDEXER_ID}"'"
+    }' > "$INDEXER_STATE_FILE"
+fi
+
+# Function to create database if it doesn't exist
+create_database() {
+    echo "Creating database ${CLICKHOUSE_DATABASE} if it doesn't exist..."
+    curl -s -X POST "${protocol}://${CLICKHOUSE_HOST}:${port}" \
         -u "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}" \
         -H "Content-Type: application/x-www-form-urlencoded" \
-        --data-binary "SELECT count() FROM system.databases WHERE name = '${CLICKHOUSE_DATABASE}'")
-    
-    echo "Database check result: $db_result"
-    
-    if [[ "$db_result" == *"1"* ]]; then
-        echo "Database ${CLICKHOUSE_DATABASE} exists"
-        
-        # Database exists, check if migrations table exists
-        local table_result=$(curl -s -X POST "${protocol}://${CLICKHOUSE_HOST}:${port}" \
-            -u "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}" \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            --data-binary "SELECT count() FROM system.tables WHERE database = '${CLICKHOUSE_DATABASE}' AND name = 'migrations'")
-        
-        echo "Migration table check result: $table_result"
-        
-        if [[ "$table_result" == *"1"* ]]; then
-            echo "Migrations table exists"
-            
-            # Migrations table exists, check if any migrations have been applied
-            local count_result=$(curl -s -X POST "${protocol}://${CLICKHOUSE_HOST}:${port}" \
-                -u "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}" \
-                -H "Content-Type: application/x-www-form-urlencoded" \
-                --data-binary "SELECT count() FROM ${CLICKHOUSE_DATABASE}.migrations")
-            
-            echo "Migration count result: $count_result"
-            
-            if [[ "$count_result" =~ [0-9]+ ]] && [ ${count_result//[!0-9]/} -gt 0 ]; then
-                echo "Database and migration table exist with ${count_result//[!0-9]/} migrations"
-                return 0
-            else
-                echo "Migrations table exists but is empty"
-            fi
-        else
-            echo "Migrations table does not exist"
-        fi
-    else
-        echo "Database ${CLICKHOUSE_DATABASE} does not exist"
-    fi
-    
-    return 1
+        --data-binary "CREATE DATABASE IF NOT EXISTS ${CLICKHOUSE_DATABASE}"
 }
 
 # Function to run database migrations
 run_migrations() {
     echo "Running database migrations..."
+    
+    # Create database first if it doesn't exist
+    create_database
     
     # Use set +e to prevent script from exiting on migration failure
     set +e
@@ -144,16 +122,45 @@ check_migrations() {
     
     echo "No migration state file found or it's empty"
     
-    # If state file doesn't exist or is empty, check the database
-    if check_database_exists; then
-        # If database has migrations, create the state file
-        echo "$(date -u)" > "$MIGRATION_STATE_FILE"
-        echo "Database already has migrations - marking as applied"
-        return 0
+    # Check if the database exists
+    local db_result=$(curl -s -X POST "${protocol}://${CLICKHOUSE_HOST}:${port}" \
+        -u "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        --data-binary "SELECT count() FROM system.databases WHERE name = '${CLICKHOUSE_DATABASE}'")
+    
+    echo "Database check result: $db_result"
+    
+    if [[ "$db_result" == *"1"* ]]; then
+        echo "Database ${CLICKHOUSE_DATABASE} exists"
+        
+        # Check if migrations table exists
+        local table_result=$(curl -s -X POST "${protocol}://${CLICKHOUSE_HOST}:${port}" \
+            -u "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-binary "SELECT count() FROM system.tables WHERE database = '${CLICKHOUSE_DATABASE}' AND name = 'migrations'")
+        
+        echo "Migration table check result: $table_result"
+        
+        if [[ "$table_result" == *"1"* ]]; then
+            echo "Migrations table exists"
+            
+            # Check if any migrations have been applied
+            local count_result=$(curl -s -X POST "${protocol}://${CLICKHOUSE_HOST}:${port}" \
+                -u "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}" \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                --data-binary "SELECT count() FROM ${CLICKHOUSE_DATABASE}.migrations")
+            
+            echo "Migration count result: $count_result"
+            
+            if [[ "$count_result" =~ [0-9]+ ]] && [ ${count_result//[!0-9]/} -gt 0 ]; then
+                echo "Database and migration table exist with ${count_result//[!0-9]/} migrations"
+                echo "$(date -u)" > "$MIGRATION_STATE_FILE"
+                return 0
+            fi
+        fi
     fi
     
-    # No state file and no migrations in database
-    echo "No migrations have been applied"
+    # No migrations found
     return 1
 }
 
@@ -172,6 +179,7 @@ case "${OPERATION_MODE}" in
         elif check_migrations; then
             echo "Migrations already applied. Set FORCE_RUN_MIGRATIONS=true to run again if needed."
         else
+            echo "Running migrations now..."
             run_migrations
             migration_exit_code=$?
             if [ $migration_exit_code -ne 0 ]; then
@@ -195,17 +203,22 @@ case "${OPERATION_MODE}" in
         echo "Starting indexer in scraper mode..."
         cd /app
         
-        # Detect available Python command and explicitly set DATASETS environment variable
-        if command -v python3 &> /dev/null; then
-            echo "Using python3 command"
-            DATASETS="$DATASETS_BACKUP" python3 -m src.indexer
-        elif command -v python &> /dev/null; then
-            echo "Using python command"
-            DATASETS="$DATASETS_BACKUP" python -m src.indexer
-        else
-            echo "ERROR: No Python command found"
-            exit 3
+        # Set environment variables for the indexer
+        export INDEXER_STATE_FILE="$INDEXER_STATE_FILE"
+        
+        # Detect available Python command and explicitly set environment variables
+        PYTHON_CMD="python3"
+        if ! command -v python3 &> /dev/null; then
+            if command -v python &> /dev/null; then
+                PYTHON_CMD="python"
+            else
+                echo "ERROR: No Python command found"
+                exit 3
+            fi
         fi
+        
+        echo "Using ${PYTHON_CMD} command"
+        DATASETS="$DATASETS_BACKUP" INDEXER_MODE="${INDEXER_MODE:-custom}" $PYTHON_CMD -m src.indexer
         ;;
         
     *)

@@ -21,6 +21,12 @@ class CryoIndexer:
         # Set up logging
         setup_logging(settings.log_level, settings.log_dir)
         
+        # Get the current indexer mode
+        current_mode = settings.get_current_mode()
+        logger.info(f"Starting indexer in mode: {current_mode.name} - {current_mode.description}")
+        logger.info(f"Datasets to index: {current_mode.datasets}")
+        logger.info(f"Start block for this mode: {current_mode.start_block}")
+        
         # Initialize components
         self.blockchain = BlockchainClient(settings.eth_rpc_url)
         self.clickhouse = ClickHouseManager(
@@ -36,19 +42,37 @@ class CryoIndexer:
         os.makedirs(settings.data_dir, exist_ok=True)
         os.makedirs(settings.state_dir, exist_ok=True)
         
-        # Load state
-        self.state = load_state(settings.state_dir)
+        # Use a mode-specific state file if provided in environment
+        state_file = os.environ.get("INDEXER_STATE_FILE")
+        if state_file:
+            logger.info(f"Using custom state file: {state_file}")
+            self.state_file = state_file
+        else:
+            # Otherwise, create a state file specific to this mode
+            self.state_file = os.path.join(settings.state_dir, f"indexer_state_{current_mode.name}.json")
+            logger.info(f"Using mode-specific state file: {self.state_file}")
         
-        # Initialize last block if it's 0
+        # Load state for this specific mode
+        self.state = load_state(settings.state_dir, state_file=os.path.basename(self.state_file))
+        
+        # Add mode info to state if not present
+        if "mode" not in self.state:
+            self.state["mode"] = current_mode.name
+        
+        # Initialize last block based on both database state and mode's preferred start block
         if self.state['last_block'] == 0:
-            current_last_block = self.clickhouse.get_latest_processed_block()
-            start_override = settings.start_block
-            self.state['last_block'] = max(current_last_block, start_override)
-            save_state(self.state, settings.state_dir)
+            current_last_block = 0
+            
+            # Only check database if we might need to continue from there
+            if current_mode.start_block == 0:
+                current_last_block = self._get_latest_block_for_datasets(current_mode.datasets)
+            
+            # Use the higher of mode's start block or last indexed block
+            self.state['last_block'] = max(current_last_block, current_mode.start_block)
+            save_state(self.state, settings.state_dir, state_file=os.path.basename(self.state_file))
         
         logger.info(f"Indexer initialized with state: {self.state}")
         logger.info(f"Using data directory: {settings.data_dir}")
-        logger.info(f"Using datasets: {settings.datasets}")
         
         # Verify Cryo installation
         self._verify_cryo()
@@ -74,9 +98,59 @@ class CryoIndexer:
             logger.error(f"Error verifying Cryo: {e}")
             raise
     
+    def _get_latest_block_for_datasets(self, datasets: List[str]) -> int:
+        """Get the latest block number for the specified datasets."""
+        max_block = 0
+        
+        # Map of dataset names to corresponding ClickHouse tables
+        dataset_to_table = {
+            "blocks": "blocks", 
+            "transactions": "transactions", 
+            "txs": "transactions", 
+            "logs": "logs", 
+            "events": "logs", 
+            "contracts": "contracts", 
+            "native_transfers": "native_transfers", 
+            "traces": "traces", 
+            "balance_diffs": "balance_diffs", 
+            "code_diffs": "code_diffs", 
+            "nonce_diffs": "nonce_diffs", 
+            "storage_diffs": "storage_diffs", 
+            "slot_diffs": "storage_diffs", 
+            "balance_reads": "balance_reads", 
+            "code_reads": "code_reads", 
+            "storage_reads": "storage_reads", 
+            "slot_reads": "storage_reads", 
+            "erc20_transfers": "erc20_transfers", 
+            "erc20_metadata": "erc20_metadata", 
+            "erc721_transfers": "erc721_transfers", 
+            "erc721_metadata": "erc721_metadata"
+        }
+        
+        # For each dataset, check the corresponding table in ClickHouse
+        for dataset in datasets:
+            table_name = dataset_to_table.get(dataset)
+            if not table_name:
+                logger.warning(f"Unknown dataset '{dataset}', skipping in block height check")
+                continue
+            
+            try:
+                # Query the table to find the max block number
+                block = self.clickhouse.get_latest_block_for_table(table_name)
+                if block > max_block:
+                    max_block = block
+                    logger.info(f"Found latest block {block} in table {table_name}")
+            except Exception as e:
+                logger.warning(f"Error checking latest block for {dataset}: {e}")
+        
+        return max_block
+    
     def run(self) -> None:
         """Main loop that continuously indexes new blocks."""
         logger.info("Starting indexer...")
+        
+        # Get the current mode
+        current_mode = settings.get_current_mode()
         
         while True:
             try:
@@ -103,7 +177,8 @@ class CryoIndexer:
                     # Update state
                     self.state['last_block'] = end_block + 1
                     self.state['last_indexed_timestamp'] = int(time.time())
-                    save_state(self.state, settings.state_dir)
+                    self.state['mode'] = current_mode.name
+                    save_state(self.state, settings.state_dir, state_file=os.path.basename(self.state_file))
                 else:
                     logger.info(f"No new blocks to process. Waiting {settings.poll_interval} seconds...")
                 
@@ -144,7 +219,7 @@ class CryoIndexer:
                 if success:
                     # Update our state
                     self.state['last_block'] = common_ancestor
-                    save_state(self.state, settings.state_dir)
+                    save_state(self.state, settings.state_dir, state_file=os.path.basename(self.state_file))
                     logger.info(f"Successfully rolled back to block {common_ancestor}")
                 else:
                     logger.error("Failed to roll back database during reorg handling")
@@ -158,11 +233,14 @@ class CryoIndexer:
             # Clean up data directory before starting
             self._clean_data_directory()
             
+            # Get the current mode
+            current_mode = settings.get_current_mode()
+            
             # Run Cryo to extract the data
-            self._run_cryo(start_block, end_block)
+            self._run_cryo(start_block, end_block, current_mode.datasets)
             
             # Load the extracted data to ClickHouse
-            self._load_to_clickhouse()
+            self._load_to_clickhouse(current_mode.datasets)
             
         except Exception as e:
             logger.error(f"Error processing blocks {start_block}-{end_block}: {e}", exc_info=True)
@@ -186,8 +264,8 @@ class CryoIndexer:
         except Exception as e:
             logger.warning(f"Error cleaning data directory: {e}", exc_info=True)
     
-    def _run_cryo(self, start_block: int, end_block: int) -> None:
-        """Run Cryo to extract blockchain data."""
+    def _run_cryo(self, start_block: int, end_block: int, datasets: List[str]) -> None:
+        """Run Cryo to extract blockchain data for specified datasets."""
         try:
             # Process smaller batch sizes for more reliability
             batch_size = min(100, end_block - start_block + 1)
@@ -201,7 +279,7 @@ class CryoIndexer:
                 # Build the command
                 cmd = [
                     "cryo",
-                    *settings.datasets,
+                    *datasets,
                     "--blocks", format_block_range(current_start, current_end),
                     "--output-dir", settings.data_dir,
                     "--rpc", settings.eth_rpc_url,
@@ -234,7 +312,7 @@ class CryoIndexer:
                 except subprocess.TimeoutExpired:
                     logger.warning(f"Cryo command timed out for blocks {current_start}-{current_end}, retrying with --requests-per-second 5")
                     # Try again with lower rate limit
-                    cmd = [c if c != "10" else "5" for c in cmd]
+                    cmd = [c if c != "1000" else "5" for c in cmd]
                     process = subprocess.run(
                         cmd,
                         check=False,
@@ -248,7 +326,7 @@ class CryoIndexer:
                 if process.returncode != 0:
                     logger.error(f"Cryo error: {process.stderr}")
                     # Check if files were created despite the error
-                    created_files = find_parquet_files(settings.data_dir, settings.datasets[0])
+                    created_files = find_parquet_files(settings.data_dir, datasets[0])
                     if created_files:
                         logger.warning("Cryo reported an error but did produce some output files. Continuing.")
                     else:
@@ -264,14 +342,14 @@ class CryoIndexer:
             logger.error(f"Error running Cryo: {e}", exc_info=True)
             raise
     
-    def _load_to_clickhouse(self) -> None:
+    def _load_to_clickhouse(self, datasets: List[str]) -> None:
         """Load extracted data files to ClickHouse."""
         total_rows = 0
         files_processed = 0
         files_failed = 0
         
         # Process each dataset
-        for dataset in settings.datasets:
+        for dataset in datasets:
             files = find_parquet_files(settings.data_dir, dataset)
             
             if not files:

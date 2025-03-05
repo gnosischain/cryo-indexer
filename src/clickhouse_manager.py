@@ -361,3 +361,32 @@ class ClickHouseManager:
         except Exception as e:
             logger.error(f"Error running migrations: {e}")
             return False
+        
+
+    def get_latest_block_for_table(self, table_name: str) -> int:
+        """Get the latest block number for a specific table."""
+        try:
+            # Check if the table exists first
+            table_exists = self._check_table_exists(table_name)
+            if not table_exists:
+                logger.warning(f"Table {table_name} does not exist")
+                return 0
+                
+            # Check if the table has a block_number column
+            columns = self._get_table_columns(table_name)
+            if 'block_number' not in columns:
+                logger.warning(f"Table {table_name} does not have a block_number column")
+                return 0
+            
+            # Query the max block number
+            result = self.client.query(f"""
+            SELECT MAX(block_number) as max_block 
+            FROM {self.database}.{table_name}
+            """)
+            
+            if result.result_rows and result.result_rows[0][0] is not None:
+                return result.result_rows[0][0]
+            return 0
+        except Exception as e:
+            logger.error(f"Error getting latest block for table {table_name}: {e}")
+            return 0
