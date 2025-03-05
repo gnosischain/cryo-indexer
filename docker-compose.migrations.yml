@@ -1,0 +1,27 @@
+services:
+  # One-off service for running migrations
+  cryo-migrations:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cryo-migrations
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./state:/app/state
+      - ./migrations:/app/migrations
+      - ./scripts/entrypoint.sh:/app/entrypoint.sh
+      - ./scripts/run_migrations.sh:/app/scripts/run_migrations.sh
+    environment:
+      - ETH_RPC_URL=${ETH_RPC_URL}
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE:-blockchain}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-9440}
+      - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE:-true}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - OPERATION_MODE=migrations_only
+      - FORCE_RUN_MIGRATIONS=${FORCE_RUN_MIGRATIONS:-false}
+    # This service is intended to run once and exit
+    restart: "no"

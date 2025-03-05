@@ -8,10 +8,10 @@ from typing import Dict, Any, List, Tuple, Optional
 from loguru import logger
 from datetime import datetime
 
-from config import settings
-from blockchain import BlockchainClient
-from clickhouse_manager import ClickHouseManager
-from utils import setup_logging, load_state, save_state, find_parquet_files, format_block_range
+from .config import settings
+from .blockchain import BlockchainClient
+from .clickhouse_manager import ClickHouseManager
+from .utils import setup_logging, load_state, save_state, find_parquet_files, format_block_range
 
 
 class CryoIndexer:
@@ -50,8 +50,29 @@ class CryoIndexer:
         logger.info(f"Using data directory: {settings.data_dir}")
         logger.info(f"Using datasets: {settings.datasets}")
         
+        # Verify Cryo installation
+        self._verify_cryo()
+        
         # Set up tables in ClickHouse
         self.clickhouse.setup_tables()
+    
+    def _verify_cryo(self):
+        """Verify that Cryo is installed and working correctly."""
+        try:
+            result = subprocess.run(
+                ["cryo", "--version"],
+                check=False,
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                logger.error(f"Cryo verification failed: {result.stderr}")
+                raise Exception("Cryo is not properly installed or accessible")
+            
+            logger.info(f"Cryo version: {result.stdout.strip()}")
+        except Exception as e:
+            logger.error(f"Error verifying Cryo: {e}")
+            raise
     
     def run(self) -> None:
         """Main loop that continuously indexes new blocks."""
@@ -73,14 +94,14 @@ class CryoIndexer:
                     self._handle_potential_reorg()
                     
                     # Process new blocks
-                    next_block = self.state['last_block'] + 1
-                    end_block = min(safe_block, next_block + settings.max_blocks_per_batch - 1)
+                    next_block = self.state['last_block']
+                    end_block = min(safe_block, next_block + settings.max_blocks_per_batch)
                     
                     logger.info(f"Processing blocks {next_block} to {end_block}")
                     self._process_blocks(next_block, end_block)
                     
                     # Update state
-                    self.state['last_block'] = end_block
+                    self.state['last_block'] = end_block + 1
                     self.state['last_indexed_timestamp'] = int(time.time())
                     save_state(self.state, settings.state_dir)
                 else:
@@ -90,7 +111,7 @@ class CryoIndexer:
                 time.sleep(settings.poll_interval)
                 
             except Exception as e:
-                logger.error(f"Error in main loop: {e}")
+                logger.error(f"Error in main loop: {e}", exc_info=True)
                 time.sleep(settings.poll_interval)
     
     def _handle_potential_reorg(self) -> None:
@@ -129,7 +150,7 @@ class CryoIndexer:
                     logger.error("Failed to roll back database during reorg handling")
         
         except Exception as e:
-            logger.error(f"Error handling potential reorg: {e}")
+            logger.error(f"Error handling potential reorg: {e}", exc_info=True)
     
     def _process_blocks(self, start_block: int, end_block: int) -> None:
         """Process a range of blocks using Cryo and load the data to ClickHouse."""
@@ -144,7 +165,7 @@ class CryoIndexer:
             self._load_to_clickhouse()
             
         except Exception as e:
-            logger.error(f"Error processing blocks {start_block}-{end_block}: {e}")
+            logger.error(f"Error processing blocks {start_block}-{end_block}: {e}", exc_info=True)
             raise
     
     def _clean_data_directory(self) -> None:
@@ -155,54 +176,99 @@ class CryoIndexer:
             for f in files:
                 if os.path.isfile(f):
                     os.remove(f)
-                elif os.path.isdir(f):
+                elif os.path.isdir(f) and not f.endswith(".cryo"):
                     shutil.rmtree(f)
+            
+            # Make sure .cryo directory exists for reports
+            os.makedirs(os.path.join(settings.data_dir, ".cryo", "reports"), exist_ok=True)
             
             logger.debug(f"Cleaned data directory: {settings.data_dir}")
         except Exception as e:
-            logger.warning(f"Error cleaning data directory: {e}")
+            logger.warning(f"Error cleaning data directory: {e}", exc_info=True)
     
     def _run_cryo(self, start_block: int, end_block: int) -> None:
         """Run Cryo to extract blockchain data."""
         try:
-            # Build the command
-            cmd = [
-                "cryo",
-                *settings.datasets,
-                "--blocks", format_block_range(start_block, end_block),
-                "--output-dir", settings.data_dir,
-                "--rpc", settings.eth_rpc_url,
-                "--overwrite"
-            ]
+            # Process smaller batch sizes for more reliability
+            batch_size = min(100, end_block - start_block + 1)
             
-            logger.debug(f"Running Cryo command: {' '.join(cmd)}")
-            
-            # Run the command
-            process = subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            
-            logger.debug(f"Cryo output: {process.stdout}")
-            
-            if process.returncode != 0:
-                logger.error(f"Cryo error: {process.stderr}")
-                raise Exception(f"Cryo process failed with return code {process.returncode}")
+            # Process in smaller batches
+            current_start = start_block
+            while current_start <= end_block:
+                current_end = min(current_start + batch_size - 1, end_block)
+                logger.info(f"Running Cryo for blocks {current_start}-{current_end}")
                 
-            logger.info(f"Successfully extracted data for blocks {start_block}-{end_block}")
+                # Build the command
+                cmd = [
+                    "cryo",
+                    *settings.datasets,
+                    "--blocks", format_block_range(current_start, current_end),
+                    "--output-dir", settings.data_dir,
+                    "--rpc", settings.eth_rpc_url,
+                    "--overwrite",
+                    "--verbose",
+                    "--requests-per-second", "1000",  # Rate limiting to avoid RPC issues
+                    "--max-concurrent-requests", "5"  # Limit concurrent requests
+                ]
+                
+                # If chain ID is specified, include it
+                if settings.chain_id != 1:
+                    cmd.extend(["--network-name", str(settings.chain_id)])
+                
+                logger.debug(f"Running Cryo command: {' '.join(cmd)}")
+                
+                # Run the command with environment variables and output capture
+                env = os.environ.copy()
+                env["ETH_RPC_URL"] = settings.eth_rpc_url
+                
+                # Try running with a smaller timeout first
+                try:
+                    process = subprocess.run(
+                        cmd,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=300  # 5 minute timeout
+                    )
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"Cryo command timed out for blocks {current_start}-{current_end}, retrying with --requests-per-second 5")
+                    # Try again with lower rate limit
+                    cmd = [c if c != "10" else "5" for c in cmd]
+                    process = subprocess.run(
+                        cmd,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=env
+                    )
+                
+                logger.debug(f"Cryo stdout: {process.stdout}")
+                
+                if process.returncode != 0:
+                    logger.error(f"Cryo error: {process.stderr}")
+                    # Check if files were created despite the error
+                    created_files = find_parquet_files(settings.data_dir, settings.datasets[0])
+                    if created_files:
+                        logger.warning("Cryo reported an error but did produce some output files. Continuing.")
+                    else:
+                        raise Exception(f"Cryo process failed with return code {process.returncode}: {process.stderr}")
+                        
+                logger.info(f"Successfully extracted data for blocks {current_start}-{current_end}")
+                current_start = current_end + 1
             
         except subprocess.CalledProcessError as e:
             logger.error(f"Cryo process error: {e.stderr}")
             raise Exception(f"Cryo process failed: {e}")
         except Exception as e:
-            logger.error(f"Error running Cryo: {e}")
+            logger.error(f"Error running Cryo: {e}", exc_info=True)
             raise
     
     def _load_to_clickhouse(self) -> None:
         """Load extracted data files to ClickHouse."""
         total_rows = 0
+        files_processed = 0
+        files_failed = 0
         
         # Process each dataset
         for dataset in settings.datasets:
@@ -219,10 +285,13 @@ class CryoIndexer:
                 try:
                     rows = self.clickhouse.insert_parquet_file(file_path)
                     total_rows += rows
+                    files_processed += 1
+                    logger.info(f"Inserted {rows} rows from {os.path.basename(file_path)}")
                 except Exception as e:
-                    logger.error(f"Error loading file {file_path}: {e}")
+                    files_failed += 1
+                    logger.error(f"Error loading file {file_path}: {e}", exc_info=True)
         
-        logger.info(f"Loaded {total_rows} total rows to ClickHouse")
+        logger.info(f"Loaded {total_rows} total rows from {files_processed} files to ClickHouse ({files_failed} files failed)")
 
 
 if __name__ == "__main__":

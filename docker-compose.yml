@@ -1,4 +1,5 @@
 services:
+  # Main service for running the indexer continuously
   cryo-indexer:
     build:
       context: .
@@ -15,7 +16,7 @@ services:
       - CLICKHOUSE_USER=${CLICKHOUSE_USER}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
       - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE:-blockchain}
-      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8443}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-9440} 
       - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE:-true}
       - CONFIRMATION_BLOCKS=${CONFIRMATION_BLOCKS:-20}
       - POLL_INTERVAL=${POLL_INTERVAL:-15}
@@ -23,7 +24,7 @@ services:
       - CHAIN_ID=${CHAIN_ID:-1}
       - START_BLOCK=${START_BLOCK:-0}
       - MAX_BLOCKS_PER_BATCH=${MAX_BLOCKS_PER_BATCH:-1000}
-      - RUN_MIGRATIONS=${RUN_MIGRATIONS:-true}
+      - OPERATION_MODE=scraper
       - DATASETS=${DATASETS:-blocks,transactions,logs}
     restart: unless-stopped
     deploy:

@@ -1,3 +1,4 @@
+numpy==1.24.4
 clickhouse-connect==0.7.0
 requests==2.31.0
 python-dotenv==1.0.0

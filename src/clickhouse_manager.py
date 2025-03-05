@@ -3,11 +3,12 @@ import pandas as pd
 import pyarrow.parquet as pq
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
-from typing import Dict, Any, List, Optional, Tuple
+from clickhouse_connect.driver.summary import QuerySummary
+from typing import Dict, Any, List, Optional, Tuple, Union
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from utils import read_parquet_to_pandas, parse_dataset_name_from_file
+from .utils import read_parquet_to_pandas, parse_dataset_name_from_file
 
 
 class ClickHouseManager:
@@ -138,6 +139,12 @@ class ClickHouseManager:
                 logger.warning(f"Empty DataFrame from {file_path}")
                 return 0
             
+            # Get table schema to ensure column compatibility
+            table_exists = self._check_table_exists(table_name)
+            if table_exists:
+                table_columns = self._get_table_columns(table_name)
+                df = self._adjust_dataframe_to_schema(df, table_columns)
+            
             # Convert binary columns to hex strings for ClickHouse
             for col in df.columns:
                 # Check if column contains binary data
@@ -148,12 +155,58 @@ class ClickHouseManager:
                         df[col] = df[col].apply(lambda x: x.hex() if isinstance(x, bytes) else None)
             
             # Insert the data
-            count = self.client.insert_df(f"{self.database}.{table_name}", df)
-            logger.info(f"Inserted {count} rows into {table_name}")
-            return count
+            result = self.client.insert_df(f"{self.database}.{table_name}", df)
+            
+            # Handle the QuerySummary object properly
+            if isinstance(result, QuerySummary):
+                # Extract the number of rows from the summary
+                row_count = result.written_rows if hasattr(result, 'written_rows') else len(df)
+                logger.info(f"Inserted {row_count} rows into {table_name}")
+                return row_count
+            else:
+                logger.info(f"Inserted {result} rows into {table_name}")
+                return result
+                
         except Exception as e:
             logger.error(f"Error inserting parquet file {file_path}: {e}")
             raise
+    
+    def _check_table_exists(self, table_name: str) -> bool:
+        """Check if a table exists in the database."""
+        try:
+            result = self.client.query(f"""
+            SELECT 1 FROM system.tables 
+            WHERE database = '{self.database}' AND name = '{table_name}'
+            """)
+            return len(result.result_rows) > 0
+        except Exception as e:
+            logger.error(f"Error checking if table {table_name} exists: {e}")
+            return False
+    
+    def _get_table_columns(self, table_name: str) -> List[str]:
+        """Get the list of columns in a table."""
+        try:
+            result = self.client.query(f"""
+            SELECT name FROM system.columns 
+            WHERE database = '{self.database}' AND table = '{table_name}'
+            ORDER BY position
+            """)
+            return [row[0] for row in result.result_rows]
+        except Exception as e:
+            logger.error(f"Error getting columns for table {table_name}: {e}")
+            return []
+    
+    def _adjust_dataframe_to_schema(self, df: pd.DataFrame, table_columns: List[str]) -> pd.DataFrame:
+        """Adjust DataFrame columns to match the table schema."""
+        # Fill missing columns with None/NULL
+        missing_columns = [col for col in table_columns if col not in df.columns]
+        for col in missing_columns:
+            logger.info(f"Adding missing column: {col}")
+            df[col] = None
+        
+        # Ensure columns are in the correct order
+        columns_to_select = [col for col in table_columns if col in df.columns]
+        return df[columns_to_select]
     
     def get_latest_processed_block(self) -> int:
         """Get the latest block number that has been processed and stored in ClickHouse."""
