@@ -1,5 +1,7 @@
 # Cryo Indexer
 
+![Cryo Indexer Header](img/header-cryo-indexer.png)
+
 A service for continuously indexing blockchain data using Cryo and storing it in ClickHouse.
 
 ## Overview
@@ -163,3 +165,8 @@ This is normal behavior for the migrations container. It's designed to run once 
 1. Check if your RPC URL is valid and the node is synced
 2. Ensure the ClickHouse database is accessible
 3. Check the logs for any errors: `make logs`
+
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
