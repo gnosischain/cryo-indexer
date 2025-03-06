@@ -8,7 +8,9 @@ CREATE TABLE IF NOT EXISTS {{database}}.native_transfers
     `transaction_hash` Nullable(String),
     `from_address` Nullable(String),
     `to_address` Nullable(String),
-    `value` Nullable(String),
+    `value_binary` Nullable(String),
+    `value_string` Nullable(String),
+    `value_f64` Nullable(UInt64),
     `chain_id` Nullable(UInt64)
 )
 ENGINE = MergeTree()
