@@ -289,9 +289,10 @@ class CryoIndexer:
                     "--max-concurrent-requests", "5"  # Limit concurrent requests
                 ]
                 
-                # If chain ID is specified, include it
-                if settings.chain_id != 1:
-                    cmd.extend(["--network-name", str(settings.chain_id)])
+                # Add network name if specified
+                if settings.network_name:
+                    cmd.extend(["--network-name", settings.network_name])
+                    logger.debug(f"Using network name: {settings.network_name}")
                 
                 logger.debug(f"Running Cryo command: {' '.join(cmd)}")
                 
@@ -324,19 +325,57 @@ class CryoIndexer:
                 logger.debug(f"Cryo stdout: {process.stdout}")
                 
                 if process.returncode != 0:
-                    logger.error(f"Cryo error: {process.stderr}")
+                    error_msg = process.stderr.strip() if process.stderr else "No error output captured"
+                    logger.error(f"Cryo error: {error_msg}")
+                    
+                    # Check for common errors and provide better diagnostics
+                    if "deserialization error" in process.stdout:
+                        logger.error("Deserialization error detected - this may indicate a network name mismatch")
+                        # Extract the specific error details from stdout
+                        error_lines = [line for line in process.stdout.split('\n') if "error" in line.lower()]
+                        for line in error_lines:
+                            logger.error(f"Error detail: {line.strip()}")
+                    
                     # Check if files were created despite the error
                     created_files = find_parquet_files(settings.data_dir, datasets[0])
                     if created_files:
                         logger.warning("Cryo reported an error but did produce some output files. Continuing.")
                     else:
-                        raise Exception(f"Cryo process failed with return code {process.returncode}: {process.stderr}")
+                        # Try one more time without network name if we have a deserialization error
+                        if "deserialization error" in process.stdout and settings.network_name:
+                            logger.warning("Trying again without network name...")
+                            # Remove the network name option
+                            cmd_without_network = [item for i, item in enumerate(cmd) 
+                                            if item != "--network-name" and 
+                                            (i == 0 or cmd[i-1] != "--network-name")]
+                            
+                            logger.debug(f"Running command without network name: {' '.join(cmd_without_network)}")
+                            retry_process = subprocess.run(
+                                cmd_without_network,
+                                check=False,
+                                capture_output=True,
+                                text=True,
+                                env=env
+                            )
+                            
+                            if retry_process.returncode == 0:
+                                logger.info("Retry without network name succeeded!")
+                                logger.debug(f"Cryo stdout: {retry_process.stdout}")
+                                # Update current start and continue
+                                current_start = current_end + 1
+                                continue
+                            else:
+                                logger.error(f"Retry failed: {retry_process.stderr}")
+                                logger.error(f"Retry stdout: {retry_process.stdout}")
                         
+                        raise Exception(f"Cryo process failed with return code {process.returncode}")
+                
                 logger.info(f"Successfully extracted data for blocks {current_start}-{current_end}")
                 current_start = current_end + 1
             
         except subprocess.CalledProcessError as e:
-            logger.error(f"Cryo process error: {e.stderr}")
+            stderr_output = e.stderr if hasattr(e, 'stderr') else "No stderr captured"
+            logger.error(f"Cryo process error: {stderr_output}")
             raise Exception(f"Cryo process failed: {e}")
         except Exception as e:
             logger.error(f"Error running Cryo: {e}", exc_info=True)

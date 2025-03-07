@@ -1,7 +1,11 @@
-.PHONY: build run-migrations run-indexer stop-indexer logs clean help force-migrations run-state run-traces run-tokens run-multi stop-multi purge-volumes purge-all purge-state purge-indexer purge-migrations
+.PHONY: build run-migrations run-indexer stop-indexer logs clean help force-migrations run-state run-traces run-tokens run-multi stop-multi purge-volumes purge-all purge-state purge-indexer purge-migrations build-image
 
 # Default environment file
 ENV_FILE := .env
+
+# Image name and tag
+IMAGE_NAME := cryo-indexer
+IMAGE_TAG := latest
 
 # Load environment variables from .env file if it exists
 ifneq (,$(wildcard $(ENV_FILE)))
@@ -11,7 +15,7 @@ endif
 
 help:
 	@echo "Cryo Indexer Commands:"
-	@echo "  make build            - Build the Docker containers"
+	@echo "  make build-image      - Build a single Docker image for all services"
 	@echo "  make run-migrations   - Run database migrations only"
 	@echo "  make force-migrations - Run database migrations, even if already applied"
 	@echo "  make run-indexer      - Start the indexer in default mode"
@@ -32,9 +36,10 @@ help:
 	@echo "  make purge-state       - Delete only the state diffs indexer volumes"
 	@echo "  make purge-migrations  - Delete only the migrations volumes"
 
-build:
-	@echo "Building Docker containers..."
-	docker compose build
+build-image:
+	@echo "Building a single Docker image for all services..."
+	docker build -t $(IMAGE_NAME):$(IMAGE_TAG) .
+	@echo "Image $(IMAGE_NAME):$(IMAGE_TAG) built successfully."
 
 run-migrations:
 	@echo "Running database migrations..."

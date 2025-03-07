@@ -1,9 +1,7 @@
 services:
   # Main indexer service - configurable via environment variables
   cryo-indexer:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: cryo-indexer:latest
     container_name: cryo-indexer
     volumes:
       - indexer_data:/app/data
@@ -21,12 +19,12 @@ services:
       - CONFIRMATION_BLOCKS=${CONFIRMATION_BLOCKS:-20}
       - POLL_INTERVAL=${POLL_INTERVAL:-15}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - CHAIN_ID=${CHAIN_ID:-1}
       - START_BLOCK=${START_BLOCK:-0}
       - MAX_BLOCKS_PER_BATCH=${MAX_BLOCKS_PER_BATCH:-1000}
       - OPERATION_MODE=scraper
       - INDEXER_MODE=${INDEXER_MODE:-default}
       - DATASETS=${DATASETS:-blocks,transactions,logs}
+      - NETWORK_NAME=${NETWORK_NAME:-gnosis}
     restart: unless-stopped
 
 volumes:

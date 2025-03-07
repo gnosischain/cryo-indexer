@@ -13,7 +13,7 @@ echo "CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-blockchain}"
 echo "CONFIRMATION_BLOCKS: ${CONFIRMATION_BLOCKS:-20}"
 echo "POLL_INTERVAL: ${POLL_INTERVAL:-15}"
 echo "LOG_LEVEL: ${LOG_LEVEL:-INFO}"
-echo "CHAIN_ID: ${CHAIN_ID:-1}"
+echo "NETWORK_NAME: ${NETWORK_NAME:-gnosis}"
 echo "START_BLOCK: ${START_BLOCK:-0}"
 echo "MAX_BLOCKS_PER_BATCH: ${MAX_BLOCKS_PER_BATCH:-1000}"
 echo "DATASETS: ${DATASETS_BACKUP}"
@@ -72,9 +72,9 @@ echo "Using state file: ${INDEXER_STATE_FILE}"
 if [ ! -f "$INDEXER_STATE_FILE" ]; then
     echo "Creating new state file for indexer mode: ${INDEXER_ID}"
     echo '{
-        "last_block": 0,
+       "last_block": 0,
         "last_indexed_timestamp": 0,
-        "chain_id": 1,
+        "network_name": "'"${NETWORK_NAME}"'",
         "mode": "'"${INDEXER_ID}"'"
     }' > "$INDEXER_STATE_FILE"
 fi

@@ -19,10 +19,12 @@
     # Add Rust to PATH
     ENV PATH="/root/.cargo/bin:${PATH}"
     
-    # Clone the repository with minimal depth
+    # Clone the repository with specific commit rather than depth 1
     RUN mkdir -p /tmp/cryo-build && cd /tmp/cryo-build \
-        && git clone --depth 1 https://github.com/paradigmxyz/cryo.git \
+        && git clone https://github.com/paradigmxyz/cryo.git \
         && cd cryo \
+        # Checkout the specific commit (avoid missing field `creationMethod` due to alloy)
+        && git checkout eba6192298e40add4d35d1587511d875f6d770e4 \
         # Configure minimal memory usage
         && export RUSTFLAGS="-C codegen-units=1 -C opt-level=s -C debuginfo=0" \
         && export CARGO_BUILD_JOBS=1 \

@@ -47,7 +47,7 @@ def load_state(state_dir: str, state_file: Optional[str] = None) -> Dict[str, An
             return {
                 'last_block': 0,
                 'last_indexed_timestamp': 0,
-                'chain_id': 1,
+                'network_name': os.environ.get('NETWORK_NAME', ''),
                 'mode': 'default'
             }
     except Exception as e:
@@ -55,7 +55,7 @@ def load_state(state_dir: str, state_file: Optional[str] = None) -> Dict[str, An
         return {
             'last_block': 0,
             'last_indexed_timestamp': 0,
-            'chain_id': 1,
+            'network_name': os.environ.get('NETWORK_NAME', ''),
             'mode': 'default'
         }
 

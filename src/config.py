@@ -22,7 +22,7 @@ class IndexerSettings:
     def __init__(self):
         # Blockchain settings
         self.eth_rpc_url = os.environ.get("ETH_RPC_URL", "")
-        self.chain_id = int(os.environ.get("CHAIN_ID", "1"))
+        self.network_name = os.environ.get("NETWORK_NAME", "")
         self.confirmation_blocks = int(os.environ.get("CONFIRMATION_BLOCKS", "20"))
         self.poll_interval = int(os.environ.get("POLL_INTERVAL", "15"))
         self.max_blocks_per_batch = int(os.environ.get("MAX_BLOCKS_PER_BATCH", "1000"))

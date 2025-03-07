@@ -1,9 +1,7 @@
 services:
   # Traces indexer
   cryo-indexer-traces:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: cryo-indexer:latest
     container_name: cryo-indexer-traces
     volumes:
       - traces_data:/app/data
@@ -21,12 +19,12 @@ services:
       - CONFIRMATION_BLOCKS=${CONFIRMATION_BLOCKS:-20}
       - POLL_INTERVAL=${POLL_INTERVAL:-15}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - CHAIN_ID=${CHAIN_ID:-1}
       - START_BLOCK=${TRACES_START_BLOCK:-0}  # Default to block 0 for traces
       - MAX_BLOCKS_PER_BATCH=${MAX_BLOCKS_PER_BATCH:-500}  # Smaller batch size for traces
       - OPERATION_MODE=scraper
       - INDEXER_MODE=traces
       - INDEXER_STATE_FILE=indexer_state_traces.json
+      - NETWORK_NAME=${NETWORK_NAME:-gnosis}
     restart: unless-stopped
 
 volumes:

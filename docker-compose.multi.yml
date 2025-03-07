@@ -1,9 +1,7 @@
 services:
   # Base Indexer: Blocks, Transactions, Logs, Contracts, Native Transfers
   cryo-indexer-base:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: cryo-indexer:latest
     container_name: cryo-indexer-base
     volumes:
       - base_data:/app/data
@@ -21,19 +19,17 @@ services:
       - CONFIRMATION_BLOCKS=${CONFIRMATION_BLOCKS:-20}
       - POLL_INTERVAL=${POLL_INTERVAL:-15}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - CHAIN_ID=${CHAIN_ID:-1}
       - START_BLOCK=${BASE_START_BLOCK:-0}  # Default to block 0 for base data
       - MAX_BLOCKS_PER_BATCH=${MAX_BLOCKS_PER_BATCH:-1000}
       - OPERATION_MODE=scraper
       - INDEXER_MODE=tx_data
       - INDEXER_STATE_FILE=indexer_state_tx_data.json
+      - NETWORK_NAME=${NETWORK_NAME:-gnosis}
     restart: unless-stopped
 
   # State Diffs Indexer
   cryo-indexer-state:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: cryo-indexer:latest
     container_name: cryo-indexer-state
     volumes:
       - state_data:/app/data
@@ -51,19 +47,17 @@ services:
       - CONFIRMATION_BLOCKS=${CONFIRMATION_BLOCKS:-20}
       - POLL_INTERVAL=${POLL_INTERVAL:-15}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - CHAIN_ID=${CHAIN_ID:-1}
       - START_BLOCK=${STATE_START_BLOCK:-1}  # Default to block 1 for state diffs
       - MAX_BLOCKS_PER_BATCH=${MAX_BLOCKS_PER_BATCH:-500}  # Smaller batch size for state diffs
       - OPERATION_MODE=scraper
       - INDEXER_MODE=state_diffs
       - INDEXER_STATE_FILE=indexer_state_state_diffs.json
+      - NETWORK_NAME=${NETWORK_NAME:-gnosis}
     restart: unless-stopped
 
   # Traces Indexer
   cryo-indexer-traces:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: cryo-indexer:latest
     container_name: cryo-indexer-traces
     volumes:
       - traces_data:/app/data
@@ -81,19 +75,17 @@ services:
       - CONFIRMATION_BLOCKS=${CONFIRMATION_BLOCKS:-20}
       - POLL_INTERVAL=${POLL_INTERVAL:-15}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - CHAIN_ID=${CHAIN_ID:-1}
       - START_BLOCK=${TRACES_START_BLOCK:-0}  # Default to block 0 for traces
       - MAX_BLOCKS_PER_BATCH=${MAX_BLOCKS_PER_BATCH:-500}  # Smaller batch size for traces
       - OPERATION_MODE=scraper
       - INDEXER_MODE=traces
       - INDEXER_STATE_FILE=indexer_state_traces.json
+      - NETWORK_NAME=${NETWORK_NAME:-gnosis}
     restart: unless-stopped
 
   # Token Data Indexer (ERC20 & ERC721)
   cryo-indexer-tokens:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: cryo-indexer:latest
     container_name: cryo-indexer-tokens
     volumes:
       - tokens_data:/app/data
@@ -111,13 +103,13 @@ services:
       - CONFIRMATION_BLOCKS=${CONFIRMATION_BLOCKS:-20}
       - POLL_INTERVAL=${POLL_INTERVAL:-15}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - CHAIN_ID=${CHAIN_ID:-1}
       - START_BLOCK=${TOKENS_START_BLOCK:-0}  # Default to block 0 for token data
       - MAX_BLOCKS_PER_BATCH=${MAX_BLOCKS_PER_BATCH:-1000}
       - OPERATION_MODE=scraper
       - INDEXER_MODE=custom  # Custom mode with specified datasets
       - DATASETS=erc20_transfers,erc20_metadata,erc721_transfers,erc721_metadata
       - INDEXER_STATE_FILE=indexer_state_tokens.json
+      - NETWORK_NAME=${NETWORK_NAME:-gnosis}
     restart: unless-stopped
 
 volumes:
