@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS {{database}}.native_transfers
     `to_address` Nullable(String),
     `value_binary` Nullable(String),
     `value_string` Nullable(String),
-    `value_f64` Nullable(UInt64),
+    `value_f64` Nullable(Float64),
     `chain_id` Nullable(UInt64)
 )
 ENGINE = MergeTree()
