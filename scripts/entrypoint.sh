@@ -19,6 +19,9 @@ echo "MAX_BLOCKS_PER_BATCH: ${MAX_BLOCKS_PER_BATCH:-1000}"
 echo "DATASETS: ${DATASETS_BACKUP}"
 echo "OPERATION_MODE: ${OPERATION_MODE:-scraper}"
 echo "INDEXER_MODE: ${INDEXER_MODE:-custom}"
+echo "CHAIN_ID: ${CHAIN_ID:-100}"
+echo "GENESIS_TIMESTAMP: ${GENESIS_TIMESTAMP:-1539024180}"
+echo "SECONDS_PER_BLOCK: ${SECONDS_PER_BLOCK:-5}"
 
 # Verify that required environment variables are set
 if [ -z "$ETH_RPC_URL" ]; then
@@ -75,7 +78,10 @@ if [ ! -f "$INDEXER_STATE_FILE" ]; then
        "last_block": 0,
         "last_indexed_timestamp": 0,
         "network_name": "'"${NETWORK_NAME}"'",
-        "mode": "'"${INDEXER_ID}"'"
+        "mode": "'"${INDEXER_ID}"'",
+        "chain_id": '"${CHAIN_ID:-100}"',
+        "genesis_timestamp": '"${GENESIS_TIMESTAMP:-1539024180}"',
+        "seconds_per_block": '"${SECONDS_PER_BLOCK:-5}"'
     }' > "$INDEXER_STATE_FILE"
 fi
 
@@ -164,6 +170,45 @@ check_migrations() {
     return 1
 }
 
+# Function to update chain metadata
+update_chain_metadata() {
+    echo "Updating chain metadata with current configuration..."
+    
+    # Check if chain_metadata table exists
+    local table_result=$(curl -s -X POST "${protocol}://${CLICKHOUSE_HOST}:${port}" \
+        -u "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        --data-binary "SELECT count() FROM system.tables WHERE database = '${CLICKHOUSE_DATABASE}' AND name = 'chain_metadata'")
+    
+    if [[ "$table_result" == *"1"* ]]; then
+        # Check if network exists in chain_metadata
+        local network_result=$(curl -s -X POST "${protocol}://${CLICKHOUSE_HOST}:${port}" \
+            -u "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-binary "SELECT count() FROM ${CLICKHOUSE_DATABASE}.chain_metadata WHERE network_name = '${NETWORK_NAME}'")
+        
+        if [[ "$network_result" == *"1"* ]]; then
+            # Update existing network
+            curl -s -X POST "${protocol}://${CLICKHOUSE_HOST}:${port}" \
+                -u "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}" \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                --data-binary "ALTER TABLE ${CLICKHOUSE_DATABASE}.chain_metadata UPDATE genesis_timestamp = ${GENESIS_TIMESTAMP:-1539024180}, seconds_per_block = ${SECONDS_PER_BLOCK:-5}, chain_id = ${CHAIN_ID:-100} WHERE network_name = '${NETWORK_NAME}'"
+            
+            echo "Updated chain metadata for network: ${NETWORK_NAME}"
+        else
+            # Insert new network
+            curl -s -X POST "${protocol}://${CLICKHOUSE_HOST}:${port}" \
+                -u "${CLICKHOUSE_USER}:${CLICKHOUSE_PASSWORD}" \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                --data-binary "INSERT INTO ${CLICKHOUSE_DATABASE}.chain_metadata (network_name, genesis_timestamp, seconds_per_block, chain_id) VALUES ('${NETWORK_NAME}', ${GENESIS_TIMESTAMP:-1539024180}, ${SECONDS_PER_BLOCK:-5}, ${CHAIN_ID:-100})"
+            
+            echo "Inserted chain metadata for network: ${NETWORK_NAME}"
+        fi
+    else
+        echo "Chain metadata table doesn't exist yet, will be created during migrations"
+    fi
+}
+
 # Handle different operation modes
 case "${OPERATION_MODE}" in
     migrations_only)
@@ -176,8 +221,10 @@ case "${OPERATION_MODE}" in
                 echo "Migration failed with exit code $migration_exit_code"
                 exit $migration_exit_code
             fi
+            update_chain_metadata
         elif check_migrations; then
             echo "Migrations already applied. Set FORCE_RUN_MIGRATIONS=true to run again if needed."
+            update_chain_metadata
         else
             echo "Running migrations now..."
             run_migrations
@@ -186,6 +233,7 @@ case "${OPERATION_MODE}" in
                 echo "Migration failed with exit code $migration_exit_code"
                 exit $migration_exit_code
             fi
+            update_chain_metadata
         fi
         echo "Migrations-only mode completed. Exiting."
         exit 0
@@ -197,6 +245,9 @@ case "${OPERATION_MODE}" in
         if ! check_migrations; then
             echo "WARNING: Migrations have not been applied. It's recommended to run migrations first."
             echo "You can run migrations by using 'make run-migrations'"
+        else
+            # Update chain metadata
+            update_chain_metadata
         fi
         
         # Start the indexer
@@ -205,6 +256,9 @@ case "${OPERATION_MODE}" in
         
         # Set environment variables for the indexer
         export INDEXER_STATE_FILE="$INDEXER_STATE_FILE"
+        export GENESIS_TIMESTAMP="${GENESIS_TIMESTAMP:-1539024180}"
+        export SECONDS_PER_BLOCK="${SECONDS_PER_BLOCK:-5}"
+        export CHAIN_ID="${CHAIN_ID:-100}"
         
         # Detect available Python command and explicitly set environment variables
         PYTHON_CMD="python3"

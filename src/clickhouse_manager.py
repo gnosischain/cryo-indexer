@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Optional, Tuple, Union
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from .config import settings
 from .utils import read_parquet_to_pandas, parse_dataset_name_from_file
 
 
@@ -74,6 +75,42 @@ class ClickHouseManager:
         except Exception as e:
             logger.error(f"Error setting up tables: {e}")
             raise
+    
+    def update_chain_metadata(self) -> None:
+        """Update chain metadata with current settings."""
+        try:
+            # Check if chain metadata for the current network exists
+            exists_query = f"""
+            SELECT 1 FROM {self.database}.chain_metadata 
+            WHERE network_name = '{settings.network_name}'
+            """
+            result = self.client.query(exists_query)
+            exists = len(result.result_rows) > 0
+            
+            if exists:
+                # Update existing row
+                update_query = f"""
+                ALTER TABLE {self.database}.chain_metadata 
+                UPDATE 
+                    genesis_timestamp = {settings.genesis_timestamp},
+                    seconds_per_block = {settings.seconds_per_block},
+                    chain_id = {settings.chain_id}
+                WHERE network_name = '{settings.network_name}'
+                """
+                self.client.command(update_query)
+                logger.info(f"Updated chain metadata for network: {settings.network_name}")
+            else:
+                # Insert new row
+                insert_query = f"""
+                INSERT INTO {self.database}.chain_metadata
+                (network_name, genesis_timestamp, seconds_per_block, chain_id)
+                VALUES ('{settings.network_name}', {settings.genesis_timestamp}, {settings.seconds_per_block}, {settings.chain_id})
+                """
+                self.client.command(insert_query)
+                logger.info(f"Inserted chain metadata for network: {settings.network_name}")
+        except Exception as e:
+            logger.error(f"Error updating chain metadata: {e}")
+            logger.warning("Continuing with default chain metadata values")
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
     def insert_parquet_file(self, file_path: str) -> int:
@@ -198,14 +235,18 @@ class ClickHouseManager:
     
     def _adjust_dataframe_to_schema(self, df: pd.DataFrame, table_columns: List[str]) -> pd.DataFrame:
         """Adjust DataFrame columns to match the table schema."""
+        # Filter only columns that exist in the table
+        existing_columns = [col for col in df.columns if col in table_columns]
+        
         # Fill missing columns with None/NULL
         missing_columns = [col for col in table_columns if col not in df.columns]
         for col in missing_columns:
-            logger.info(f"Adding missing column: {col}")
-            df[col] = None
+            if col not in ['block_timestamp', 'month']:  # Skip materialized columns
+                logger.info(f"Adding missing column: {col}")
+                df[col] = None
         
-        # Ensure columns are in the correct order
-        columns_to_select = [col for col in table_columns if col in df.columns]
+        # Ensure columns are in the correct order (except materialized columns)
+        columns_to_select = [col for col in table_columns if col in df.columns and col not in ['block_timestamp', 'month']]
         return df[columns_to_select]
     
     def get_latest_processed_block(self) -> int:
@@ -356,13 +397,16 @@ class ClickHouseManager:
                     logger.error(f"Error executing migration {file_name}: {e}")
                     raise
             
+            # After running migrations, update chain metadata
+            if self._check_table_exists('chain_metadata'):
+                self.update_chain_metadata()
+            
             logger.info("All migrations completed successfully")
             return True
         except Exception as e:
             logger.error(f"Error running migrations: {e}")
             return False
         
-
     def get_latest_block_for_table(self, table_name: str) -> int:
         """Get the latest block number for a specific table."""
         try:
@@ -390,3 +434,41 @@ class ClickHouseManager:
         except Exception as e:
             logger.error(f"Error getting latest block for table {table_name}: {e}")
             return 0
+
+
+    def get_block_timestamp(self, block_number: int) -> int:
+        """Get the timestamp for a specific block number using our chain metadata."""
+        try:
+            result = self.client.query(f"""
+            SELECT toDateTime64(addSeconds(
+                toDateTime((SELECT genesis_timestamp FROM {self.database}.chain_metadata WHERE network_name = 'gnosis' LIMIT 1)),
+                {block_number} * (SELECT seconds_per_block FROM {self.database}.chain_metadata WHERE network_name = 'gnosis' LIMIT 1)
+            ), 0, 'UTC')
+            """)
+            
+            if result.result_rows and result.result_rows[0][0] is not None:
+                return result.result_rows[0][0]
+            return 0
+        except Exception as e:
+            logger.error(f"Error getting timestamp for block {block_number}: {e}")
+            return 0
+
+    def get_month_partition_for_block(self, block_number: int) -> str:
+        """Get the month partition for a specific block."""
+        try:
+            result = self.client.query(f"""
+            SELECT formatDateTime(
+                toDateTime64(addSeconds(
+                    toDateTime((SELECT genesis_timestamp FROM {self.database}.chain_metadata WHERE network_name = 'gnosis' LIMIT 1)),
+                    {block_number} * (SELECT seconds_per_block FROM {self.database}.chain_metadata WHERE network_name = 'gnosis' LIMIT 1)
+                ), 0, 'UTC'),
+                '%Y-%m', 'UTC'
+            )
+            """)
+            
+            if result.result_rows and result.result_rows[0][0] is not None:
+                return result.result_rows[0][0]
+            return "unknown"
+        except Exception as e:
+            logger.error(f"Error getting month partition for block {block_number}: {e}")
+            return "unknown"
