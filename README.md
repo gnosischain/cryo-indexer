@@ -1,5 +1,3 @@
-# Cryo Indexer
-
 ![Cryo Indexer Header](img/header-cryo-indexer.png)
 
 A service for continuously indexing blockchain data using Cryo and storing it in ClickHouse, with support for running multiple indexers with different datasets.
