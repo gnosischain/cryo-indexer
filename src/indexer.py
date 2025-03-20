@@ -7,6 +7,7 @@ import json
 from typing import Dict, Any, List, Tuple, Optional
 from loguru import logger
 from datetime import datetime
+import time
 
 from .config import settings
 from .blockchain import BlockchainClient
@@ -152,6 +153,11 @@ class CryoIndexer:
         # Get the current mode
         current_mode = settings.get_current_mode()
         
+        # Check if we're running with an end block
+        historical_mode = settings.end_block > 0
+        if historical_mode:
+            logger.info(f"Running with fixed block range: {self.state['last_block']} to {settings.end_block}")
+        
         while True:
             try:
                 # Get the latest block number
@@ -160,6 +166,10 @@ class CryoIndexer:
                 # Calculate the safe block to process (allowing for potential reorgs)
                 safe_block = latest_block - settings.confirmation_blocks
                 
+                # If end_block is set, cap the safe block
+                if historical_mode:
+                    safe_block = min(safe_block, settings.end_block)
+                    
                 logger.debug(f"Latest block: {latest_block}, Safe block: {safe_block}, Last processed: {self.state['last_block']}")
                 
                 # Check if there are new blocks to process
@@ -175,20 +185,27 @@ class CryoIndexer:
                     self._process_blocks(next_block, end_block)
                     
                     # Update state
-                    self.state['last_block'] = end_block + 1
+                    self.state['last_block'] = end_block #+ 1
                     self.state['last_indexed_timestamp'] = int(time.time())
                     self.state['mode'] = current_mode.name
                     save_state(self.state, settings.state_dir, state_file=os.path.basename(self.state_file))
+                    
+                    # Check if we've reached the requested end block in historical mode
+                    if historical_mode and self.state['last_block'] > settings.end_block:
+                        logger.info(f"Reached requested end block {settings.end_block}. Indexing complete.")
+                        return  # Exit the function
                 else:
-                    logger.info(f"No new blocks to process. Waiting {settings.poll_interval} seconds...")
-                
-                # Sleep until next check
-                time.sleep(settings.poll_interval)
-                
+                    if historical_mode:
+                        logger.info(f"No more blocks to process up to requested end block {settings.end_block}. Indexing complete.")
+                        return  # Exit the function
+                    else:
+                        logger.info(f"No new blocks to process. Waiting {settings.poll_interval} seconds...")
+                        # Sleep until next check
+                        time.sleep(settings.poll_interval)
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
                 time.sleep(settings.poll_interval)
-    
+        
     def _handle_potential_reorg(self) -> None:
         """Check for and handle any blockchain reorganizations."""
         try:
@@ -228,24 +245,77 @@ class CryoIndexer:
             logger.error(f"Error handling potential reorg: {e}", exc_info=True)
     
     def _process_blocks(self, start_block: int, end_block: int) -> None:
-        """Process a range of blocks using Cryo and load the data to ClickHouse."""
         try:
             # Clean up data directory before starting
             self._clean_data_directory()
             
-            # Get the current mode
+            # Get the current mode and datasets
             current_mode = settings.get_current_mode()
+            all_datasets = current_mode.datasets.copy()
             
-            # Run Cryo to extract the data
-            self._run_cryo(start_block, end_block, current_mode.datasets)
+            # Always process blocks first separately
+            logger.info("Processing blocks first to ensure timestamp accuracy")
+            # Extract and load blocks first
+            self._run_cryo(start_block, end_block, ['blocks'])
+            self._load_to_clickhouse(['blocks'])
             
-            # Load the extracted data to ClickHouse
-            self._load_to_clickhouse(current_mode.datasets)
+            logger.info(f"About to verify blocks {start_block}-{end_block}")
+            # Always verify blocks are loaded before continuing
+            self._verify_blocks_loaded(start_block, end_block)
             
+            # Then process other datasets if any
+            remaining_datasets = [d for d in all_datasets if d != 'blocks']
+            if remaining_datasets:
+                logger.info(f"Processing remaining datasets: {remaining_datasets}")
+                self._run_cryo(start_block, end_block, remaining_datasets)
+                self._load_to_clickhouse(remaining_datasets)
+                
         except Exception as e:
             logger.error(f"Error processing blocks {start_block}-{end_block}: {e}", exc_info=True)
             raise
     
+    def _verify_blocks_loaded(self, start_block: int, end_block: int) -> None:
+        """Verify that blocks are loaded in the database before proceeding."""
+        max_attempts = 5
+        attempts = 0
+        
+        logger.info(f"======= {max_attempts}-{attempts}")
+        
+        while attempts < max_attempts:
+            logger.info(f"Verifying blocks {start_block}-{end_block} are loaded in the database...")
+            
+            # Query to check if blocks are loaded
+            query_result = self.clickhouse.client.query(f"""
+                SELECT 
+                    COUNT(*) as total_blocks,
+                    MIN(block_number) as min_block,
+                    MAX(block_number) as max_block
+                FROM {self.clickhouse.database}.blocks
+                WHERE block_number BETWEEN {start_block} AND {end_block} - 1
+            """)
+            
+            if query_result.result_rows:
+                total_blocks = query_result.result_rows[0][0]
+                min_block = query_result.result_rows[0][1]
+                max_block = query_result.result_rows[0][2]
+                
+                expected_count = end_block - start_block
+                
+                if total_blocks == expected_count and min_block == start_block and max_block == end_block - 1:
+                    logger.info(f"All {total_blocks} blocks verified in database")
+                    return
+                else:
+                    logger.warning(f"Only {total_blocks}/{expected_count} blocks found in database. Min: {min_block}, Max: {max_block}")
+            else:
+                logger.warning("No blocks found in database for verification query")
+            
+            attempts += 1
+            logger.info(f"Waiting for blocks to be fully loaded (attempt {attempts}/{max_attempts})...")
+            time.sleep(5)  # Wait 5 seconds before checking again
+        
+        logger.error(f"Failed to verify all blocks {start_block}-{end_block} are in the database after {max_attempts} attempts")
+        raise Exception(f"Blocks {start_block}-{end_block} not fully loaded in database")
+
     def _clean_data_directory(self) -> None:
         """Clean up the data directory before a new extraction."""
         try:
@@ -268,12 +338,13 @@ class CryoIndexer:
         """Run Cryo to extract blockchain data for specified datasets."""
         try:
             # Process smaller batch sizes for more reliability
-            batch_size = min(100, end_block - start_block + 1)
+            batch_size = 1000 #min(100, end_block - start_block + 1)
             
             # Process in smaller batches
             current_start = start_block
-            while current_start <= end_block:
-                current_end = min(current_start + batch_size - 1, end_block)
+            while current_start < end_block:
+                #current_end = min(current_start + batch_size - 1, end_block)
+                current_end = min(current_start + batch_size, end_block)
                 logger.info(f"Running Cryo for blocks {current_start}-{current_end}")
                 
                 # Build the command
@@ -362,7 +433,7 @@ class CryoIndexer:
                                 logger.info("Retry without network name succeeded!")
                                 logger.debug(f"Cryo stdout: {retry_process.stdout}")
                                 # Update current start and continue
-                                current_start = current_end + 1
+                                current_start = current_end #+ 1
                                 continue
                             else:
                                 logger.error(f"Retry failed: {retry_process.stderr}")
@@ -371,7 +442,8 @@ class CryoIndexer:
                         raise Exception(f"Cryo process failed with return code {process.returncode}")
                 
                 logger.info(f"Successfully extracted data for blocks {current_start}-{current_end}")
-                current_start = current_end + 1
+                current_start = current_end #+ 1
+                logger.info(f"blocks {current_start}-{end_block}")
             
         except subprocess.CalledProcessError as e:
             stderr_output = e.stderr if hasattr(e, 'stderr') else "No stderr captured"
@@ -398,6 +470,7 @@ class CryoIndexer:
             logger.info(f"Found {len(files)} parquet files for dataset {dataset}")
             
             # Process each file
+            logger.info(f"Files {files}")
             for file_path in files:
                 try:
                     rows = self.clickhouse.insert_parquet_file(file_path)

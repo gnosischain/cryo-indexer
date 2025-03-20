@@ -8,10 +8,8 @@ CREATE TABLE IF NOT EXISTS {{database}}.nonce_diffs
     `from_value` Nullable(UInt64),
     `to_value` Nullable(UInt64),
     `chain_id` Nullable(UInt64),
-    `block_timestamp` DateTime64(0, 'UTC') MATERIALIZED toDateTime64(addSeconds(
-        toDateTime((SELECT genesis_timestamp FROM {{database}}.chain_metadata WHERE network_name = 'gnosis' LIMIT 1)),
-        coalesce(block_number, 0) * (SELECT seconds_per_block FROM {{database}}.chain_metadata WHERE network_name = 'gnosis' LIMIT 1)
-    ), 0, 'UTC'),
+    `block_timestamp` Nullable(DateTime64(0, 'UTC')) MATERIALIZED 
+        toDateTime64(coalesce((SELECT timestamp FROM {{database}}.blocks WHERE blocks.block_number = block_number LIMIT 1), 0), 0, 'UTC'),
     `month` String MATERIALIZED formatDateTime(block_timestamp, '%Y-%m', 'UTC')
 )
 ENGINE = ReplacingMergeTree()

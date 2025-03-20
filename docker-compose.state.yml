@@ -20,6 +20,7 @@ services:
       - POLL_INTERVAL=${POLL_INTERVAL:-15}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - START_BLOCK=${STATE_START_BLOCK:-1}  # Default to block 1 for state diffs
+      - END_BLOCK=${END_BLOCK:-0}
       - MAX_BLOCKS_PER_BATCH=${MAX_BLOCKS_PER_BATCH:-500}  # Smaller batch size for state diffs
       - OPERATION_MODE=scraper
       - INDEXER_MODE=state_diffs

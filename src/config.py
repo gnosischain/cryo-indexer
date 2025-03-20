@@ -1,5 +1,6 @@
 import os
 from typing import List, Dict, Optional
+from loguru import logger
 
 class IndexerMode:
     """Definition of an indexer mode with its specific settings."""
@@ -57,6 +58,7 @@ class IndexerSettings:
         
         # Default start block (can be overridden by mode)
         self.default_start_block = int(os.environ.get("START_BLOCK", "0"))
+        self.end_block = int(os.environ.get("END_BLOCK", "0"))
         
         # Define indexer modes
         self._define_modes()
@@ -66,12 +68,13 @@ class IndexerSettings:
     
     def _define_modes(self):
         """Define available indexer modes with their specific configurations."""
+
         self.available_modes = {
             # Default mode for basic data
             "default": IndexerMode(
                 name="default",
                 datasets=["blocks", "transactions", "logs"],
-                start_block=0,
+                start_block=self.default_start_block,
                 description="Default mode for indexing blocks, transactions, and logs"
             ),
             
@@ -79,7 +82,7 @@ class IndexerSettings:
             "blocks": IndexerMode(
                 name="blocks",
                 datasets=["blocks"],
-                start_block=0,
+                start_block=self.default_start_block,
                 description="Index blocks only"
             ),
             
@@ -87,7 +90,7 @@ class IndexerSettings:
             "transactions": IndexerMode(
                 name="transactions",
                 datasets=["transactions"],
-                start_block=0,
+                start_block=self.default_start_block,
                 description="Index transactions only"
             ),
             
@@ -95,7 +98,7 @@ class IndexerSettings:
             "logs": IndexerMode(
                 name="logs",
                 datasets=["logs"],
-                start_block=0,
+                start_block=self.default_start_block,
                 description="Index logs/events only"
             ),
             
@@ -103,7 +106,7 @@ class IndexerSettings:
             "contracts": IndexerMode(
                 name="contracts",
                 datasets=["contracts"],
-                start_block=0,
+                start_block=self.default_start_block,
                 description="Index contract creations only"
             ),
             
@@ -111,7 +114,7 @@ class IndexerSettings:
             "transfers": IndexerMode(
                 name="transfers",
                 datasets=["native_transfers"],
-                start_block=0,
+                start_block=self.default_start_block,
                 description="Index native ETH transfers only"
             ),
             
@@ -119,7 +122,7 @@ class IndexerSettings:
             "tx_data": IndexerMode(
                 name="tx_data", 
                 datasets=["blocks", "transactions", "logs", "contracts", "traces", "native_transfers"],
-                start_block=0,
+                start_block=self.default_start_block,
                 description="Index all transaction-related data"
             ),
             
@@ -127,7 +130,7 @@ class IndexerSettings:
             "traces": IndexerMode(
                 name="traces",
                 datasets=["traces"],
-                start_block=0,
+                start_block=self.default_start_block,
                 description="Index transaction traces"
             ),
             
@@ -135,7 +138,7 @@ class IndexerSettings:
             "state_diffs": IndexerMode(
                 name="state_diffs",
                 datasets=["balance_diffs", "code_diffs", "nonce_diffs", "storage_diffs"],
-                start_block=1,  # Start from block 1 for state diffs
+                start_block=self.default_start_block,  # Start from block 1 for state diffs
                 description="Index state differences (balance, code, nonce, storage)"
             ),
             
@@ -143,7 +146,7 @@ class IndexerSettings:
             "erc20": IndexerMode(
                 name="erc20",
                 datasets=["erc20_transfers", "erc20_metadata"],
-                start_block=0,
+                start_block=self.default_start_block,
                 description="Index ERC20 token transfers and metadata"
             ),
             
@@ -151,7 +154,7 @@ class IndexerSettings:
             "erc721": IndexerMode(
                 name="erc721",
                 datasets=["erc721_transfers", "erc721_metadata"],
-                start_block=0,
+                start_block=self.default_start_block,
                 description="Index ERC721 token transfers and metadata"
             ),
             

@@ -20,6 +20,7 @@ services:
       - POLL_INTERVAL=${POLL_INTERVAL:-15}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - START_BLOCK=${TRACES_START_BLOCK:-0}  # Default to block 0 for traces
+      - END_BLOCK=${END_BLOCK:-0}
       - MAX_BLOCKS_PER_BATCH=${MAX_BLOCKS_PER_BATCH:-500}  # Smaller batch size for traces
       - OPERATION_MODE=scraper
       - INDEXER_MODE=traces

@@ -20,6 +20,7 @@ services:
       - POLL_INTERVAL=${POLL_INTERVAL:-15}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - START_BLOCK=${TOKENS_START_BLOCK:-0}  # Default to block 0 for token data
+      - END_BLOCK=${END_BLOCK:-0}
       - MAX_BLOCKS_PER_BATCH=${MAX_BLOCKS_PER_BATCH:-1000}
       - OPERATION_MODE=scraper
       - INDEXER_MODE=custom  # Custom mode with specified datasets

@@ -74,6 +74,15 @@ run-multi:
 	docker compose -f docker-compose.multi.yml up -d
 	@echo "All specialized indexers started."
 
+run-range:
+	@echo "Running indexer with block range..."
+	@if [ -z "$(START_BLOCK)" ] || [ -z "$(END_BLOCK)" ]; then \
+		echo "ERROR: START_BLOCK and END_BLOCK must be specified"; \
+		echo "Usage: make run-range START_BLOCK=<start_block> END_BLOCK=<end_block> [INDEXER_MODE=<mode>]"; \
+		exit 1; \
+	fi
+	START_BLOCK=$(START_BLOCK) END_BLOCK=$(END_BLOCK) INDEXER_MODE=$(INDEXER_MODE) docker-compose up
+
 start: run-migrations run-indexer
 	@echo "Indexer started with migrations applied."
 
