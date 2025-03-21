@@ -138,7 +138,7 @@ class IndexerSettings:
             "state_diffs": IndexerMode(
                 name="state_diffs",
                 datasets=["balance_diffs", "code_diffs", "nonce_diffs", "storage_diffs"],
-                start_block=self.default_start_block,  # Start from block 1 for state diffs
+                start_block=self.default_start_block, 
                 description="Index state differences (balance, code, nonce, storage)"
             ),
             
@@ -164,11 +164,9 @@ class IndexerSettings:
                 datasets=[
                     "blocks", "transactions", "logs", "contracts", 
                     "native_transfers", "traces", "balance_diffs", 
-                    "code_diffs", "nonce_diffs", "storage_diffs",
-                    "erc20_transfers", "erc20_metadata", 
-                    "erc721_transfers", "erc721_metadata"
+                    "code_diffs", "nonce_diffs", "storage_diffs"
                 ],
-                start_block=0,
+                start_block=self.default_start_block,
                 description="Index all available data types"
             ),
             

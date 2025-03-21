@@ -28,9 +28,8 @@ CREATE TABLE IF NOT EXISTS {{database}}.transactions
     `r` Nullable(String),
     `s` Nullable(String),
     `v` Nullable(UInt8),
-    `block_timestamp` Nullable(DateTime64(0, 'UTC')) MATERIALIZED 
-        toDateTime64(coalesce((SELECT timestamp FROM {{database}}.blocks WHERE blocks.block_number = block_number LIMIT 1), 0), 0, 'UTC'),
-    `month` String MATERIALIZED formatDateTime(toDateTime(block_timestamp), '%Y-%m', 'UTC')
+    `block_timestamp` Nullable(DateTime64(0, 'UTC')),
+    `month` String
 )
 ENGINE = ReplacingMergeTree()
 PARTITION BY month

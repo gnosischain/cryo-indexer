@@ -60,7 +60,53 @@ class CryoIndexer:
         if "mode" not in self.state:
             self.state["mode"] = current_mode.name
         
-        # Initialize last block based on both database state and mode's preferred start block
+        # Initialize starting block based on explicit START_BLOCK if provided
+        self._initialize_starting_block(current_mode)
+        
+        logger.info(f"Indexer initialized with state: {self.state}")
+        logger.info(f"Using data directory: {settings.data_dir}")
+        
+        # Verify Cryo installation
+        self._verify_cryo()
+        
+        # Set up tables in ClickHouse
+        self.clickhouse.setup_tables()
+    
+    def _initialize_starting_block(self, current_mode):
+        """
+        Initialize the starting block with proper precedence:
+        1. Explicit START_BLOCK from environment if provided
+        2. Otherwise, use the higher of state's last_block or mode's start_block
+        """
+        # Check if START_BLOCK environment variable is explicitly set
+        explicit_start_block = os.environ.get("START_BLOCK")
+        
+        if explicit_start_block is not None and explicit_start_block.strip():
+            try:
+                # Parse the explicit start block
+                explicit_block = int(explicit_start_block)
+                logger.info(f"Explicit START_BLOCK={explicit_block} specified")
+                
+                # Only use explicit start block if:
+                # - It's greater than 0, or
+                # - self.state['last_block'] is 0 (new indexing)
+                if explicit_block > 0 or self.state['last_block'] == 0:
+                    logger.info(f"Using START_BLOCK={explicit_block} as starting point")
+                    self.state['last_block'] = explicit_block
+                    # Save to state file immediately
+                    save_state(self.state, settings.state_dir, state_file=os.path.basename(self.state_file))
+                else:
+                    logger.info(f"Ignoring START_BLOCK=0 since we have existing state: last_block={self.state['last_block']}")
+            except ValueError:
+                logger.error(f"Invalid START_BLOCK value: {explicit_start_block}")
+                # Fall back to normal initialization
+                self._initialize_from_state_or_db(current_mode)
+        else:
+            # No explicit start block, use normal initialization
+            self._initialize_from_state_or_db(current_mode)
+
+    def _initialize_from_state_or_db(self, current_mode):
+        """Initialize from state file or database if last_block is 0"""
         if self.state['last_block'] == 0:
             current_last_block = 0
             
@@ -71,15 +117,6 @@ class CryoIndexer:
             # Use the higher of mode's start block or last indexed block
             self.state['last_block'] = max(current_last_block, current_mode.start_block)
             save_state(self.state, settings.state_dir, state_file=os.path.basename(self.state_file))
-        
-        logger.info(f"Indexer initialized with state: {self.state}")
-        logger.info(f"Using data directory: {settings.data_dir}")
-        
-        # Verify Cryo installation
-        self._verify_cryo()
-        
-        # Set up tables in ClickHouse
-        self.clickhouse.setup_tables()
     
     def _verify_cryo(self):
         """Verify that Cryo is installed and working correctly."""
@@ -155,6 +192,20 @@ class CryoIndexer:
         
         # Check if we're running with an end block
         historical_mode = settings.end_block > 0
+        
+        # For all modes, query the database to find the actual progress
+        # rather than relying on state files that might be lost with container restarts
+        # BUT ONLY IF START_BLOCK is not explicitly set
+        if "blocks" in current_mode.datasets and "START_BLOCK" not in os.environ:
+            db_last_block = self.clickhouse.get_latest_block_for_table("blocks")
+            if db_last_block > 0:
+                logger.info(f"Found last processed block in database: {db_last_block}")
+                
+                # Only update state if database shows greater progress than our state file
+                # or if we're starting a new run (state['last_block'] == 0)
+                if db_last_block > self.state['last_block'] or self.state['last_block'] == 0:
+                    self.state['last_block'] = db_last_block
+        
         if historical_mode:
             logger.info(f"Running with fixed block range: {self.state['last_block']} to {settings.end_block}")
         
@@ -174,9 +225,6 @@ class CryoIndexer:
                 
                 # Check if there are new blocks to process
                 if safe_block > self.state['last_block']:
-                    # Check for reorgs before continuing
-                    self._handle_potential_reorg()
-                    
                     # Process new blocks
                     next_block = self.state['last_block']
                     end_block = min(safe_block, next_block + settings.max_blocks_per_batch)
@@ -184,14 +232,14 @@ class CryoIndexer:
                     logger.info(f"Processing blocks {next_block} to {end_block}")
                     self._process_blocks(next_block, end_block)
                     
-                    # Update state
-                    self.state['last_block'] = end_block #+ 1
-                    self.state['last_indexed_timestamp'] = int(time.time())
-                    self.state['mode'] = current_mode.name
+                    # Update state in memory
+                    self.state['last_block'] = end_block
+                    
+                    # Save state to file to track progress
                     save_state(self.state, settings.state_dir, state_file=os.path.basename(self.state_file))
                     
                     # Check if we've reached the requested end block in historical mode
-                    if historical_mode and self.state['last_block'] > settings.end_block:
+                    if historical_mode and self.state['last_block'] >= settings.end_block:
                         logger.info(f"Reached requested end block {settings.end_block}. Indexing complete.")
                         return  # Exit the function
                 else:
@@ -246,6 +294,9 @@ class CryoIndexer:
     
     def _process_blocks(self, start_block: int, end_block: int) -> None:
         try:
+            # Handle potential reorgs
+            self._handle_potential_reorg()
+            
             # Clean up data directory before starting
             self._clean_data_directory()
             
@@ -253,33 +304,91 @@ class CryoIndexer:
             current_mode = settings.get_current_mode()
             all_datasets = current_mode.datasets.copy()
             
-            # Always process blocks first separately
-            logger.info("Processing blocks first to ensure timestamp accuracy")
-            # Extract and load blocks first
-            self._run_cryo(start_block, end_block, ['blocks'])
-            self._load_to_clickhouse(['blocks'])
+            # Split datasets into state diff and non-state diff categories
+            state_diff_datasets = ['balance_diffs', 'code_diffs', 'nonce_diffs', 'storage_diffs']
+            non_state_diff_datasets = [d for d in all_datasets if d not in state_diff_datasets]
+            state_diff_only = [d for d in all_datasets if d in state_diff_datasets]
             
-            logger.info(f"About to verify blocks {start_block}-{end_block}")
-            # Always verify blocks are loaded before continuing
-            self._verify_blocks_loaded(start_block, end_block)
-            
-            # Then process other datasets if any
-            remaining_datasets = [d for d in all_datasets if d != 'blocks']
-            if remaining_datasets:
-                logger.info(f"Processing remaining datasets: {remaining_datasets}")
-                self._run_cryo(start_block, end_block, remaining_datasets)
-                self._load_to_clickhouse(remaining_datasets)
+            # Always process blocks first for timestamp reference
+            if 'blocks' in non_state_diff_datasets:
+                blocks_datasets = ['blocks']
+                logger.info("Processing blocks first to ensure timestamp accuracy")
+                self._run_cryo(start_block, end_block, blocks_datasets)
+                self._load_to_clickhouse(blocks_datasets)
                 
+                logger.info(f"Verifying blocks {start_block}-{end_block}")
+                # Verify blocks are loaded before continuing
+                self._verify_blocks_loaded(start_block, end_block)
+                
+                # Remove blocks from the list of datasets to process
+                non_state_diff_datasets = [d for d in non_state_diff_datasets if d != 'blocks']
+            
+            # Process remaining non-state diff datasets
+            if non_state_diff_datasets:
+                logger.info(f"Processing non-state diff datasets: {non_state_diff_datasets}")
+                self._run_cryo(start_block, end_block, non_state_diff_datasets)
+                self._load_to_clickhouse(non_state_diff_datasets)
+            
+            # Process state diff datasets if any (starting from block 1 or higher)
+            if state_diff_only:
+                # Adjust starting block for state diff datasets
+                state_diff_start = max(start_block, 1)  # Ensure state diffs start at least at block 1
+                
+                if state_diff_start != start_block:
+                    logger.info(f"Adjusting state diff starting block from {start_block} to {state_diff_start} (state diffs must start at block 1 or higher)")
+                
+                if state_diff_start <= end_block:  # Only process if there's a valid range
+                    logger.info(f"Processing state diff datasets for blocks {state_diff_start}-{end_block}: {state_diff_only}")
+                    self._run_cryo(state_diff_start, end_block, state_diff_only)
+                    self._load_to_clickhouse(state_diff_only)
+                else:
+                    logger.info(f"Skipping state diff datasets - no valid block range after adjustment (start: {state_diff_start}, end: {end_block})")
+        
         except Exception as e:
             logger.error(f"Error processing blocks {start_block}-{end_block}: {e}", exc_info=True)
             raise
+
+    def _check_blocks_exist(self, start_block: int, end_block: int) -> bool:
+        """Check if all blocks in range already exist in the database."""
+        try:
+            logger.info(f"Checking if blocks {start_block}-{end_block} already exist in database")
+            
+            query_result = self.clickhouse.client.query(f"""
+                SELECT 
+                    COUNT(*) as existing_blocks,
+                    COUNT(DISTINCT block_number) as distinct_blocks
+                FROM {self.clickhouse.database}.blocks
+                WHERE block_number BETWEEN {start_block} AND {end_block} - 1
+            """)
+            
+            if query_result.result_rows:
+                existing_blocks = query_result.result_rows[0][0]
+                distinct_blocks = query_result.result_rows[0][1]
+                expected_count = end_block - start_block
+                
+                if distinct_blocks == expected_count:
+                    logger.info(f"All {distinct_blocks} blocks already exist in database")
+                    
+                    # Check for duplicates
+                    if existing_blocks > distinct_blocks:
+                        logger.warning(f"Found {existing_blocks - distinct_blocks} duplicate block entries")
+                    
+                    return True
+                else:
+                    logger.info(f"Only {distinct_blocks}/{expected_count} blocks found in database")
+                    return False
+            else:
+                logger.info("No blocks found in database for this range")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error checking if blocks exist: {e}", exc_info=True)
+            return False
     
     def _verify_blocks_loaded(self, start_block: int, end_block: int) -> None:
         """Verify that blocks are loaded in the database before proceeding."""
         max_attempts = 5
         attempts = 0
-        
-        logger.info(f"======= {max_attempts}-{attempts}")
         
         while attempts < max_attempts:
             logger.info(f"Verifying blocks {start_block}-{end_block} are loaded in the database...")
@@ -303,6 +412,7 @@ class CryoIndexer:
                 
                 if total_blocks == expected_count and min_block == start_block and max_block == end_block - 1:
                     logger.info(f"All {total_blocks} blocks verified in database")
+                    time.sleep(5)
                     return
                 else:
                     logger.warning(f"Only {total_blocks}/{expected_count} blocks found in database. Min: {min_block}, Max: {max_block}")
@@ -343,7 +453,6 @@ class CryoIndexer:
             # Process in smaller batches
             current_start = start_block
             while current_start < end_block:
-                #current_end = min(current_start + batch_size - 1, end_block)
                 current_end = min(current_start + batch_size, end_block)
                 logger.info(f"Running Cryo for blocks {current_start}-{current_end}")
                 
@@ -433,7 +542,7 @@ class CryoIndexer:
                                 logger.info("Retry without network name succeeded!")
                                 logger.debug(f"Cryo stdout: {retry_process.stdout}")
                                 # Update current start and continue
-                                current_start = current_end #+ 1
+                                current_start = current_end
                                 continue
                             else:
                                 logger.error(f"Retry failed: {retry_process.stderr}")
@@ -442,8 +551,8 @@ class CryoIndexer:
                         raise Exception(f"Cryo process failed with return code {process.returncode}")
                 
                 logger.info(f"Successfully extracted data for blocks {current_start}-{current_end}")
-                current_start = current_end #+ 1
-                logger.info(f"blocks {current_start}-{end_block}")
+                current_start = current_end
+                logger.info(f"Remaining blocks to process: {current_start}-{end_block}")
             
         except subprocess.CalledProcessError as e:
             stderr_output = e.stderr if hasattr(e, 'stderr') else "No stderr captured"
@@ -470,7 +579,6 @@ class CryoIndexer:
             logger.info(f"Found {len(files)} parquet files for dataset {dataset}")
             
             # Process each file
-            logger.info(f"Files {files}")
             for file_path in files:
                 try:
                     rows = self.clickhouse.insert_parquet_file(file_path)

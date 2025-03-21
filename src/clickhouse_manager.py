@@ -76,42 +76,6 @@ class ClickHouseManager:
             logger.error(f"Error setting up tables: {e}")
             raise
     
-    def update_chain_metadata(self) -> None:
-        """Update chain metadata with current settings."""
-        try:
-            # Check if chain metadata for the current network exists
-            exists_query = f"""
-            SELECT 1 FROM {self.database}.chain_metadata 
-            WHERE network_name = '{settings.network_name}'
-            """
-            result = self.client.query(exists_query)
-            exists = len(result.result_rows) > 0
-            
-            if exists:
-                # Update existing row
-                update_query = f"""
-                ALTER TABLE {self.database}.chain_metadata 
-                UPDATE 
-                    genesis_timestamp = {settings.genesis_timestamp},
-                    seconds_per_block = {settings.seconds_per_block},
-                    chain_id = {settings.chain_id}
-                WHERE network_name = '{settings.network_name}'
-                """
-                self.client.command(update_query)
-                logger.info(f"Updated chain metadata for network: {settings.network_name}")
-            else:
-                # Insert new row
-                insert_query = f"""
-                INSERT INTO {self.database}.chain_metadata
-                (network_name, genesis_timestamp, seconds_per_block, chain_id)
-                VALUES ('{settings.network_name}', {settings.genesis_timestamp}, {settings.seconds_per_block}, {settings.chain_id})
-                """
-                self.client.command(insert_query)
-                logger.info(f"Inserted chain metadata for network: {settings.network_name}")
-        except Exception as e:
-            logger.error(f"Error updating chain metadata: {e}")
-            logger.warning("Continuing with default chain metadata values")
-    
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
     def insert_parquet_file(self, file_path: str) -> int:
         """
@@ -166,7 +130,7 @@ class ClickHouseManager:
             }
             
             table_name = table_mappings.get(dataset, dataset)
-            
+        
             logger.info(f"Importing {file_path} into {table_name}")
             
             # Read the parquet file
@@ -181,24 +145,29 @@ class ClickHouseManager:
             if table_exists:
                 table_columns = self._get_table_columns(table_name)
                 df = self._adjust_dataframe_to_schema(df, table_columns)
+                
+                # Add timestamps and month partitioning columns
+                if dataset != 'blocks' and 'block_number' in df.columns and 'block_timestamp' in table_columns:
+                    self._add_timestamp_columns(df, table_name)
             
             # Convert binary columns to hex strings for ClickHouse
-            for col in df.columns:
-                # Check if column contains binary data
-                if df[col].dtype == 'object' and df[col].notna().any():
-                    first_non_null = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
-                    if isinstance(first_non_null, bytes):
-                        logger.debug(f"Converting binary column {col} to hex strings")
-                        df[col] = df[col].apply(lambda x: x.hex() if isinstance(x, bytes) else None)
+            self._convert_binary_columns(df)
             
-            # Insert the data
+            # Insert using a ReplacingMergeTree strategy
+            # For ReplacingMergeTree tables, ClickHouse will eventually deduplicate rows
+            # with the same primary key during merges
             result = self.client.insert_df(f"{self.database}.{table_name}", df)
             
             # Handle the QuerySummary object properly
             if isinstance(result, QuerySummary):
-                # Extract the number of rows from the summary
                 row_count = result.written_rows if hasattr(result, 'written_rows') else len(df)
                 logger.info(f"Inserted {row_count} rows into {table_name}")
+                
+                # For critical tables like 'blocks', force a merge to deduplicate immediately
+                if table_name in ['blocks', 'transactions']:
+                    logger.info(f"Optimizing table {table_name} to deduplicate rows...")
+                    self.client.command(f"OPTIMIZE TABLE {self.database}.{table_name} FINAL")
+                
                 return row_count
             else:
                 logger.info(f"Inserted {result} rows into {table_name}")
@@ -207,6 +176,53 @@ class ClickHouseManager:
         except Exception as e:
             logger.error(f"Error inserting parquet file {file_path}: {e}")
             raise
+
+    def _add_timestamp_columns(self, df, table_name):
+        """Add timestamp and month columns to a dataframe based on block numbers."""
+        try:
+            # For each unique block number, get the timestamp
+            unique_blocks = df['block_number'].dropna().unique()
+            block_timestamps = {}
+            
+            for block_num in unique_blocks:
+                try:
+                    # Query the timestamp from blocks table
+                    query = f"""
+                    SELECT timestamp 
+                    FROM {self.database}.blocks 
+                    WHERE block_number = {int(block_num)} 
+                    LIMIT 1
+                    """
+                    result = self.client.query(query)
+                    if result.result_rows:
+                        timestamp = result.result_rows[0][0]
+                        block_timestamps[block_num] = timestamp
+                except Exception as e:
+                    logger.warning(f"Error getting timestamp for block {block_num}: {e}")
+            
+            # Map block numbers to timestamps
+            df['block_timestamp'] = df['block_number'].map(
+                lambda x: pd.Timestamp.fromtimestamp(block_timestamps.get(x, 0)) if pd.notna(x) else None
+            )
+            
+            # Calculate month from block_timestamp
+            if 'month' in self._get_table_columns(table_name):
+                df['month'] = df['block_timestamp'].apply(
+                    lambda x: x.strftime('%Y-%m') if pd.notna(x) else '1970-01'
+                )
+        except Exception as e:
+            logger.warning(f"Error adding timestamp columns: {e}")
+        
+    def _convert_binary_columns(self, df):
+        """Convert binary columns to hex strings for ClickHouse."""
+        for col in df.columns:
+            # Check if column contains binary data
+            if df[col].dtype == 'object' and df[col].notna().any():
+                first_non_null = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
+                if isinstance(first_non_null, bytes):
+                    logger.debug(f"Converting binary column {col} to hex strings")
+                    df[col] = df[col].apply(lambda x: x.hex() if isinstance(x, bytes) else None)
+                    
     
     def _check_table_exists(self, table_name: str) -> bool:
         """Check if a table exists in the database."""
@@ -397,10 +413,6 @@ class ClickHouseManager:
                     logger.error(f"Error executing migration {file_name}: {e}")
                     raise
             
-            # After running migrations, update chain metadata
-            if self._check_table_exists('chain_metadata'):
-                self.update_chain_metadata()
-            
             logger.info("All migrations completed successfully")
             return True
         except Exception as e:
@@ -434,41 +446,3 @@ class ClickHouseManager:
         except Exception as e:
             logger.error(f"Error getting latest block for table {table_name}: {e}")
             return 0
-
-
-    def get_block_timestamp(self, block_number: int) -> int:
-        """Get the timestamp for a specific block number using our chain metadata."""
-        try:
-            result = self.client.query(f"""
-            SELECT toDateTime64(addSeconds(
-                toDateTime((SELECT genesis_timestamp FROM {self.database}.chain_metadata WHERE network_name = 'gnosis' LIMIT 1)),
-                {block_number} * (SELECT seconds_per_block FROM {self.database}.chain_metadata WHERE network_name = 'gnosis' LIMIT 1)
-            ), 0, 'UTC')
-            """)
-            
-            if result.result_rows and result.result_rows[0][0] is not None:
-                return result.result_rows[0][0]
-            return 0
-        except Exception as e:
-            logger.error(f"Error getting timestamp for block {block_number}: {e}")
-            return 0
-
-    def get_month_partition_for_block(self, block_number: int) -> str:
-        """Get the month partition for a specific block."""
-        try:
-            result = self.client.query(f"""
-            SELECT formatDateTime(
-                toDateTime64(addSeconds(
-                    toDateTime((SELECT genesis_timestamp FROM {self.database}.chain_metadata WHERE network_name = 'gnosis' LIMIT 1)),
-                    {block_number} * (SELECT seconds_per_block FROM {self.database}.chain_metadata WHERE network_name = 'gnosis' LIMIT 1)
-                ), 0, 'UTC'),
-                '%Y-%m', 'UTC'
-            )
-            """)
-            
-            if result.result_rows and result.result_rows[0][0] is not None:
-                return result.result_rows[0][0]
-            return "unknown"
-        except Exception as e:
-            logger.error(f"Error getting month partition for block {block_number}: {e}")
-            return "unknown"

@@ -180,3 +180,49 @@ purge-all:
 	else \
 		echo "All volumes successfully purged. The system has been completely reset."; \
 	fi
+
+backfill:
+	@if [ -z "$(START_BLOCK)" ]; then \
+		echo "Error: START_BLOCK parameter is required"; \
+		echo "Usage: make backfill START_BLOCK=<block> [END_BLOCK=<block>] [MODE=<mode>] [DATASETS=<datasets>]"; \
+		exit 1; \
+	fi
+	@echo "Running backfill with START_BLOCK=$(START_BLOCK), END_BLOCK=$(END_BLOCK), MODE=$(MODE), DATASETS=$(DATASETS)"
+	@BACKFILL_ID=$$(date +%Y%m%d%H%M%S) \
+	START_BLOCK=$(START_BLOCK) \
+	END_BLOCK=$(END_BLOCK) \
+	MODE=$(MODE) \
+	DATASETS=$(DATASETS) \
+	docker compose -f docker-compose.backfill.yml up --abort-on-container-exit
+
+# Specialized backfills
+backfill-blocks:
+	@if [ -z "$(START_BLOCK)" ]; then \
+		echo "Error: START_BLOCK parameter is required"; \
+		echo "Usage: make backfill-blocks START_BLOCK=<block> [END_BLOCK=<block>]"; \
+		exit 1; \
+	fi
+	@echo "Running blocks backfill from block $(START_BLOCK)"
+	@make backfill MODE=blocks START_BLOCK=$(START_BLOCK) END_BLOCK=$(END_BLOCK)
+
+backfill-transactions:
+	@if [ -z "$(START_BLOCK)" ]; then \
+		echo "Error: START_BLOCK parameter is required"; \
+		echo "Usage: make backfill-transactions START_BLOCK=<block> [END_BLOCK=<block>]"; \
+		exit 1; \
+	fi
+	@echo "Running transactions backfill from block $(START_BLOCK)"
+	@make backfill MODE=transactions START_BLOCK=$(START_BLOCK) END_BLOCK=$(END_BLOCK)
+
+backfill-full:
+	@if [ -z "$(START_BLOCK)" ]; then \
+		echo "Error: START_BLOCK parameter is required"; \
+		echo "Usage: make backfill-full START_BLOCK=<block> [END_BLOCK=<block>]"; \
+		exit 1; \
+	fi
+	@echo "Running full backfill from block $(START_BLOCK)"
+	@make backfill MODE=full START_BLOCK=$(START_BLOCK) END_BLOCK=$(END_BLOCK)
+
+# Clean backfill volumes
+clean-backfill:
+	docker compose -f docker-compose.backfill.yml down -v

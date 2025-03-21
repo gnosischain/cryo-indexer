@@ -8,9 +8,8 @@ CREATE TABLE IF NOT EXISTS {{database}}.nonce_diffs
     `from_value` Nullable(UInt64),
     `to_value` Nullable(UInt64),
     `chain_id` Nullable(UInt64),
-    `block_timestamp` Nullable(DateTime64(0, 'UTC')) MATERIALIZED 
-        toDateTime64(coalesce((SELECT timestamp FROM {{database}}.blocks WHERE blocks.block_number = block_number LIMIT 1), 0), 0, 'UTC'),
-    `month` String MATERIALIZED formatDateTime(block_timestamp, '%Y-%m', 'UTC')
+    `block_timestamp` Nullable(DateTime64(0, 'UTC')),
+    `month` String
 )
 ENGINE = ReplacingMergeTree()
 PARTITION BY month
