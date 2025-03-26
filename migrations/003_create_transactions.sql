@@ -21,13 +21,7 @@ CREATE TABLE IF NOT EXISTS {{database}}.transactions
     `n_input_bytes` Nullable(UInt32),
     `n_input_zero_bytes` Nullable(UInt32),
     `n_input_nonzero_bytes` Nullable(UInt32),
-    `n_rlp_bytes` Nullable(UInt32),
-    `block_hash` Nullable(String),
     `chain_id` Nullable(UInt64),
-    `timestamp` Nullable(UInt32),
-    `r` Nullable(String),
-    `s` Nullable(String),
-    `v` Nullable(UInt8),
     `block_timestamp` Nullable(DateTime64(0, 'UTC')),
     `month` String
 )

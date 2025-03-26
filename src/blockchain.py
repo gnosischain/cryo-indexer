@@ -11,6 +11,7 @@ class BlockchainClient:
     
     def __init__(self, rpc_url: str):
         self.rpc_url = rpc_url
+        logger.info(f"BlockchainClient initialization: { self.rpc_url}")
         self.web3 = Web3(Web3.HTTPProvider(rpc_url))
         self.session = requests.Session()
         logger.info(f"BlockchainClient initialized. Connected: {self.web3.is_connected()}")
