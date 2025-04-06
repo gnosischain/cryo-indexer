@@ -1,24 +1,27 @@
 ![Cryo Indexer Header](img/header-cryo-indexer.png)
 
-A service for continuously indexing blockchain data using Cryo and storing it in ClickHouse, with support for running multiple indexers with different datasets.
+# Cryo Indexer
+
+A service for continuously indexing blockchain data using [Cryo](https://github.com/paradigmxyz/cryo) and storing it in ClickHouse, with support for running multiple specialized indexers with different datasets.
 
 ## Overview
 
-Cryo Indexer extracts blockchain data using the [Cryo](https://github.com/paradigmxyz/cryo) tool and stores it in a ClickHouse database for easy querying and analysis. It supports automatic handling of chain reorganizations and can extract various types of blockchain data such as blocks, transactions, logs, and more.
+Cryo Indexer extracts blockchain data using the Cryo tool and stores it in a ClickHouse database for easy querying and analysis. It supports automatic handling of chain reorganizations and can extract various types of blockchain data such as blocks, transactions, logs, state diffs, and token transfers.
 
 ## Multi-Mode Functionality
 
-The cryo indexer supports running multiple instances with different dataset configurations and starting blocks. This enables the following capabilities:
+The Cryo indexer supports running multiple instances with different dataset configurations and starting blocks. This enables the following capabilities:
 
 - Run different datasets in separate processes to balance resource usage
 - Start different dataset types from different block heights
 - Manage separate indexing progress for each dataset group
+- Backfill specific data ranges as needed
 
 ## Features
 
 - Continuously index blockchain data
-- Handle chain reorganizations
-- Store data in ClickHouse database
+- Handle chain reorganizations automatically
+- Store data in ClickHouse database with optimized schema
 - Configurable indexing options
 - Multiple indexer modes with different dataset configurations
 - Support for multiple datasets:
@@ -26,22 +29,27 @@ The cryo indexer supports running multiple instances with different dataset conf
   - Transactions
   - Logs
   - Contracts
-  - ERC20/ERC721 transfers
-  - State diffs
+  - ERC20/ERC721 transfers and metadata
+  - State diffs (balance, code, nonce, storage)
+  - Transaction traces
+  - Native token transfers
   - And more...
 
 ## Requirements
 
 - Docker and Docker Compose
-- An Ethereum RPC node
-- ClickHouse instance
+- An Ethereum RPC node with archive access
+- ClickHouse instance (Cloud or self-hosted)
 
 ## Quick Start
 
 1. Clone the repository
 2. Copy `.env.example` to `.env` and customize it with your settings
-3. Run the migrations and start the indexer:
-
+3. Build the Docker image:
+```bash
+make build-image
+```
+4. Run the migrations and start the indexer:
 ```bash
 # Start a single indexer with default settings
 make start
@@ -74,6 +82,7 @@ POLL_INTERVAL=15
 LOG_LEVEL=INFO
 CHAIN_ID=1
 MAX_BLOCKS_PER_BATCH=1000
+NETWORK_NAME=ethereum
 
 # Default indexer start block
 START_BLOCK=0
@@ -93,19 +102,21 @@ DATASETS=blocks,transactions,logs
 
 The indexer supports several predefined modes:
 
-- `default`: Index blocks, transactions, and logs (starting from block 0)
-- `blocks`: Index only blocks (starting from block 0)
-- `transactions`: Index only transactions (starting from block 0)
-- `logs`: Index only event logs (starting from block 0)
-- `contracts`: Index only contract creations (starting from block 0)
-- `transfers`: Index only native ETH transfers (starting from block 0)
-- `tx_data`: Index all transaction-related data (blocks, transactions, logs, contracts, transfers) (starting from block 0)
-- `traces`: Index transaction traces (starting from block 0)
-- `state_diffs`: Index state differences (balance, code, nonce, storage) (starting from block 1)
-- `erc20`: Index ERC20 token transfers and metadata (starting from block 0)
-- `erc721`: Index ERC721 token transfers and metadata (starting from block 0)
-- `full`: Index all available data types (starting from block 0)
-- `custom`: Custom indexing mode configured via DATASETS and START_BLOCK environment variables
+| Mode | Description | Datasets | Default Start Block |
+|------|-------------|----------|-------------------|
+| `default` | Basic blockchain data | blocks, transactions, logs | 0 |
+| `blocks` | Only block data | blocks | 0 |
+| `transactions` | Only transaction data | transactions | 0 |
+| `logs` | Only event logs | logs | 0 |
+| `contracts` | Only contract creations | contracts | 0 |
+| `transfers` | Only native ETH transfers | native_transfers | 0 |
+| `tx_data` | All transaction-related data | blocks, transactions, logs, contracts, traces, native_transfers | 0 |
+| `traces` | Transaction traces | traces | 0 |
+| `state_diffs` | State differences | balance_diffs, code_diffs, nonce_diffs, storage_diffs | 1 |
+| `erc20` | ERC20 token data | erc20_transfers, erc20_metadata | 0 |
+| `erc721` | ERC721 token data | erc721_transfers, erc721_metadata | 0 |
+| `full` | All available data types | blocks, transactions, logs, contracts, native_transfers, traces, balance_diffs, code_diffs, nonce_diffs, storage_diffs | 0 |
+| `custom` | User-defined datasets | Specified via DATASETS env var | Specified via START_BLOCK env var |
 
 ### Running Multiple Indexers
 
@@ -140,24 +151,67 @@ The multi-mode setup includes the following indexers:
 
 Each indexer maintains its own state and data using Docker volumes, so they can progress independently.
 
+### Database Schema
+
+The indexer creates the following tables in your ClickHouse database:
+
+| Table Name | Description | Datasets |
+|------------|-------------|----------|
+| `blocks` | Block headers | blocks |
+| `transactions` | Transaction data | transactions, txs |
+| `logs` | Event logs | logs, events |
+| `contracts` | Contract creations | contracts |
+| `native_transfers` | Native token transfers | native_transfers |
+| `traces` | Transaction traces | traces |
+| `balance_diffs` | Balance changes | balance_diffs |
+| `code_diffs` | Contract code changes | code_diffs |
+| `nonce_diffs` | Account nonce changes | nonce_diffs |
+| `storage_diffs` | Contract storage changes | storage_diffs, slot_diffs |
+| `migrations` | Database migration tracking | (internal) |
+
+Tables are created using a migrations system that ensures your database schema stays in sync with the codebase.
+
 ### Using Make Commands
 
 The repository includes a Makefile to simplify common operations:
 
-- `make build` - Build Docker containers
+#### Environment Setup
+- `make build-image` - Build the Docker image for all services
+
+#### Database Management
 - `make run-migrations` - Run database migrations only
 - `make force-migrations` - Run migrations even if previously applied
-- `make run-indexer` - Start the default indexer
+- `make debug-migrations` - Debug migrations with shell access
+
+#### Indexer Operations
+- `make run-indexer` - Start the indexer in default mode
 - `make run-state` - Start the state diffs indexer
 - `make run-traces` - Start the traces indexer
 - `make run-tokens` - Start the token data indexer
 - `make run-multi` - Start all specialized indexers
-- `make start` - Run migrations and start the default indexer
-- `make stop` - Stop the default indexer
+- `make start` - Run migrations and start the indexer
+- `make stop` - Stop the indexer
 - `make stop-multi` - Stop all specialized indexers
-- `make logs` - View logs for the default indexer
-- `make logs-service S=cryo-indexer-state` - View logs for a specific service
-- `make clean` - Clean up all containers and volumes
+- `make logs` - View logs from the indexer
+- `make logs-service S=<service>` - View logs for a specific service
+
+#### Backfilling Data
+- `make backfill START_BLOCK=<block> [END_BLOCK=<block>] [MODE=<mode>] [DATASETS=<datasets>]` - Run a backfill for a specific block range
+- `make backfill-blocks START_BLOCK=<block> [END_BLOCK=<block>]` - Backfill only blocks
+- `make backfill-transactions START_BLOCK=<block> [END_BLOCK=<block>]` - Backfill only transactions
+- `make backfill-full START_BLOCK=<block> [END_BLOCK=<block>]` - Backfill all datasets
+- `make clean-backfill` - Clean up backfill containers and volumes
+
+#### Volume Management
+- `make clean` - Remove all containers and volumes
+- `make purge-indexer` - Delete only the default indexer volumes
+- `make purge-state` - Delete only the state diffs indexer volumes
+- `make purge-traces` - Delete only the traces indexer volumes
+- `make purge-tokens` - Delete only the tokens indexer volumes
+- `make purge-migrations` - Delete only the migrations volumes
+- `make purge-all` - Delete all Docker volumes (complete reset)
+
+Run `make help` to see all available commands and their descriptions.
 
 ## Architecture
 
@@ -221,6 +275,24 @@ TRACES_START_BLOCK=15000000
 TOKENS_START_BLOCK=15000000
 ```
 
+## Backfilling Specific Ranges
+
+You can backfill specific block ranges for targeted datasets:
+
+```bash
+# Backfill blocks 1000000-1100000 with all data
+make backfill START_BLOCK=1000000 END_BLOCK=1100000 MODE=full
+
+# Backfill only blocks and transactions for a range
+make backfill START_BLOCK=1000000 END_BLOCK=1100000 DATASETS=blocks,transactions
+
+# Use specialized backfill commands
+make backfill-blocks START_BLOCK=1000000 END_BLOCK=1100000
+make backfill-transactions START_BLOCK=1000000 END_BLOCK=1100000
+```
+
+Backfill operations run as one-time services that exit when complete, making them ideal for filling gaps in your data.
+
 ## Troubleshooting
 
 ### Different Services Progressing at Different Rates
@@ -236,6 +308,7 @@ Running multiple indexers can be resource-intensive. You may need to adjust the 
 If your RPC provider is limiting requests:
 - Adjust `MAX_BLOCKS_PER_BATCH` to a lower value
 - Consider specialized RPC providers for specific data types
+- Check the logs for rate limiting messages
 
 ### State Diffs Failing Below Block 1
 
@@ -247,6 +320,7 @@ If you're having trouble with ClickHouse connections:
 - Verify your ClickHouse credentials in `.env`
 - Make sure the ClickHouse instance is running and accessible
 - Check the logs for detailed error messages
+- Ensure your firewall allows connections to the ClickHouse port
 
 ### Checking Individual Service Status
 
@@ -262,6 +336,20 @@ If you encounter problems with migrations:
 - Run `make force-migrations` to force migrations to run again
 - Check the migration logs for specific errors: `docker logs cryo-migrations`
 - Use `make debug-migrations` to get a shell inside the migrations container for troubleshooting
+
+### Handling Incomplete or Failed Runs
+
+If an indexer stops unexpectedly:
+- Check logs with `make logs-service S=<service_name>`
+- You can safely restart the service with the same command used to start it
+- The indexer will pick up where it left off using its state file
+
+### Docker Volume Issues
+
+If you encounter problems with Docker volumes:
+- Use `make purge-all` to completely reset all volumes (warning: this will delete all indexed data)
+- For targeted cleanup, use the specific volume purge commands like `make purge-indexer`
+- Check Docker volume status with `docker volume ls | grep cryo-indexer`
 
 ## License
 
