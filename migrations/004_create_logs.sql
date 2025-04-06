@@ -1,4 +1,3 @@
--- Logs table
 CREATE TABLE IF NOT EXISTS {{database}}.logs
 (
     `block_number` Nullable(UInt32),
@@ -13,10 +12,9 @@ CREATE TABLE IF NOT EXISTS {{database}}.logs
     `data` Nullable(String),
     `n_data_bytes` Nullable(UInt32),
     `chain_id` Nullable(UInt64),
-    `block_timestamp` Nullable(DateTime64(0, 'UTC')),
-    `month` String
+    `block_timestamp` DateTime64(0, 'UTC')
 )
 ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(block_timestamp)
 ORDER BY (block_number, transaction_index, log_index)
 SETTINGS allow_nullable_key = 1;

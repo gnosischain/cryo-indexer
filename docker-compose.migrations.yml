@@ -1,9 +1,7 @@
 services:
   # One-off service for running migrations
   cryo-migrations:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: cryo-indexer:latest
     container_name: cryo-migrations
     volumes:
       - migration_data:/app/data

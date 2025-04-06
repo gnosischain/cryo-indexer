@@ -9,9 +9,9 @@ CREATE TABLE IF NOT EXISTS {{database}}.blocks
     `timestamp` Nullable(UInt32),
     `base_fee_per_gas` Nullable(UInt64),
     `chain_id` Nullable(UInt64),
-    `month` String MATERIALIZED formatDateTime(toDateTime(timestamp), '%Y-%m', 'UTC')
+    `block_timestamp` DateTime MATERIALIZED toDateTime(timestamp)
 )
 ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(block_timestamp)
 ORDER BY block_number
 SETTINGS allow_nullable_key = 1;

@@ -1,4 +1,3 @@
--- Contracts table
 CREATE TABLE IF NOT EXISTS {{database}}.contracts
 (
     `block_number` Nullable(UInt32),
@@ -15,10 +14,9 @@ CREATE TABLE IF NOT EXISTS {{database}}.contracts
     `n_code_bytes` Nullable(UInt32),
     `code_hash` Nullable(String),
     `chain_id` Nullable(UInt64),
-    `block_timestamp` Nullable(DateTime64(0, 'UTC')),
-    `month` String
+    `block_timestamp` DateTime64(0, 'UTC')
 )
 ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(block_timestamp)
 ORDER BY (block_number, create_index)
 SETTINGS allow_nullable_key = 1;

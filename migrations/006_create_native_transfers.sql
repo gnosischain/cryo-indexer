@@ -1,4 +1,3 @@
--- Native Transfers table
 CREATE TABLE IF NOT EXISTS {{database}}.native_transfers
 (
     `block_number` Nullable(UInt32),
@@ -12,10 +11,9 @@ CREATE TABLE IF NOT EXISTS {{database}}.native_transfers
     `value_string` Nullable(String),
     `value_f64` Nullable(Float64),
     `chain_id` Nullable(UInt64),
-    `block_timestamp` Nullable(DateTime64(0, 'UTC')),
-    `month` String
+    `block_timestamp` DateTime64(0, 'UTC')
 )
 ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(block_timestamp)
 ORDER BY (block_number, transfer_index)
 SETTINGS allow_nullable_key = 1;

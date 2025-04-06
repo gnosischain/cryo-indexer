@@ -1,4 +1,3 @@
--- Balance Diffs table
 CREATE TABLE IF NOT EXISTS {{database}}.balance_diffs
 (
     `block_number` Nullable(UInt32),
@@ -12,10 +11,9 @@ CREATE TABLE IF NOT EXISTS {{database}}.balance_diffs
     `to_value_string` Nullable(String),
     `to_value_f64` Nullable(Float64),
     `chain_id` Nullable(UInt64),
-    `block_timestamp` Nullable(DateTime64(0, 'UTC')),
-    `month` String
+    `block_timestamp` DateTime64(0, 'UTC')
 )
 ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(block_timestamp)
 ORDER BY (block_number, transaction_index)
 SETTINGS allow_nullable_key = 1;

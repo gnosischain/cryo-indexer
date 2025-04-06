@@ -1,4 +1,3 @@
--- Storage Diffs table
 CREATE TABLE IF NOT EXISTS {{database}}.storage_diffs
 (
     `block_number` Nullable(UInt32),
@@ -9,10 +8,9 @@ CREATE TABLE IF NOT EXISTS {{database}}.storage_diffs
     `from_value` Nullable(String),
     `to_value` Nullable(String),
     `chain_id` Nullable(UInt64),
-    `block_timestamp` Nullable(DateTime64(0, 'UTC')),
-    `month` String
+    `block_timestamp` DateTime64(0, 'UTC')
 )
 ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(block_timestamp)
 ORDER BY (block_number, transaction_index)
 SETTINGS allow_nullable_key = 1;

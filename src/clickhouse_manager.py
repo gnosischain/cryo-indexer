@@ -206,10 +206,10 @@ class ClickHouseManager:
             )
             
             # Calculate month from block_timestamp
-            if 'month' in self._get_table_columns(table_name):
-                df['month'] = df['block_timestamp'].apply(
-                    lambda x: x.strftime('%Y-%m') if pd.notna(x) else '1970-01'
-                )
+           # if 'month' in self._get_table_columns(table_name):
+           #     df['month'] = df['block_timestamp'].apply(
+           #         lambda x: x.strftime('%Y-%m') if pd.notna(x) else '1970-01'
+           #     )
         except Exception as e:
             logger.warning(f"Error adding timestamp columns: {e}")
         

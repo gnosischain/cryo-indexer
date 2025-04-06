@@ -1,4 +1,3 @@
--- Traces table
 CREATE TABLE IF NOT EXISTS {{database}}.traces
 (
     `action_from` Nullable(String),
@@ -22,10 +21,9 @@ CREATE TABLE IF NOT EXISTS {{database}}.traces
     `block_hash` Nullable(String),
     `error` Nullable(String),
     `chain_id` Nullable(UInt64),
-    `block_timestamp` Nullable(DateTime64(0, 'UTC')),
-    `month` String
+    `block_timestamp` DateTime64(0, 'UTC')
 )
 ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(block_timestamp)
 ORDER BY (block_number, transaction_index, trace_address)
 SETTINGS allow_nullable_key = 1;
