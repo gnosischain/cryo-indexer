@@ -26,7 +26,7 @@ services:
       - INDEXER_MODE=${INDEXER_MODE:-default}
       - DATASETS=${DATASETS:-blocks,transactions,logs}
       - NETWORK_NAME=${NETWORK_NAME:-gnosis}
-    restart: unless-stopped
+    #restart: unless-stopped
 
 volumes:
   indexer_data:

@@ -164,9 +164,9 @@ class ClickHouseManager:
                 logger.info(f"Inserted {row_count} rows into {table_name}")
                 
                 # For critical tables like 'blocks', force a merge to deduplicate immediately
-                if table_name in ['blocks', 'transactions']:
-                    logger.info(f"Optimizing table {table_name} to deduplicate rows...")
-                    self.client.command(f"OPTIMIZE TABLE {self.database}.{table_name} FINAL")
+                #if table_name in ['blocks', 'transactions']:
+                #    logger.info(f"Optimizing table {table_name} to deduplicate rows...")
+                #    self.client.command(f"OPTIMIZE TABLE {self.database}.{table_name} FINAL")
                 
                 return row_count
             else:
