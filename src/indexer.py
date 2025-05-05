@@ -12,7 +12,7 @@ import time
 from .config import settings
 from .blockchain import BlockchainClient
 from .clickhouse_manager import ClickHouseManager
-from .utils import setup_logging, load_state, save_state, find_parquet_files, format_block_range
+from .utils import setup_logging, load_state, save_state, find_parquet_files, format_block_range, read_parquet_to_pandas
 
 
 class CryoIndexer:
@@ -393,10 +393,10 @@ class CryoIndexer:
         while attempts < max_attempts:
             logger.info(f"Verifying blocks {start_block}-{end_block} are loaded in the database...")
             
-            # Query to check if blocks are loaded
+            # Modified query to count DISTINCT block numbers
             query_result = self.clickhouse.client.query(f"""
                 SELECT 
-                    COUNT(*) as total_blocks,
+                    COUNT(DISTINCT block_number) as distinct_blocks,
                     MIN(block_number) as min_block,
                     MAX(block_number) as max_block
                 FROM {self.clickhouse.database}.blocks
@@ -404,18 +404,18 @@ class CryoIndexer:
             """)
             
             if query_result.result_rows:
-                total_blocks = query_result.result_rows[0][0]
+                distinct_blocks = query_result.result_rows[0][0]
                 min_block = query_result.result_rows[0][1]
                 max_block = query_result.result_rows[0][2]
                 
                 expected_count = end_block - start_block
                 
-                if total_blocks == expected_count and min_block == start_block and max_block == end_block - 1:
-                    logger.info(f"All {total_blocks} blocks verified in database")
+                if distinct_blocks == expected_count and min_block == start_block and max_block == end_block - 1:
+                    logger.info(f"All {distinct_blocks} blocks verified in database")
                     time.sleep(5)
                     return
                 else:
-                    logger.warning(f"Only {total_blocks}/{expected_count} blocks found in database. Min: {min_block}, Max: {max_block}")
+                    logger.warning(f"Only {distinct_blocks}/{expected_count} distinct blocks found in database. Min: {min_block}, Max: {max_block}")
             else:
                 logger.warning("No blocks found in database for verification query")
             
@@ -581,6 +581,28 @@ class CryoIndexer:
             # Process each file
             for file_path in files:
                 try:
+                    # For blocks, check if they exist first
+                    if dataset == 'blocks':
+                        df = read_parquet_to_pandas(file_path)
+                        if not df.empty and 'block_number' in df.columns:
+                            min_block = df['block_number'].min()
+                            max_block = df['block_number'].max()
+                            
+                            # Check if any blocks in this range are already in the database
+                            query = f"""
+                            SELECT COUNT(DISTINCT block_number) as block_count
+                            FROM {self.clickhouse.database}.blocks
+                            WHERE block_number BETWEEN {min_block} AND {max_block}
+                            """
+                            result = self.clickhouse.client.query(query)
+                            existing_count = result.result_rows[0][0] if result.result_rows else 0
+                            expected_count = max_block - min_block + 1
+                            
+                            if existing_count == expected_count:
+                                logger.info(f"All blocks {min_block}-{max_block} already exist in database, skipping insert")
+                                continue
+
+                    # Insert the file if not all blocks exist
                     rows = self.clickhouse.insert_parquet_file(file_path)
                     total_rows += rows
                     files_processed += 1

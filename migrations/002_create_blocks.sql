@@ -14,4 +14,6 @@ CREATE TABLE IF NOT EXISTS {{database}}.blocks
 ENGINE = ReplacingMergeTree()
 PARTITION BY toStartOfMonth(block_timestamp)
 ORDER BY block_number
-SETTINGS allow_nullable_key = 1;
+SETTINGS allow_nullable_key = 1,
+replicated_deduplication_window         = 10,   -- last 10 parts
+replicated_deduplication_window_seconds = 900;  -- or 15 minutes
