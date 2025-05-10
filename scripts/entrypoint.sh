@@ -23,6 +23,21 @@ echo "CHAIN_ID: ${CHAIN_ID:-100}"
 echo "GENESIS_TIMESTAMP: ${GENESIS_TIMESTAMP:-1539024180}"
 echo "SECONDS_PER_BLOCK: ${SECONDS_PER_BLOCK:-5}"
 
+# Print parallel processing settings if in parallel mode
+if [ "${OPERATION_MODE}" = "parallel" ]; then
+    echo ""
+    echo "=== TRUE MULTIPROCESS INDEXING ==="
+    echo "PARALLEL_WORKERS: ${PARALLEL_WORKERS:-3} separate Python processes"
+    echo "WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-1000} blocks per worker batch"
+    
+    # Warn if PARALLEL_WORKERS is too high
+    if [ "${PARALLEL_WORKERS:-3}" -gt 10 ]; then
+        echo "WARNING: Using a high number of worker processes (${PARALLEL_WORKERS}). This may cause excessive resource usage."
+    fi
+    
+    echo ""
+fi
+
 # Verify that required environment variables are set
 if [ -z "$ETH_RPC_URL" ]; then
     echo "ERROR: ETH_RPC_URL environment variable is required"
@@ -198,7 +213,49 @@ case "${OPERATION_MODE}" in
         exit 0
         ;;
         
-    scraper)
+    parallel)
+        echo "Running in multiprocess parallel mode with ${PARALLEL_WORKERS:-3} processes"
+        # Check if migrations have been applied
+        if ! check_migrations; then
+            echo "WARNING: Migrations have not been applied. It's recommended to run migrations first."
+            echo "You can run migrations by using 'make run-migrations'"
+        fi
+        
+        # Start the indexer
+        echo "Starting indexer in parallel mode..."
+        cd /app
+        
+        # Set environment variables for the indexer
+        export INDEXER_STATE_FILE="$INDEXER_STATE_FILE"
+        export CHAIN_ID="${CHAIN_ID:-100}"
+        export OPERATION_MODE="parallel"
+        
+        # Set multiprocessing options
+        export PYTHONUNBUFFERED=1        # Ensure Python output is not buffered
+        export PYTHONFAULTHANDLER=1      # Enable fault handler for better error reporting
+        
+        # Detect available Python command
+        PYTHON_CMD="python3"
+        if ! command -v python3 &> /dev/null; then
+            if command -v python &> /dev/null; then
+                PYTHON_CMD="python"
+            else
+                echo "ERROR: No Python command found"
+                exit 3
+            fi
+        fi
+        
+        echo "Using ${PYTHON_CMD} command"
+        echo ""
+        echo "===================================================="
+        echo "STARTING MULTIPROCESS INDEXER WITH ${PARALLEL_WORKERS:-3} PROCESSES"
+        echo "===================================================="
+        echo ""
+        
+        DATASETS="$DATASETS_BACKUP" INDEXER_MODE="${INDEXER_MODE:-custom}" $PYTHON_CMD -m src.indexer
+        ;;
+        
+    scraper|*)
         echo "Running in scraper mode"
         # Check if migrations have been applied
         if ! check_migrations; then
@@ -227,11 +284,5 @@ case "${OPERATION_MODE}" in
         
         echo "Using ${PYTHON_CMD} command"
         DATASETS="$DATASETS_BACKUP" INDEXER_MODE="${INDEXER_MODE:-custom}" $PYTHON_CMD -m src.indexer
-        ;;
-        
-    *)
-        echo "ERROR: Unknown operation mode: ${OPERATION_MODE}"
-        echo "Supported modes: scraper, migrations_only"
-        exit 1
         ;;
 esac

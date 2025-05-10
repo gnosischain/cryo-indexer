@@ -9,6 +9,7 @@ from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from .config import settings
+from .clickhouse_pool import ClickHouseConnectionPool
 from .utils import read_parquet_to_pandas, parse_dataset_name_from_file
 
 
@@ -31,36 +32,33 @@ class ClickHouseManager:
         self.port = port
         self.secure = secure
         
-        self.client = self._connect()
+        # Create connection pool
+        self.connection_pool = ClickHouseConnectionPool(
+            host=host,
+            user=user,
+            password=password,
+            database=database,
+            port=port,
+            secure=secure
+        )
+        
+        # Get a client from the pool for initial setup
+        self.client = self.connection_pool.get_client()
         self._ensure_database_exists()
         
     def _connect(self) -> Client:
-        """Establish connection to ClickHouse."""
-        logger.info(f"Connecting to ClickHouse at {self.host}:{self.port}")
-        try:
-            client = clickhouse_connect.get_client(
-                host=self.host,
-                user=self.user,
-                password=self.password,
-                port=self.port,
-                secure=self.secure
-            )
-            # Test connection
-            client.command("SELECT 1")
-            logger.info("ClickHouse connection established successfully")
-            return client
-        except Exception as e:
-            logger.error(f"Error connecting to ClickHouse: {e}")
-            raise
+        """Get a ClickHouse client from the connection pool."""
+        return self.connection_pool.get_client()
     
     def _ensure_database_exists(self) -> None:
         """Make sure the target database exists."""
         try:
             # Try to create the database if it doesn't exist
-            self.client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
+            client = self._connect()
+            client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
             
             # Set the current database
-            self.client.command(f"USE {self.database}")
+            client.command(f"USE {self.database}")
             logger.info(f"Using database: {self.database}")
         except Exception as e:
             logger.error(f"Error ensuring database exists: {e}")
@@ -85,6 +83,9 @@ class ClickHouseManager:
             Number of rows inserted
         """
         try:
+            # Get a client from the pool
+            client = self._connect()
+            
             # Determine the target table
             dataset = parse_dataset_name_from_file(file_path)
             
@@ -156,18 +157,12 @@ class ClickHouseManager:
             # Insert using a ReplacingMergeTree strategy
             # For ReplacingMergeTree tables, ClickHouse will eventually deduplicate rows
             # with the same primary key during merges
-            result = self.client.insert_df(f"{self.database}.{table_name}", df)
+            result = client.insert_df(f"{self.database}.{table_name}", df)
             
             # Handle the QuerySummary object properly
             if isinstance(result, QuerySummary):
                 row_count = result.written_rows if hasattr(result, 'written_rows') else len(df)
                 logger.info(f"Inserted {row_count} rows into {table_name}")
-                
-                # For critical tables like 'blocks', force a merge to deduplicate immediately
-                #if table_name in ['blocks', 'transactions']:
-                #    logger.info(f"Optimizing table {table_name} to deduplicate rows...")
-                #    self.client.command(f"OPTIMIZE TABLE {self.database}.{table_name} FINAL")
-                
                 return row_count
             else:
                 logger.info(f"Inserted {result} rows into {table_name}")
@@ -187,13 +182,14 @@ class ClickHouseManager:
             for block_num in unique_blocks:
                 try:
                     # Query the timestamp from blocks table
+                    client = self._connect()
                     query = f"""
                     SELECT timestamp 
                     FROM {self.database}.blocks 
                     WHERE block_number = {int(block_num)} 
                     LIMIT 1
                     """
-                    result = self.client.query(query)
+                    result = client.query(query)
                     if result.result_rows:
                         timestamp = result.result_rows[0][0]
                         block_timestamps[block_num] = timestamp
@@ -204,12 +200,6 @@ class ClickHouseManager:
             df['block_timestamp'] = df['block_number'].map(
                 lambda x: pd.Timestamp.fromtimestamp(block_timestamps.get(x, 0)) if pd.notna(x) else None
             )
-            
-            # Calculate month from block_timestamp
-           # if 'month' in self._get_table_columns(table_name):
-           #     df['month'] = df['block_timestamp'].apply(
-           #         lambda x: x.strftime('%Y-%m') if pd.notna(x) else '1970-01'
-           #     )
         except Exception as e:
             logger.warning(f"Error adding timestamp columns: {e}")
         
@@ -227,7 +217,8 @@ class ClickHouseManager:
     def _check_table_exists(self, table_name: str) -> bool:
         """Check if a table exists in the database."""
         try:
-            result = self.client.query(f"""
+            client = self._connect()
+            result = client.query(f"""
             SELECT 1 FROM system.tables 
             WHERE database = '{self.database}' AND name = '{table_name}'
             """)
@@ -239,7 +230,8 @@ class ClickHouseManager:
     def _get_table_columns(self, table_name: str) -> List[str]:
         """Get the list of columns in a table."""
         try:
-            result = self.client.query(f"""
+            client = self._connect()
+            result = client.query(f"""
             SELECT name FROM system.columns 
             WHERE database = '{self.database}' AND table = '{table_name}'
             ORDER BY position
@@ -268,7 +260,8 @@ class ClickHouseManager:
     def get_latest_processed_block(self) -> int:
         """Get the latest block number that has been processed and stored in ClickHouse."""
         try:
-            result = self.client.query(f"""
+            client = self._connect()
+            result = client.query(f"""
             SELECT MAX(block_number) as max_block 
             FROM {self.database}.blocks
             """)
@@ -286,7 +279,8 @@ class ClickHouseManager:
         Used for reorg detection.
         """
         try:
-            result = self.client.query(f"""
+            client = self._connect()
+            result = client.query(f"""
             SELECT block_number, block_hash
             FROM {self.database}.blocks
             WHERE block_number BETWEEN {start_block} AND {end_block}
@@ -311,6 +305,8 @@ class ClickHouseManager:
         Used for handling reorgs.
         """
         try:
+            client = self._connect()
+            
             # List of tables to rollback
             tables = [
                 'blocks', 
@@ -332,13 +328,13 @@ class ClickHouseManager:
             
             for table in tables:
                 # Check if table exists before attempting to delete from it
-                table_exists = self.client.query(f"""
+                table_exists = client.query(f"""
                 SELECT 1 FROM system.tables 
                 WHERE database = '{self.database}' AND name = '{table}'
                 """)
                 
                 if table_exists.result_rows:
-                    self.client.command(f"""
+                    client.command(f"""
                     ALTER TABLE {self.database}.{table}
                     DELETE WHERE block_number > {block_number}
                     """)
@@ -353,6 +349,8 @@ class ClickHouseManager:
     def run_migrations(self, migrations_dir: str) -> bool:
         """Run SQL migrations from the provided directory."""
         try:
+            client = self._connect()
+            
             # Get all SQL files in the migrations directory, sorted
             migration_files = sorted([
                 f for f in os.listdir(migrations_dir)
@@ -362,7 +360,7 @@ class ClickHouseManager:
             logger.info(f"Found {len(migration_files)} migration files")
             
             # Create migrations table if it doesn't exist
-            self.client.command(f"""
+            client.command(f"""
             CREATE TABLE IF NOT EXISTS {self.database}.migrations
             (
                 `name` String,
@@ -374,7 +372,7 @@ class ClickHouseManager:
             """)
             
             # Get already executed migrations
-            executed_migrations = self.client.query(f"""
+            executed_migrations = client.query(f"""
             SELECT name FROM {self.database}.migrations
             """)
             
@@ -401,10 +399,10 @@ class ClickHouseManager:
                     for statement in sql.split(';'):
                         statement = statement.strip()
                         if statement:
-                            self.client.command(statement)
+                            client.command(statement)
                     
                     # Record successful migration
-                    self.client.command(f"""
+                    client.command(f"""
                     INSERT INTO {self.database}.migrations (name) VALUES ('{file_name}')
                     """)
                     
@@ -422,6 +420,8 @@ class ClickHouseManager:
     def get_latest_block_for_table(self, table_name: str) -> int:
         """Get the latest block number for a specific table."""
         try:
+            client = self._connect()
+            
             # Check if the table exists first
             table_exists = self._check_table_exists(table_name)
             if not table_exists:
@@ -435,7 +435,7 @@ class ClickHouseManager:
                 return 0
             
             # Query the max block number
-            result = self.client.query(f"""
+            result = client.query(f"""
             SELECT MAX(block_number) as max_block 
             FROM {self.database}.{table_name}
             """)

@@ -60,6 +60,12 @@ class IndexerSettings:
         self.default_start_block = int(os.environ.get("START_BLOCK", "0"))
         self.end_block = int(os.environ.get("END_BLOCK", "0"))
         
+        # Parallel processing settings
+        self.operation_mode = os.environ.get("OPERATION_MODE", "scraper")
+        self.parallel_workers = int(os.environ.get("PARALLEL_WORKERS", "1"))
+        self.worker_batch_size = int(os.environ.get("WORKER_BATCH_SIZE", str(self.max_blocks_per_batch)))
+        self.max_concurrent_workers = int(os.environ.get("MAX_CONCURRENT_WORKERS", "3"))
+        
         # Define indexer modes
         self._define_modes()
         
@@ -176,6 +182,14 @@ class IndexerSettings:
                 datasets=os.environ.get("DATASETS", "blocks,transactions,logs").split(","),
                 start_block=int(os.environ.get("START_BLOCK", "0")),
                 description="Custom indexing mode configured via DATASETS and START_BLOCK"
+            ),
+            
+            # Parallel mode for parallel indexing with multiple workers
+            "parallel": IndexerMode(
+                name="parallel",
+                datasets=os.environ.get("DATASETS", "blocks,transactions,logs").split(","),
+                start_block=int(os.environ.get("START_BLOCK", "0")),
+                description="Parallel indexing with multiple workers"
             )
         }
     

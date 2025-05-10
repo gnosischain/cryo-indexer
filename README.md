@@ -34,6 +34,7 @@ The Cryo indexer supports running multiple instances with different dataset conf
   - Transaction traces
   - Native token transfers
   - And more...
+- True parallel processing with multiple worker processes
 
 ## Requirements
 
@@ -56,6 +57,9 @@ make start
 
 # Or start multiple specialized indexers
 make run-multi
+
+# Or run with true parallel processing
+make run-parallel
 ```
 
 ## Setup
@@ -96,6 +100,10 @@ TOKENS_START_BLOCK=0     # For ERC20 and ERC721 tokens
 # Default indexer mode and datasets
 INDEXER_MODE=default
 DATASETS=blocks,transactions,logs
+
+# Parallel processing settings
+PARALLEL_WORKERS=4       # Number of worker processes in parallel mode
+WORKER_BATCH_SIZE=1000   # Blocks per worker batch in parallel mode
 ```
 
 ### Available Indexer Modes
@@ -117,6 +125,25 @@ The indexer supports several predefined modes:
 | `erc721` | ERC721 token data | erc721_transfers, erc721_metadata | 0 |
 | `full` | All available data types | blocks, transactions, logs, contracts, native_transfers, traces, balance_diffs, code_diffs, nonce_diffs, storage_diffs | 0 |
 | `custom` | User-defined datasets | Specified via DATASETS env var | Specified via START_BLOCK env var |
+
+### Operation Modes
+
+The indexer supports three main operation modes:
+
+1. **Sequential Mode (default)**: Single worker process that processes blocks sequentially
+   ```bash
+   make run-indexer
+   ```
+
+2. **Multi-Worker Mode**: Multiple specialized indexers, each focused on a specific set of datasets
+   ```bash
+   make run-multi
+   ```
+
+3. **Parallel Mode**: True parallel processing with multiple worker processes handling different block ranges
+   ```bash
+   make run-parallel
+   ```
 
 ### Running Multiple Indexers
 
@@ -150,6 +177,24 @@ The multi-mode setup includes the following indexers:
 4. **cryo-indexer-tokens**: Indexes ERC20 and ERC721 token data
 
 Each indexer maintains its own state and data using Docker volumes, so they can progress independently.
+
+### Parallel Processing
+
+For high-performance indexing, you can use the parallel processing mode which distributes the work across multiple worker processes:
+
+```bash
+# Run with 4 worker processes (default)
+make run-parallel
+
+# Run with 8 worker processes
+PARALLEL_WORKERS=8 make run-parallel
+```
+
+Parallel mode divides work into batches, with each worker process handling a different block range. This can significantly improve throughput, especially on systems with multiple CPU cores.
+
+You can customize the parallel processing with these environment variables:
+- `PARALLEL_WORKERS`: Number of worker processes (default: 4)
+- `WORKER_BATCH_SIZE`: Number of blocks per worker batch (default: 1000)
 
 ### Database Schema
 
@@ -189,11 +234,14 @@ The repository includes a Makefile to simplify common operations:
 - `make run-traces` - Start the traces indexer
 - `make run-tokens` - Start the token data indexer
 - `make run-multi` - Start all specialized indexers
+- `make run-parallel` - Start the parallel indexer with multiple workers
 - `make start` - Run migrations and start the indexer
 - `make stop` - Stop the indexer
 - `make stop-multi` - Stop all specialized indexers
+- `make stop-parallel` - Stop the parallel indexer
 - `make logs` - View logs from the indexer
 - `make logs-service S=<service>` - View logs for a specific service
+- `make logs-parallel` - View logs from the parallel indexer
 
 #### Backfilling Data
 - `make backfill START_BLOCK=<block> [END_BLOCK=<block>] [MODE=<mode>] [DATASETS=<datasets>]` - Run a backfill for a specific block range
@@ -208,6 +256,7 @@ The repository includes a Makefile to simplify common operations:
 - `make purge-state` - Delete only the state diffs indexer volumes
 - `make purge-traces` - Delete only the traces indexer volumes
 - `make purge-tokens` - Delete only the tokens indexer volumes
+- `make purge-parallel` - Delete only the parallel indexer volumes
 - `make purge-migrations` - Delete only the migrations volumes
 - `make purge-all` - Delete all Docker volumes (complete reset)
 
@@ -217,13 +266,37 @@ Run `make help` to see all available commands and their descriptions.
 
 The Cryo Indexer architecture consists of multiple components:
 
-1. **Migrations Service**: A one-time service that sets up the ClickHouse database schema
-2. **Indexer Services**: Multiple services that index different types of blockchain data
-3. **State Management**: Each indexer maintains its own state file to track progress
-4. **Mode System**: Predefined configurations for different data extraction needs
-5. **Docker Volumes**: Each service uses dedicated Docker volumes to store data, logs, and state
+1. **Core Components:**
+   - `config.py` - Configuration settings from environment variables
+   - `blockchain.py` - Client for blockchain RPC interaction
+   - `clickhouse_manager.py` - Database interaction manager
+   - `clickhouse_pool.py` - Connection pooling for ClickHouse
+   - `worker.py` - Unified worker implementation for block processing
 
-Each indexer uses the same code base but is configured differently through environment variables and mode settings, allowing them to focus on specific datasets and start from appropriate block heights.
+2. **Indexer Modes:**
+   - `indexer.py` - Main entry point and sequential mode implementation
+   - `multiprocess_indexer.py` - Parallel indexing with multiple processes
+
+3. **Services:**
+   - **Migrations Service**: A one-time service that sets up the ClickHouse database schema
+   - **Indexer Services**: Multiple services that index different types of blockchain data
+   - **State Management**: Each indexer maintains its own state file to track progress
+   - **Mode System**: Predefined configurations for different data extraction needs
+   - **Docker Volumes**: Each service uses dedicated Docker volumes to store data, logs, and state
+
+Each indexer service uses the same code base but is configured differently through environment variables and mode settings, allowing them to focus on specific datasets and start from appropriate block heights.
+
+### Worker Implementation
+
+The unified `IndexerWorker` class is at the core of the system, providing a consistent implementation for:
+
+1. **Block Processing**: Handling block ranges for any dataset
+2. **Data Extraction**: Running Cryo to extract blockchain data
+3. **Data Loading**: Importing data into ClickHouse
+4. **Reorg Handling**: Detecting and handling chain reorganizations
+5. **State Management**: Tracking progress of indexed blocks
+
+This unified worker can be used in both sequential and parallel modes, ensuring consistent behavior across all indexing operations.
 
 ## Data Storage
 
@@ -251,6 +324,7 @@ You can monitor each indexer's progress by:
    ```bash
    make logs
    make logs-service S=cryo-indexer-state
+   make logs-parallel
    ```
 
 2. Querying the ClickHouse database:
@@ -261,6 +335,25 @@ You can monitor each indexer's progress by:
    -- Check state diffs progress
    SELECT MAX(block_number) FROM blockchain.storage_diffs;
    ```
+
+## Performance Tuning
+
+### Sequential vs. Parallel Mode
+
+- **Sequential Mode**: Good for basic indexing on smaller chains or when resources are limited
+- **Multi-Worker Mode**: Best for balance between simplicity and performance, with different workers focusing on specific datasets
+- **Parallel Mode**: Highest performance, recommended for:
+  - High-throughput chains
+  - Initial sync of large block ranges
+  - Systems with multiple CPUs and high memory
+
+### Configuration Parameters
+
+- `MAX_BLOCKS_PER_BATCH`: Controls how many blocks are processed in a single batch (default: 1000)
+- `PARALLEL_WORKERS`: Number of worker processes in parallel mode (default: 4)
+- `WORKER_BATCH_SIZE`: Number of blocks per worker batch in parallel mode (default: 1000)
+- `CONFIRMATION_BLOCKS`: Number of blocks to wait before considering a block confirmed (default: 20)
+- `POLL_INTERVAL`: Time in seconds between checking for new blocks (default: 15)
 
 ## Customizing Start Blocks
 
@@ -350,6 +443,14 @@ If you encounter problems with Docker volumes:
 - Use `make purge-all` to completely reset all volumes (warning: this will delete all indexed data)
 - For targeted cleanup, use the specific volume purge commands like `make purge-indexer`
 - Check Docker volume status with `docker volume ls | grep cryo-indexer`
+
+### Parallel Processing Issues
+
+If you encounter issues with parallel processing:
+- Try reducing the number of workers with `PARALLEL_WORKERS=2`
+- Reduce the worker batch size with `WORKER_BATCH_SIZE=500`
+- Check individual worker logs in the logs directory
+- Ensure your system has enough CPU cores and memory for the specified number of workers
 
 ## License
 
