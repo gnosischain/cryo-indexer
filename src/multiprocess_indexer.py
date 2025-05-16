@@ -9,11 +9,12 @@ from loguru import logger
 from datetime import datetime
 import signal
 import sys
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 
 from .config import settings
 from .blockchain import BlockchainClient
 from .clickhouse_manager import ClickHouseManager
-from .worker import IndexerWorker  # Import the new unified worker
+from .worker import IndexerWorker
 from .utils import setup_logging, load_state, save_state
 
 
@@ -55,6 +56,11 @@ def write_shared_state(file_path, state):
     with file_lock(file_path):
         with open(file_path, 'w') as f:
             json.dump(state, f, indent=2)
+
+
+class ProcessingError(Exception):
+    """Exception raised when block processing fails."""
+    pass
 
 
 class MultiprocessIndexer:
@@ -108,8 +114,8 @@ class MultiprocessIndexer:
         
         # Process management
         self.processes = []
-        self.process_data = {}  # Store info about each process
-        
+        self.failed_ranges = []  # Track ranges that failed completely after max retries
+    
     def _init_shared_state(self):
         """Initialize the shared state file for worker processes."""
         if not os.path.exists(self.shared_state_file):
@@ -131,6 +137,11 @@ class MultiprocessIndexer:
         logger.info("Saving final state...")
         self._update_main_state()
         
+        # Log information about failed block ranges
+        if self.failed_ranges:
+            logger.error(f"There are {len(self.failed_ranges)} permanently failed block ranges")
+            logger.error(f"Permanent failures: {self.failed_ranges}")
+        
         logger.info("Shutdown complete")
         sys.exit(0)
     
@@ -148,55 +159,88 @@ class MultiprocessIndexer:
         except Exception as e:
             logger.error(f"Error updating main state: {e}")
     
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=60),
+        retry=retry_if_exception_type(ProcessingError),
+        before_sleep=before_sleep_log(logger, "INFO"),  
+        reraise=True
+    )
+    def _process_block_range(self, worker_id, start_block, end_block, datasets):
+        """Process a block range with automatic retries."""
+        retry_count = 0
+        for attempt in range(3):  # tenacity doesn't easily expose attempt number, so we track it manually
+            try:
+                # Configure process-specific logger
+                logger.remove()  # Remove existing handlers
+                logger.add(
+                    lambda msg: print(f"[Worker {worker_id}] {msg}", end="\n"),
+                    level=settings.log_level
+                )
+                logger.add(
+                    os.path.join(settings.log_dir, f"worker_{worker_id}.log"),
+                    rotation="10 MB",
+                    level=settings.log_level
+                )
+                
+                if attempt > 0:
+                    logger.info(f"Worker {worker_id} RETRY #{attempt} for blocks {start_block}-{end_block}")
+                    # Adjust rate limits for retries
+                    os.environ["WORKER_CRYO_REQUESTS_PER_SECOND"] = str(max(50, 500 // (attempt + 1)))
+                    os.environ["WORKER_CRYO_MAX_CONCURRENT"] = str(max(1, 5 // (attempt + 1)))
+                    os.environ["WORKER_CRYO_TIMEOUT"] = str(300 + (attempt * 60))  # Increase timeout for retries
+                else:
+                    logger.info(f"Worker {worker_id} processing blocks {start_block}-{end_block}")
+                
+                # Each worker gets its own blockchain client and ClickHouse manager
+                blockchain = BlockchainClient(settings.eth_rpc_url)
+                clickhouse = ClickHouseManager(
+                    host=settings.clickhouse_host,
+                    user=settings.clickhouse_user,
+                    password=settings.clickhouse_password,
+                    database=settings.clickhouse_database,
+                    port=settings.clickhouse_port,
+                    secure=settings.clickhouse_secure
+                )
+                
+                # Create worker using the unified IndexerWorker
+                worker = IndexerWorker(
+                    worker_id=str(worker_id),
+                    blockchain=blockchain,
+                    clickhouse=clickhouse,
+                    data_dir=settings.data_dir,
+                    network_name=settings.network_name,
+                    rpc_url=settings.eth_rpc_url
+                )
+                
+                # Process the block range
+                success = worker.process_block_range(start_block, end_block, datasets)
+                
+                if success:
+                    logger.info(f"Worker {worker_id} completed blocks {start_block}-{end_block}")
+                    self._mark_range_completed(start_block, end_block)
+                    return True
+                else:
+                    logger.error(f"Worker {worker_id} failed to process blocks {start_block}-{end_block}")
+                    # If worker.process_block_range returns False, raise exception to trigger retry
+                    raise ProcessingError(f"Failed to process blocks {start_block}-{end_block}")
+                
+            except ProcessingError:
+                # Let tenacity handle the retry
+                raise
+            except Exception as e:
+                logger.error(f"Worker {worker_id} encountered an error: {e}", exc_info=True)
+                raise ProcessingError(f"Exception while processing blocks {start_block}-{end_block}: {str(e)}")
+    
     def _worker_process(self, worker_id, start_block, end_block, datasets):
         """Worker process function that runs independently."""
-        # Configure process-specific logger
-        logger.remove()  # Remove existing handlers
-        logger.add(
-            lambda msg: print(f"[Worker {worker_id}] {msg}", end="\n"),
-            level=settings.log_level
-        )
-        logger.add(
-            os.path.join(settings.log_dir, f"worker_{worker_id}.log"),
-            rotation="10 MB",
-            level=settings.log_level
-        )
-        
-        logger.info(f"Worker {worker_id} started, processing blocks {start_block}-{end_block}")
-        
         try:
-            # Each worker gets its own blockchain client and ClickHouse manager
-            blockchain = BlockchainClient(settings.eth_rpc_url)
-            clickhouse = ClickHouseManager(
-                host=settings.clickhouse_host,
-                user=settings.clickhouse_user,
-                password=settings.clickhouse_password,
-                database=settings.clickhouse_database,
-                port=settings.clickhouse_port,
-                secure=settings.clickhouse_secure
-            )
-            
-            # Create worker using the new unified IndexerWorker
-            worker = IndexerWorker(
-                worker_id=str(worker_id),
-                blockchain=blockchain,
-                clickhouse=clickhouse,
-                data_dir=settings.data_dir,
-                network_name=settings.network_name,
-                rpc_url=settings.eth_rpc_url
-            )
-            
-            # Process the block range
-            success = worker.process_block_range(start_block, end_block, datasets)
-            
-            if success:
-                logger.info(f"Worker {worker_id} completed blocks {start_block}-{end_block}")
-                self._mark_range_completed(start_block, end_block)
-            else:
-                logger.error(f"Worker {worker_id} failed to process blocks {start_block}-{end_block}")
-        
+            # Process with retries
+            self._process_block_range(worker_id, start_block, end_block, datasets)
         except Exception as e:
-            logger.error(f"Worker {worker_id} encountered an error: {e}", exc_info=True)
+            # If all retries failed, mark as permanently failed
+            logger.error(f"Worker {worker_id} failed to process blocks {start_block}-{end_block} after all retries: {e}")
+            self._mark_range_failed_permanent(start_block, end_block)
     
     def _get_active_workers(self):
         """Get the number of currently active worker processes."""
@@ -241,6 +285,32 @@ class MultiprocessIndexer:
         except Exception as e:
             logger.error(f"Error marking range {start_block}-{end_block} as completed: {e}")
     
+    def _mark_range_failed_permanent(self, start_block, end_block):
+        """Mark a block range as permanently failed after all retries."""
+        try:
+            # Read current shared state with locking
+            shared_state = read_shared_state(self.shared_state_file)
+            
+            # Remove from active ranges
+            active_ranges = shared_state.get('active_ranges', [])
+            if [start_block, end_block] in active_ranges:
+                active_ranges.remove([start_block, end_block])
+            
+            # Add to in-memory failed ranges list
+            self.failed_ranges.append([start_block, end_block])
+            
+            # Log the permanent failure
+            logger.error(f"Block range {start_block}-{end_block} has failed permanently after multiple retries")
+            
+            # Update shared state
+            shared_state['active_ranges'] = active_ranges
+            
+            # Write updated shared state with locking
+            write_shared_state(self.shared_state_file, shared_state)
+            
+        except Exception as e:
+            logger.error(f"Error marking range {start_block}-{end_block} as permanently failed: {e}")
+    
     def _clean_finished_processes(self):
         """Remove completed processes from the list."""
         self.processes = [p for p in self.processes if p.is_alive()]
@@ -271,6 +341,16 @@ class MultiprocessIndexer:
                         return None
                     end_block = min(next_block + settings.worker_batch_size, safe_block)
             
+            # Check if this range is in permanently failed ranges
+            for start, end in self.failed_ranges:
+                if (start <= next_block < end) or (start < end_block <= end) or (next_block <= start < end_block):
+                    # Skip this range or part of it
+                    logger.warning(f"Skipping permanently failed range: {start}-{end}")
+                    next_block = max(end, next_block)
+                    if next_block >= safe_block:
+                        return None
+                    end_block = min(next_block + settings.worker_batch_size, safe_block)
+            
             # Update next_block for next call
             shared_state['next_block'] = end_block
             
@@ -287,12 +367,33 @@ class MultiprocessIndexer:
             logger.error(f"Error getting next block range: {e}")
             return None
     
+    def _log_status(self):
+        """Log current status of the indexer."""
+        try:
+            shared_state = read_shared_state(self.shared_state_file)
+            
+            active_count = len(shared_state.get('active_ranges', []))
+            completed_count = len(shared_state.get('completed_ranges', []))
+            permanent_failures = len(self.failed_ranges)
+            current_block = shared_state.get('next_block', 0)
+            
+            logger.info(f"Status: Current block: {current_block}, "
+                       f"Active ranges: {active_count}, "
+                       f"Completed ranges: {completed_count}, "
+                       f"Permanent failures: {permanent_failures}")
+        except Exception as e:
+            logger.error(f"Error logging status: {e}")
+    
     def run(self):
         """Start the multiprocess indexer and manage worker processes."""
         logger.info("Starting multiprocess indexer...")
         
         current_mode = settings.get_current_mode()
         historical_mode = settings.end_block > 0
+        
+        # Status logging timer
+        last_status_time = time.time()
+        status_interval = 60  # Log status every 60 seconds
         
         try:
             while True:
@@ -336,6 +437,12 @@ class MultiprocessIndexer:
                 # Periodically update the main state from shared state
                 self._update_main_state()
                 
+                # Periodically log status
+                current_time = time.time()
+                if current_time - last_status_time > status_interval:
+                    self._log_status()
+                    last_status_time = current_time
+                
                 # Check if we're done in historical mode
                 if historical_mode and self.state.get('last_block', 0) >= settings.end_block:
                     # Wait for remaining processes to finish
@@ -344,6 +451,7 @@ class MultiprocessIndexer:
                             p.join(timeout=10)
                     
                     logger.info(f"Reached end block {settings.end_block}. Indexing complete.")
+                    self._log_status()
                     return
                 
                 # Small delay
@@ -357,6 +465,7 @@ class MultiprocessIndexer:
                     p.terminate()
             
             self._update_main_state()
+            self._log_status()
             
         except Exception as e:
             logger.error(f"Error in main loop: {e}", exc_info=True)
@@ -366,5 +475,6 @@ class MultiprocessIndexer:
                     p.terminate()
             
             self._update_main_state()
+            self._log_status()
             
             raise
