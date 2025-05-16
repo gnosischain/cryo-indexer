@@ -2,6 +2,8 @@ import os
 import time
 import json
 import multiprocessing
+from contextlib import contextmanager
+import fcntl
 from typing import Dict, Any, List, Tuple, Optional
 from loguru import logger
 from datetime import datetime
@@ -13,6 +15,46 @@ from .blockchain import BlockchainClient
 from .clickhouse_manager import ClickHouseManager
 from .worker import IndexerWorker  # Import the new unified worker
 from .utils import setup_logging, load_state, save_state
+
+
+@contextmanager
+def file_lock(file_path):
+    """Context manager for file locking to prevent race conditions."""
+    lock_file = f"{file_path}.lock"
+    lock_fd = open(lock_file, 'w+')
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+        if os.path.exists(lock_file):
+            try:
+                os.remove(lock_file)
+            except:
+                pass
+
+
+def read_shared_state(file_path):
+    """Read the shared state file with locking to prevent race conditions."""
+    with file_lock(file_path):
+        if os.path.exists(file_path):
+            with open(file_path, 'r') as f:
+                return json.load(f)
+        else:
+            return {
+                "active_ranges": [],
+                "completed_ranges": [],
+                "last_block": 0,
+                "next_block": 0
+            }
+
+
+def write_shared_state(file_path, state):
+    """Write the shared state file with locking to prevent race conditions."""
+    with file_lock(file_path):
+        with open(file_path, 'w') as f:
+            json.dump(state, f, indent=2)
 
 
 class MultiprocessIndexer:
@@ -77,8 +119,7 @@ class MultiprocessIndexer:
                 "last_block": self.state.get('last_block', 0),
                 "next_block": self.state.get('last_block', 0)
             }
-            with open(self.shared_state_file, 'w') as f:
-                json.dump(shared_state, f, indent=2)
+            write_shared_state(self.shared_state_file, shared_state)
     
     def _handle_exit(self, sig, frame):
         """Handle exit signals gracefully."""
@@ -96,16 +137,14 @@ class MultiprocessIndexer:
     def _update_main_state(self):
         """Update the main state from the shared state file."""
         try:
-            if os.path.exists(self.shared_state_file):
-                with open(self.shared_state_file, 'r') as f:
-                    shared_state = json.load(f)
-                
-                # Update the main state with the highest block from shared state
-                if 'last_block' in shared_state and shared_state['last_block'] > self.state.get('last_block', 0):
-                    self.state['last_block'] = shared_state['last_block']
-                    self.state['last_indexed_timestamp'] = int(time.time())
-                    save_state(self.state, settings.state_dir, state_file=os.path.basename(self.state_file))
-                    logger.info(f"Updated main state last_block to {self.state['last_block']}")
+            shared_state = read_shared_state(self.shared_state_file)
+            
+            # Update the main state with the highest block from shared state
+            if 'last_block' in shared_state and shared_state['last_block'] > self.state.get('last_block', 0):
+                self.state['last_block'] = shared_state['last_block']
+                self.state['last_indexed_timestamp'] = int(time.time())
+                save_state(self.state, settings.state_dir, state_file=os.path.basename(self.state_file))
+                logger.info(f"Updated main state last_block to {self.state['last_block']}")
         except Exception as e:
             logger.error(f"Error updating main state: {e}")
     
@@ -166,9 +205,8 @@ class MultiprocessIndexer:
     def _mark_range_completed(self, start_block, end_block):
         """Mark a block range as completed in the shared state."""
         try:
-            # Read current shared state
-            with open(self.shared_state_file, 'r') as f:
-                shared_state = json.load(f)
+            # Read current shared state with locking
+            shared_state = read_shared_state(self.shared_state_file)
             
             # Remove from active ranges
             active_ranges = shared_state.get('active_ranges', [])
@@ -197,9 +235,8 @@ class MultiprocessIndexer:
             shared_state['active_ranges'] = active_ranges
             shared_state['completed_ranges'] = merged_ranges
             
-            # Write updated shared state
-            with open(self.shared_state_file, 'w') as f:
-                json.dump(shared_state, f, indent=2)
+            # Write updated shared state with locking
+            write_shared_state(self.shared_state_file, shared_state)
             
         except Exception as e:
             logger.error(f"Error marking range {start_block}-{end_block} as completed: {e}")
@@ -211,9 +248,8 @@ class MultiprocessIndexer:
     def _get_next_block_range(self, safe_block):
         """Get the next block range to process."""
         try:
-            # Read current shared state
-            with open(self.shared_state_file, 'r') as f:
-                shared_state = json.load(f)
+            # Read current shared state with locking
+            shared_state = read_shared_state(self.shared_state_file)
             
             # Get the next block to process
             next_block = shared_state.get('next_block', self.state.get('last_block', 0))
@@ -242,9 +278,8 @@ class MultiprocessIndexer:
             active_ranges.append([next_block, end_block])
             shared_state['active_ranges'] = active_ranges
             
-            # Write updated shared state
-            with open(self.shared_state_file, 'w') as f:
-                json.dump(shared_state, f, indent=2)
+            # Write updated shared state with locking
+            write_shared_state(self.shared_state_file, shared_state)
             
             return (next_block, end_block)
             

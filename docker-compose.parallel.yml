@@ -37,11 +37,11 @@ services:
     deploy:
       resources:
         limits:
-          memory: ${MEMORY_LIMIT:-4G}
-          cpus: ${CPU_LIMIT:-4}
+          memory: ${MEMORY_LIMIT:-8G}
+          cpus: ${CPU_LIMIT:-8}
         reservations:
-          memory: ${MEMORY_RESERVATION:-2G}
-          cpus: ${CPU_RESERVATION:-2}
+          memory: ${MEMORY_RESERVATION:-4G}
+          cpus: ${CPU_RESERVATION:-4}
     ulimits:
       nofile:
         soft: 65536
