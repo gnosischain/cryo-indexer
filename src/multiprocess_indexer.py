@@ -1,15 +1,13 @@
 import os
 import time
-import json
 import multiprocessing
-from contextlib import contextmanager
-import fcntl
+from multiprocessing import Queue, Process
+import queue
 from typing import Dict, Any, List, Tuple, Optional
 from loguru import logger
-from datetime import datetime
 import signal
 import sys
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+import random  # For RPC endpoint selection
 
 from .config import settings
 from .blockchain import BlockchainClient
@@ -18,55 +16,38 @@ from .worker import IndexerWorker
 from .utils import setup_logging, load_state, save_state
 
 
-@contextmanager
-def file_lock(file_path):
-    """Context manager for file locking to prevent race conditions."""
-    lock_file = f"{file_path}.lock"
-    lock_fd = open(lock_file, 'w+')
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        lock_fd.close()
-        if os.path.exists(lock_file):
-            try:
-                os.remove(lock_file)
-            except:
-                pass
+# Message types for worker-coordinator communication
+WORKER_READY = "READY"
+WORKER_COMPLETED = "COMPLETED"
+WORKER_FAILED = "FAILED"
 
 
-def read_shared_state(file_path):
-    """Read the shared state file with locking to prevent race conditions."""
-    with file_lock(file_path):
-        if os.path.exists(file_path):
-            with open(file_path, 'r') as f:
-                return json.load(f)
-        else:
-            return {
-                "active_ranges": [],
-                "completed_ranges": [],
-                "last_block": 0,
-                "next_block": 0
-            }
+# Multiple RPC endpoints for better distribution
+RPC_ENDPOINTS = [
+    settings.eth_rpc_url,  # Primary endpoint from settings
+]
+
+# Add backup endpoints if configured
+BACKUP_RPC_ENDPOINTS = os.environ.get("BACKUP_RPC_ENDPOINTS", "").split(",")
+for endpoint in BACKUP_RPC_ENDPOINTS:
+    if endpoint.strip():
+        RPC_ENDPOINTS.append(endpoint.strip())
 
 
-def write_shared_state(file_path, state):
-    """Write the shared state file with locking to prevent race conditions."""
-    with file_lock(file_path):
-        with open(file_path, 'w') as f:
-            json.dump(state, f, indent=2)
-
-
-class ProcessingError(Exception):
-    """Exception raised when block processing fails."""
-    pass
+def get_rpc_endpoint(worker_id):
+    """Get an RPC endpoint, distributing load across available endpoints."""
+    if len(RPC_ENDPOINTS) == 1:
+        return RPC_ENDPOINTS[0]
+    
+    # Distribute workers across endpoints
+    index = worker_id % len(RPC_ENDPOINTS)
+    return RPC_ENDPOINTS[index]
 
 
 class MultiprocessIndexer:
     """
     Multiprocess indexer that uses separate Python processes for true parallelism.
-    Much simpler than thread-based solutions and guarantees parallel RPC calls.
+    Uses a simple queue-based approach for coordination rather than file-based state.
     """
     
     def __init__(self):
@@ -77,312 +58,416 @@ class MultiprocessIndexer:
         current_mode = settings.get_current_mode()
         logger.info(f"Starting multiprocess indexer in mode: {current_mode.name} with {settings.parallel_workers} processes")
         logger.info(f"Datasets to index: {current_mode.datasets}")
+        logger.info(f"Using {len(RPC_ENDPOINTS)} RPC endpoints for load distribution")
+        
+        # Performance tuning
+        self.worker_batch_size = int(os.environ.get("WORKER_BATCH_SIZE", str(settings.worker_batch_size)))
+        self.max_queue_size = max(settings.parallel_workers * 3, 20)  # Buffer tasks for workers
+        self.prefetch_blocks = int(os.environ.get("PREFETCH_BLOCKS", "5000"))  # How far ahead to queue work
+        
+        logger.info(f"Performance settings: batch_size={self.worker_batch_size}, "
+                    f"prefetch={self.prefetch_blocks}, queue_size={self.max_queue_size}")
         
         # Initialize blockchain client (for main process only)
         self.blockchain = BlockchainClient(settings.eth_rpc_url)
+        
+        # Create ClickHouse manager for main process
+        self.clickhouse = ClickHouseManager(
+            host=settings.clickhouse_host,
+            user=settings.clickhouse_user,
+            password=settings.clickhouse_password,
+            database=settings.clickhouse_database,
+            port=settings.clickhouse_port,
+            secure=settings.clickhouse_secure
+        )
         
         # Create necessary directories
         os.makedirs(settings.data_dir, exist_ok=True)
         os.makedirs(settings.state_dir, exist_ok=True)
         
-        # Use a state file specific to this mode
-        self.state_file = os.path.join(settings.state_dir, f"indexer_state_{current_mode.name}.json")
-        logger.info(f"Using state file: {self.state_file}")
+        # Get the highest block from the database to resume from
+        highest_block = self.clickhouse.get_latest_processed_block()
+        logger.info(f"Highest block in database: {highest_block}")
         
-        # Load initial state
+        # Use local state file only for main process restart capability
+        self.state_file = os.path.join(settings.state_dir, f"indexer_state_{current_mode.name}.json")
         self.state = load_state(settings.state_dir, state_file=os.path.basename(self.state_file))
         
-        # Add mode info to state if not present
-        if "mode" not in self.state:
-            self.state["mode"] = current_mode.name
-            
-        # Initialize or reset multiprocessing info in state
-        self.state["multiprocessing"] = {
-            "last_processed_block": self.state.get('last_block', 0),
-            "active_ranges": [],
-            "next_block": self.state.get('last_block', 0)
-        }
+        # Update last_block to be the max of state file and database
+        self.state['last_block'] = max(self.state.get('last_block', 0), highest_block)
         save_state(self.state, settings.state_dir, state_file=os.path.basename(self.state_file))
         
-        # Create a shared state file for workers
-        self.shared_state_file = os.path.join(settings.state_dir, f"shared_state_{current_mode.name}.json")
-        self._init_shared_state()
+        logger.info(f"Resuming from block {self.state['last_block']}")
+        
+        # Set up multiprocessing communication with larger queue sizes
+        self.task_queue = Queue(self.max_queue_size)  # Tasks for workers
+        self.result_queue = Queue(self.max_queue_size)  # Results from workers
         
         # Set up signal handling
         signal.signal(signal.SIGINT, self._handle_exit)
         signal.signal(signal.SIGTERM, self._handle_exit)
         
         # Process management
-        self.processes = []
-        self.failed_ranges = []  # Track ranges that failed completely after max retries
-    
-    def _init_shared_state(self):
-        """Initialize the shared state file for worker processes."""
-        if not os.path.exists(self.shared_state_file):
-            shared_state = {
-                "active_ranges": [],
-                "completed_ranges": [],
-                "last_block": self.state.get('last_block', 0),
-                "next_block": self.state.get('last_block', 0)
-            }
-            write_shared_state(self.shared_state_file, shared_state)
+        self.workers = []
+        self.next_worker_id = 0
+        self.available_workers = 0  # Track number of idle workers
+        
+        # In-memory state tracking
+        self.active_ranges = []
+        self.completed_ranges = []
+        self.failed_ranges = []
+        self.next_block = self.state.get('last_block', 0)
+        
+        # Stats tracking
+        self.start_time = time.time()
+        self.total_blocks_processed = 0
+        self.blocks_since_last_report = 0
+        self.last_report_time = time.time()
+        self.report_interval = 10  # Report throughput every 10 seconds
     
     def _handle_exit(self, sig, frame):
         """Handle exit signals gracefully."""
         logger.info("Shutdown signal received, terminating worker processes...")
-        for p in self.processes:
-            if p.is_alive():
-                p.terminate()
         
-        logger.info("Saving final state...")
-        self._update_main_state()
+        # Send termination message to all workers
+        for _ in range(len(self.workers)):
+            self.task_queue.put(None)  # None is the termination signal
+        
+        # Wait for workers to exit
+        for worker in self.workers:
+            if worker.is_alive():
+                worker.join(timeout=2)
+                if worker.is_alive():
+                    worker.terminate()
+        
+        # Save final state
+        self.state['last_block'] = self.next_block
+        save_state(self.state, settings.state_dir, state_file=os.path.basename(self.state_file))
         
         # Log information about failed block ranges
         if self.failed_ranges:
             logger.error(f"There are {len(self.failed_ranges)} permanently failed block ranges")
             logger.error(f"Permanent failures: {self.failed_ranges}")
         
+        # Report performance stats
+        self._report_throughput(final=True)
+        
         logger.info("Shutdown complete")
         sys.exit(0)
     
-    def _update_main_state(self):
-        """Update the main state from the shared state file."""
+    def _worker_process(self, worker_id, task_queue, result_queue):
+        """Worker process that processes blocks from the task queue."""
         try:
-            shared_state = read_shared_state(self.shared_state_file)
+            # Configure process-specific logger
+            logger.remove()  # Remove existing handlers
+            logger.add(
+                lambda msg: print(f"[Worker {worker_id}] {msg}", end="\n"),
+                level=settings.log_level
+            )
+            logger.add(
+                os.path.join(settings.log_dir, f"worker_{worker_id}.log"),
+                rotation="10 MB",
+                level=settings.log_level
+            )
             
-            # Update the main state with the highest block from shared state
-            if 'last_block' in shared_state and shared_state['last_block'] > self.state.get('last_block', 0):
-                self.state['last_block'] = shared_state['last_block']
-                self.state['last_indexed_timestamp'] = int(time.time())
-                save_state(self.state, settings.state_dir, state_file=os.path.basename(self.state_file))
-                logger.info(f"Updated main state last_block to {self.state['last_block']}")
+            logger.info(f"Worker {worker_id} started")
+            
+            # Get RPC endpoint for this worker for better load distribution
+            rpc_url = get_rpc_endpoint(worker_id)
+            logger.info(f"Worker {worker_id} using RPC endpoint: {rpc_url}")
+            
+            # Create data directory for this worker
+            worker_data_dir = os.path.join(settings.data_dir, f"worker_{worker_id}")
+            os.makedirs(worker_data_dir, exist_ok=True)
+            
+            # Create own blockchain client and database connection
+            blockchain = BlockchainClient(rpc_url)
+            clickhouse = ClickHouseManager(
+                host=settings.clickhouse_host,
+                user=settings.clickhouse_user,
+                password=settings.clickhouse_password,
+                database=settings.clickhouse_database,
+                port=settings.clickhouse_port,
+                secure=settings.clickhouse_secure
+            )
+            
+            # Create worker instance
+            worker = IndexerWorker(
+                worker_id=str(worker_id),
+                blockchain=blockchain,
+                clickhouse=clickhouse,
+                data_dir=worker_data_dir,
+                network_name=settings.network_name,
+                rpc_url=rpc_url
+            )
+            
+            # Signal that we're ready for work
+            logger.info(f"Worker {worker_id} is ready for tasks")
+            result_queue.put((WORKER_READY, worker_id, None))
+            
+            task_count = 0
+            
+            # Process tasks until told to exit
+            while True:
+                try:
+                    # Block with timeout to avoid CPU spinning
+                    task = task_queue.get(timeout=60)
+                    
+                    # None is the signal to exit
+                    if task is None:
+                        logger.info(f"Worker {worker_id} received exit signal")
+                        break
+                    
+                    start_block, end_block, datasets, retry_count = task
+                    task_count += 1
+                    
+                    if retry_count > 0:
+                        logger.info(f"Worker {worker_id} retrying blocks {start_block}-{end_block} (attempt {retry_count+1})")
+                        # Adjust rate limits for retries
+                        os.environ["WORKER_CRYO_REQUESTS_PER_SECOND"] = str(max(50, 500 // (retry_count + 1)))
+                        os.environ["WORKER_CRYO_MAX_CONCURRENT"] = str(max(1, 5 // (retry_count + 1)))
+                        os.environ["WORKER_CRYO_TIMEOUT"] = str(300 + (retry_count * 60))
+                    else:
+                        logger.info(f"Worker {worker_id} processing blocks {start_block}-{end_block} (task #{task_count})")
+                    
+                    # Process the block range
+                    success = worker.process_block_range(start_block, end_block, datasets)
+                    
+                    if success:
+                        logger.info(f"Worker {worker_id} completed blocks {start_block}-{end_block}")
+                        result_queue.put((WORKER_COMPLETED, worker_id, (start_block, end_block)))
+                    else:
+                        logger.error(f"Worker {worker_id} failed to process blocks {start_block}-{end_block}")
+                        result_queue.put((WORKER_FAILED, worker_id, (start_block, end_block, retry_count)))
+                    
+                    # Signal that we're ready for more work
+                    logger.info(f"Worker {worker_id} is ready for more tasks")
+                    result_queue.put((WORKER_READY, worker_id, None))
+                    
+                except queue.Empty:
+                    # Timeout waiting for a task, just continue
+                    continue
+                except Exception as e:
+                    logger.error(f"Worker {worker_id} error: {e}", exc_info=True)
+                    # Try to recover by signaling ready again
+                    try:
+                        result_queue.put((WORKER_READY, worker_id, None))
+                    except:
+                        pass
+                    time.sleep(5)  # Brief pause before continuing
+        
         except Exception as e:
-            logger.error(f"Error updating main state: {e}")
+            logger.error(f"Worker {worker_id} process crashed: {e}", exc_info=True)
     
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=2, max=60),
-        retry=retry_if_exception_type(ProcessingError),
-        before_sleep=before_sleep_log(logger, "INFO"),  
-        reraise=True
-    )
-    def _process_block_range(self, worker_id, start_block, end_block, datasets):
-        """Process a block range with automatic retries."""
-        retry_count = 0
-        for attempt in range(3):  # tenacity doesn't easily expose attempt number, so we track it manually
-            try:
-                # Configure process-specific logger
-                logger.remove()  # Remove existing handlers
-                logger.add(
-                    lambda msg: print(f"[Worker {worker_id}] {msg}", end="\n"),
-                    level=settings.log_level
-                )
-                logger.add(
-                    os.path.join(settings.log_dir, f"worker_{worker_id}.log"),
-                    rotation="10 MB",
-                    level=settings.log_level
-                )
+    def _start_workers(self):
+        """Start the worker processes."""
+        for _ in range(settings.parallel_workers):
+            worker_id = self.next_worker_id
+            self.next_worker_id += 1
+            
+            p = Process(
+                target=self._worker_process,
+                args=(worker_id, self.task_queue, self.result_queue)
+            )
+            p.daemon = True
+            p.start()
+            self.workers.append(p)
+            logger.info(f"Started worker {worker_id}")
+    
+    def _check_worker_results(self):
+        """Check for any results from workers."""
+        # Process all available results without waiting
+        results_processed = 0
+        blocks_completed = 0
+        
+        try:
+            while not self.result_queue.empty():
+                result = self.result_queue.get(block=False)
+                results_processed += 1
                 
-                if attempt > 0:
-                    logger.info(f"Worker {worker_id} RETRY #{attempt} for blocks {start_block}-{end_block}")
-                    # Adjust rate limits for retries
-                    os.environ["WORKER_CRYO_REQUESTS_PER_SECOND"] = str(max(50, 500 // (attempt + 1)))
-                    os.environ["WORKER_CRYO_MAX_CONCURRENT"] = str(max(1, 5 // (attempt + 1)))
-                    os.environ["WORKER_CRYO_TIMEOUT"] = str(300 + (attempt * 60))  # Increase timeout for retries
+                if not isinstance(result, tuple) or len(result) != 3:
+                    logger.error(f"Malformed worker result: {result}")
+                    continue
+                    
+                message_type, worker_id, data = result
+                
+                if message_type == WORKER_READY:
+                    # Worker is ready for a new task
+                    self.available_workers += 1
+                    logger.debug(f"Worker {worker_id} is available. Total available: {self.available_workers}")
+                
+                elif message_type == WORKER_COMPLETED:
+                    start_block, end_block = data
+                    
+                    # Calculate number of blocks completed
+                    blocks_in_range = end_block - start_block
+                    blocks_completed += blocks_in_range
+                    self.total_blocks_processed += blocks_in_range
+                    self.blocks_since_last_report += blocks_in_range
+                    
+                    # Remove from active ranges
+                    if [start_block, end_block] in self.active_ranges:
+                        self.active_ranges.remove([start_block, end_block])
+                    
+                    # Add to completed ranges
+                    self.completed_ranges.append([start_block, end_block])
+                    logger.info(f"Block range {start_block}-{end_block} marked as completed ({blocks_in_range} blocks)")
+                    
+                    # Update last_block if this range extends it
+                    if start_block <= self.next_block and end_block > self.next_block:
+                        self.next_block = end_block
+                        self.state['last_block'] = self.next_block
+                        save_state(self.state, settings.state_dir, state_file=os.path.basename(self.state_file))
+                        logger.info(f"Updated next_block to {self.next_block}")
+                
+                elif message_type == WORKER_FAILED:
+                    start_block, end_block, retry_count = data
+                    
+                    # Remove from active ranges
+                    if [start_block, end_block] in self.active_ranges:
+                        self.active_ranges.remove([start_block, end_block])
+                    
+                    # Check if we've exceeded retry limit
+                    if retry_count >= 2:  # Max 3 attempts (0, 1, 2)
+                        logger.error(f"Block range {start_block}-{end_block} failed permanently after 3 attempts")
+                        self.failed_ranges.append([start_block, end_block])
+                    else:
+                        # Queue for retry with incremented retry count
+                        logger.warning(f"Scheduling retry for block range {start_block}-{end_block} (attempt {retry_count+2}/3)")
+                        self.task_queue.put((start_block, end_block, settings.get_current_mode().datasets, retry_count + 1))
                 else:
-                    logger.info(f"Worker {worker_id} processing blocks {start_block}-{end_block}")
-                
-                # Each worker gets its own blockchain client and ClickHouse manager
-                blockchain = BlockchainClient(settings.eth_rpc_url)
-                clickhouse = ClickHouseManager(
-                    host=settings.clickhouse_host,
-                    user=settings.clickhouse_user,
-                    password=settings.clickhouse_password,
-                    database=settings.clickhouse_database,
-                    port=settings.clickhouse_port,
-                    secure=settings.clickhouse_secure
-                )
-                
-                # Create worker using the unified IndexerWorker
-                worker = IndexerWorker(
-                    worker_id=str(worker_id),
-                    blockchain=blockchain,
-                    clickhouse=clickhouse,
-                    data_dir=settings.data_dir,
-                    network_name=settings.network_name,
-                    rpc_url=settings.eth_rpc_url
-                )
-                
-                # Process the block range
-                success = worker.process_block_range(start_block, end_block, datasets)
-                
-                if success:
-                    logger.info(f"Worker {worker_id} completed blocks {start_block}-{end_block}")
-                    self._mark_range_completed(start_block, end_block)
-                    return True
-                else:
-                    logger.error(f"Worker {worker_id} failed to process blocks {start_block}-{end_block}")
-                    # If worker.process_block_range returns False, raise exception to trigger retry
-                    raise ProcessingError(f"Failed to process blocks {start_block}-{end_block}")
-                
-            except ProcessingError:
-                # Let tenacity handle the retry
-                raise
-            except Exception as e:
-                logger.error(f"Worker {worker_id} encountered an error: {e}", exc_info=True)
-                raise ProcessingError(f"Exception while processing blocks {start_block}-{end_block}: {str(e)}")
-    
-    def _worker_process(self, worker_id, start_block, end_block, datasets):
-        """Worker process function that runs independently."""
-        try:
-            # Process with retries
-            self._process_block_range(worker_id, start_block, end_block, datasets)
+                    logger.warning(f"Unknown message type: {message_type}")
+        
         except Exception as e:
-            # If all retries failed, mark as permanently failed
-            logger.error(f"Worker {worker_id} failed to process blocks {start_block}-{end_block} after all retries: {e}")
-            self._mark_range_failed_permanent(start_block, end_block)
+            logger.error(f"Error processing worker results: {str(e)}", exc_info=True)
+        
+        if results_processed > 0:
+            logger.debug(f"Processed {results_processed} worker messages, {blocks_completed} blocks completed")
+            
+        # Report throughput periodically
+        self._report_throughput()
     
-    def _get_active_workers(self):
-        """Get the number of currently active worker processes."""
-        return sum(1 for p in self.processes if p.is_alive())
+    def _report_throughput(self, final=False):
+        """Report throughput statistics."""
+        current_time = time.time()
+        elapsed = current_time - self.last_report_time
+        
+        if elapsed >= self.report_interval or final:
+            # Calculate blocks per second
+            if elapsed > 0:
+                blocks_per_second = self.blocks_since_last_report / elapsed
+            else:
+                blocks_per_second = 0
+                
+            # Calculate overall average
+            total_elapsed = current_time - self.start_time
+            if total_elapsed > 0:
+                overall_blocks_per_second = self.total_blocks_processed / total_elapsed
+            else:
+                overall_blocks_per_second = 0
+            
+            logger.info(f"Performance: {blocks_per_second:.2f} blocks/sec current, "
+                        f"{overall_blocks_per_second:.2f} blocks/sec average, "
+                        f"{self.total_blocks_processed} blocks total")
+            
+            # Reset counters
+            self.last_report_time = current_time
+            self.blocks_since_last_report = 0
     
-    def _mark_range_completed(self, start_block, end_block):
-        """Mark a block range as completed in the shared state."""
-        try:
-            # Read current shared state with locking
-            shared_state = read_shared_state(self.shared_state_file)
+    def _assign_work(self, safe_block):
+        """Assign work to idle workers if available."""
+        # Skip if no workers are available
+        if self.available_workers <= 0:
+            return
+        
+        # Skip if task queue is nearly full
+        if self.task_queue.qsize() > self.max_queue_size * 0.8:
+            logger.debug(f"Task queue nearly full ({self.task_queue.qsize()}/{self.max_queue_size}), waiting for workers to catch up")
+            return
+        
+        tasks_assigned = 0
+        prefetch_limit = self.next_block + self.prefetch_blocks
+        
+        # Cap to safe block
+        prefetch_limit = min(prefetch_limit, safe_block)
+        
+        # Pre-fill task queue with work up to prefetch limit
+        while self.next_block < prefetch_limit and tasks_assigned < self.max_queue_size:
+            # Calculate end block (limit batch size for better distribution)
+            end_block = min(self.next_block + self.worker_batch_size, prefetch_limit)
             
-            # Remove from active ranges
-            active_ranges = shared_state.get('active_ranges', [])
-            if [start_block, end_block] in active_ranges:
-                active_ranges.remove([start_block, end_block])
+            # Skip ranges that overlap with active or permanently failed ranges
+            skip = False
             
-            # Add to completed ranges
-            completed_ranges = shared_state.get('completed_ranges', [])
-            completed_ranges.append([start_block, end_block])
+            # Check active ranges
+            for start, end in self.active_ranges:
+                if (start <= self.next_block < end) or (start < end_block <= end) or (self.next_block <= start < end_block):
+                    logger.debug(f"Skipping overlapping active range: {start}-{end}")
+                    self.next_block = max(end, self.next_block)
+                    skip = True
+                    break
             
-            # Sort and merge completed ranges
-            completed_ranges.sort()
-            merged_ranges = []
+            if skip:
+                continue
             
-            for r in completed_ranges:
-                if not merged_ranges or r[0] > merged_ranges[-1][1] + 1:
-                    merged_ranges.append(r)
-                else:
-                    merged_ranges[-1][1] = max(merged_ranges[-1][1], r[1])
-            
-            # Update the last block if applicable
-            if merged_ranges and merged_ranges[0][0] <= shared_state.get('last_block', 0) + 1:
-                shared_state['last_block'] = max(shared_state.get('last_block', 0), merged_ranges[0][1])
-            
-            # Update shared state
-            shared_state['active_ranges'] = active_ranges
-            shared_state['completed_ranges'] = merged_ranges
-            
-            # Write updated shared state with locking
-            write_shared_state(self.shared_state_file, shared_state)
-            
-        except Exception as e:
-            logger.error(f"Error marking range {start_block}-{end_block} as completed: {e}")
-    
-    def _mark_range_failed_permanent(self, start_block, end_block):
-        """Mark a block range as permanently failed after all retries."""
-        try:
-            # Read current shared state with locking
-            shared_state = read_shared_state(self.shared_state_file)
-            
-            # Remove from active ranges
-            active_ranges = shared_state.get('active_ranges', [])
-            if [start_block, end_block] in active_ranges:
-                active_ranges.remove([start_block, end_block])
-            
-            # Add to in-memory failed ranges list
-            self.failed_ranges.append([start_block, end_block])
-            
-            # Log the permanent failure
-            logger.error(f"Block range {start_block}-{end_block} has failed permanently after multiple retries")
-            
-            # Update shared state
-            shared_state['active_ranges'] = active_ranges
-            
-            # Write updated shared state with locking
-            write_shared_state(self.shared_state_file, shared_state)
-            
-        except Exception as e:
-            logger.error(f"Error marking range {start_block}-{end_block} as permanently failed: {e}")
-    
-    def _clean_finished_processes(self):
-        """Remove completed processes from the list."""
-        self.processes = [p for p in self.processes if p.is_alive()]
-    
-    def _get_next_block_range(self, safe_block):
-        """Get the next block range to process."""
-        try:
-            # Read current shared state with locking
-            shared_state = read_shared_state(self.shared_state_file)
-            
-            # Get the next block to process
-            next_block = shared_state.get('next_block', self.state.get('last_block', 0))
-            
-            # If we've reached the safe block, return None
-            if next_block >= safe_block:
-                return None
-            
-            # Calculate end block
-            end_block = min(next_block + settings.worker_batch_size, safe_block)
-            
-            # Check if this range is already being processed
-            active_ranges = shared_state.get('active_ranges', [])
-            for start, end in active_ranges:
-                if (start <= next_block < end) or (start < end_block <= end):
-                    # Range overlap, try finding the next free range
-                    next_block = max(end, next_block)
-                    if next_block >= safe_block:
-                        return None
-                    end_block = min(next_block + settings.worker_batch_size, safe_block)
-            
-            # Check if this range is in permanently failed ranges
+            # Check permanently failed ranges
             for start, end in self.failed_ranges:
-                if (start <= next_block < end) or (start < end_block <= end) or (next_block <= start < end_block):
-                    # Skip this range or part of it
+                if (start <= self.next_block < end) or (start < end_block <= end) or (self.next_block <= start < end_block):
                     logger.warning(f"Skipping permanently failed range: {start}-{end}")
-                    next_block = max(end, next_block)
-                    if next_block >= safe_block:
-                        return None
-                    end_block = min(next_block + settings.worker_batch_size, safe_block)
+                    self.next_block = max(end, self.next_block)
+                    skip = True
+                    break
             
-            # Update next_block for next call
-            shared_state['next_block'] = end_block
+            if skip:
+                continue
             
-            # Add to active ranges
-            active_ranges.append([next_block, end_block])
-            shared_state['active_ranges'] = active_ranges
+            # Assign the range
+            logger.info(f"Queuing block range {self.next_block}-{end_block} for processing ({end_block - self.next_block} blocks)")
+            self.active_ranges.append([self.next_block, end_block])
+            self.task_queue.put((self.next_block, end_block, settings.get_current_mode().datasets, 0))
+            tasks_assigned += 1
             
-            # Write updated shared state with locking
-            write_shared_state(self.shared_state_file, shared_state)
+            # Update next_block
+            self.next_block = end_block
             
-            return (next_block, end_block)
-            
-        except Exception as e:
-            logger.error(f"Error getting next block range: {e}")
-            return None
+            # Decrement available workers (but don't go below zero)
+            self.available_workers = max(0, self.available_workers - 1)
+        
+        if tasks_assigned > 0:
+            logger.info(f"Assigned {tasks_assigned} tasks to queue, {self.task_queue.qsize()}/{self.max_queue_size} queued")
     
     def _log_status(self):
         """Log current status of the indexer."""
-        try:
-            shared_state = read_shared_state(self.shared_state_file)
-            
-            active_count = len(shared_state.get('active_ranges', []))
-            completed_count = len(shared_state.get('completed_ranges', []))
-            permanent_failures = len(self.failed_ranges)
-            current_block = shared_state.get('next_block', 0)
-            
-            logger.info(f"Status: Current block: {current_block}, "
-                       f"Active ranges: {active_count}, "
-                       f"Completed ranges: {completed_count}, "
-                       f"Permanent failures: {permanent_failures}")
-        except Exception as e:
-            logger.error(f"Error logging status: {e}")
+        queue_size = self.task_queue.qsize()
+        logger.info(f"Status: Current block: {self.next_block}, "
+                   f"Active ranges: {len(self.active_ranges)}, "
+                   f"Available workers: {self.available_workers}, "
+                   f"Task queue: {queue_size}/{self.max_queue_size}, "
+                   f"Completed ranges: {len(self.completed_ranges)}, "
+                   f"Failed ranges: {len(self.failed_ranges)}")
+        
+        # Report throughput
+        self._report_throughput()
+    
+    def _check_worker_health(self):
+        """Check if all worker processes are still alive."""
+        for i, worker in enumerate(self.workers):
+            if not worker.is_alive():
+                logger.error(f"Worker process {i} has died. Restarting...")
+                
+                # Create a new worker
+                worker_id = self.next_worker_id
+                self.next_worker_id += 1
+                
+                p = Process(
+                    target=self._worker_process,
+                    args=(worker_id, self.task_queue, self.result_queue)
+                )
+                p.daemon = True
+                p.start()
+                
+                # Replace the dead worker
+                self.workers[i] = p
     
     def run(self):
         """Start the multiprocess indexer and manage worker processes."""
@@ -391,14 +476,25 @@ class MultiprocessIndexer:
         current_mode = settings.get_current_mode()
         historical_mode = settings.end_block > 0
         
+        # Start worker processes
+        self._start_workers()
+        
+        # Give workers time to initialize
+        logger.info("Waiting for workers to initialize...")
+        time.sleep(2)
+        
         # Status logging timer
         last_status_time = time.time()
-        status_interval = 60  # Log status every 60 seconds
+        status_interval = 30  # Log status every 30 seconds
+        
+        # Set start time for throughput calculations
+        self.start_time = time.time()
+        self.last_report_time = self.start_time
         
         try:
             while True:
-                # Clean up finished processes
-                self._clean_finished_processes()
+                # Check worker health
+                self._check_worker_health()
                 
                 # Get latest block from blockchain
                 latest_block = self.blockchain.get_latest_block_number()
@@ -407,35 +503,11 @@ class MultiprocessIndexer:
                 if historical_mode:
                     safe_block = min(safe_block, settings.end_block)
                 
-                # Check if we need to start more workers
-                active_workers = self._get_active_workers()
-                available_slots = settings.parallel_workers - active_workers
+                # Process results from workers
+                self._check_worker_results()
                 
-                if available_slots > 0:
-                    for _ in range(available_slots):
-                        next_range = self._get_next_block_range(safe_block)
-                        
-                        if next_range:
-                            start_block, end_block = next_range
-                            worker_id = len(self.processes)
-                            
-                            logger.info(f"Starting worker {worker_id} for blocks {start_block}-{end_block}")
-                            
-                            # Create and start new worker process
-                            p = multiprocessing.Process(
-                                target=self._worker_process,
-                                args=(worker_id, start_block, end_block, current_mode.datasets)
-                            )
-                            p.start()
-                            self.processes.append(p)
-                            
-                            # Give process a moment to initialize
-                            time.sleep(0.5)
-                        else:
-                            break
-                
-                # Periodically update the main state from shared state
-                self._update_main_state()
+                # Pre-fill task queue with work
+                self._assign_work(safe_block)
                 
                 # Periodically log status
                 current_time = time.time()
@@ -444,37 +516,30 @@ class MultiprocessIndexer:
                     last_status_time = current_time
                 
                 # Check if we're done in historical mode
-                if historical_mode and self.state.get('last_block', 0) >= settings.end_block:
-                    # Wait for remaining processes to finish
-                    for p in self.processes:
-                        if p.is_alive():
-                            p.join(timeout=10)
-                    
+                if historical_mode and self.next_block >= settings.end_block and len(self.active_ranges) == 0 and self.task_queue.empty():
                     logger.info(f"Reached end block {settings.end_block}. Indexing complete.")
+                    
+                    # Send termination signal to all workers
+                    for _ in range(len(self.workers)):
+                        self.task_queue.put(None)
+                    
+                    # Wait for workers to exit
+                    for worker in self.workers:
+                        worker.join(timeout=5)
+                    
                     self._log_status()
+                    # Report final performance statistics
+                    self._report_throughput(final=True)
                     return
                 
-                # Small delay
-                time.sleep(2)
+                # Avoid CPU spinning - very short sleep
+                time.sleep(0.1)
                 
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt, shutting down...")
-            # Clean up processes on exit
-            for p in self.processes:
-                if p.is_alive():
-                    p.terminate()
-            
-            self._update_main_state()
-            self._log_status()
+            self._handle_exit(None, None)
             
         except Exception as e:
             logger.error(f"Error in main loop: {e}", exc_info=True)
-            # Clean up processes on error
-            for p in self.processes:
-                if p.is_alive():
-                    p.terminate()
-            
-            self._update_main_state()
-            self._log_status()
-            
+            self._handle_exit(None, None)
             raise

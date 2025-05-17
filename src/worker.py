@@ -169,7 +169,7 @@ class IndexerWorker:
                 "--rpc", self.rpc_url,
                 "--overwrite",
                 "--verbose",
-                "--requests-per-second", "500",  # Rate limiting to avoid RPC issues
+                "--requests-per-second", "50",  # Rate limiting to avoid RPC issues
                 "--max-concurrent-requests", "5"  # Limit concurrent requests
             ]
             
