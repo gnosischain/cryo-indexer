@@ -64,9 +64,9 @@ COPY --from=builder /tmp/cryo-build/cryo/target/release/cryo /usr/local/bin/cryo
 # Verify binary is executable
 RUN chmod +x /usr/local/bin/cryo
 
-# Create required directories
-RUN mkdir -p /app/data /app/logs /app/state /app/migrations && \
-chmod 777 /app/data /app/logs /app/state /app/migrations
+# Create required directories (removed /app/state since we're stateless now)
+RUN mkdir -p /app/data /app/logs /app/migrations && \
+    chmod 777 /app/data /app/logs /app/migrations
 
 # Copy application files
 COPY requirements.txt /app/

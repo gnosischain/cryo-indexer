@@ -4,8 +4,9 @@ import glob
 import logging
 import pandas as pd
 import pyarrow.parquet as pq
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from loguru import logger
+
 
 def setup_logging(log_level: str, log_dir: str) -> None:
     """Set up logging configuration."""
@@ -30,6 +31,7 @@ def setup_logging(log_level: str, log_dir: str) -> None:
     )
     
     logger.info(f"Logging initialized at level {log_level}")
+
 
 def load_state(state_dir: str, state_file: Optional[str] = None) -> Dict[str, Any]:
     """Load indexer state from file."""
@@ -59,6 +61,7 @@ def load_state(state_dir: str, state_file: Optional[str] = None) -> Dict[str, An
             'mode': 'default'
         }
 
+
 def save_state(state: Dict[str, Any], state_dir: str, state_file: Optional[str] = None) -> None:
     """Save indexer state to file."""
     if state_file:
@@ -74,6 +77,7 @@ def save_state(state: Dict[str, Any], state_dir: str, state_file: Optional[str] 
     except Exception as e:
         logger.error(f"Error saving state to {file_path}: {e}")
 
+
 def find_parquet_files(data_dir: str, dataset: str) -> List[str]:
     """Find all parquet files for a dataset in the data directory."""
     # Handle multiple datasets
@@ -83,7 +87,7 @@ def find_parquet_files(data_dir: str, dataset: str) -> List[str]:
             all_files.extend(find_parquet_files(data_dir, ds))
         return all_files
     
-    # Look for network-specific patterns too (e.g., gnosis__blocks__*.parquet)
+    # Look for network-specific patterns too
     patterns = [
         # Standard cryo pattern: {network}__{dataset}__{range}.parquet
         os.path.join(data_dir, f"**/*__{dataset}__*.parquet"),
@@ -102,6 +106,7 @@ def find_parquet_files(data_dir: str, dataset: str) -> List[str]:
         files.extend(glob.glob(pattern, recursive=True))
     
     return sorted(list(set(files)))  # Remove duplicates and sort
+
 
 def read_parquet_to_pandas(file_path: str) -> pd.DataFrame:
     """Read a parquet file into a pandas DataFrame with better error handling."""
@@ -126,16 +131,18 @@ def read_parquet_to_pandas(file_path: str) -> pd.DataFrame:
         logger.error(f"Error reading parquet file {file_path}: {e}")
         return pd.DataFrame()
 
+
 def format_block_range(start_block: int, end_block: int) -> str:
     """Format a block range for use with Cryo CLI."""
     return f"{start_block}:{end_block}"
+
 
 def parse_dataset_name_from_file(file_path: str) -> str:
     """Extract the dataset name from a parquet file path with better pattern matching."""
     filename = os.path.basename(file_path)
     
     # Try different parsing patterns
-    # Pattern 1: network__dataset__range.parquet (e.g., gnosis__blocks__00000001_to_00000999.parquet)
+    # Pattern 1: network__dataset__range.parquet
     parts = filename.split("__")
     if len(parts) > 1:
         return parts[1]
@@ -159,6 +166,7 @@ def parse_dataset_name_from_file(file_path: str) -> str:
     
     return "unknown"
 
+
 def list_modes() -> None:
     """Utility function to list all available indexer modes."""
     try:
@@ -175,3 +183,39 @@ def list_modes() -> None:
             print("-" * 80)
     except ImportError:
         print("Could not import settings. Make sure you're running this from the correct directory.")
+
+
+def parse_block_ranges(ranges_str: str) -> List[Tuple[int, int]]:
+    """Parse comma-separated block ranges like '100-200,500-600'."""
+    ranges = []
+    for range_str in ranges_str.split(','):
+        range_str = range_str.strip()
+        if '-' in range_str:
+            try:
+                start, end = map(int, range_str.split('-'))
+                ranges.append((start, end))
+            except ValueError:
+                logger.error(f"Invalid range format: {range_str}")
+    return ranges
+
+
+def find_continuous_ranges(blocks: List[int]) -> List[Tuple[int, int]]:
+    """Find continuous ranges in a list of block numbers."""
+    if not blocks:
+        return []
+    
+    blocks = sorted(blocks)
+    ranges = []
+    start = blocks[0]
+    end = blocks[0]
+    
+    for block in blocks[1:]:
+        if block == end + 1:
+            end = block
+        else:
+            ranges.append((start, end + 1))
+            start = block
+            end = block
+    
+    ranges.append((start, end + 1))
+    return ranges

@@ -1,37 +1,33 @@
 import os
 from typing import List, Dict, Optional
 from loguru import logger
+from enum import Enum
 
-class IndexerMode:
-    """Definition of an indexer mode with its specific settings."""
+
+class IndexMode(Enum):
+    """Simplified indexing modes."""
+    DEFAULT = "default"      # blocks, transactions, logs
+    MINIMAL = "minimal"      # blocks only
+    FULL = "full"           # all datasets
+    CUSTOM = "custom"       # user-defined datasets
     
-    def __init__(
-        self,
-        name: str,
-        datasets: List[str],
-        start_block: int,
-        description: str = ""
-    ):
-        self.name = name
-        self.datasets = datasets
-        self.start_block = start_block
-        self.description = description
+
+class OperationType(Enum):
+    """Types of operations."""
+    CONTINUOUS = "continuous"    # Follow chain tip
+    HISTORICAL = "historical"    # Index specific range
+    FILL_GAPS = "fill_gaps"     # Find and fill gaps
+    VALIDATE = "validate"        # Check data integrity
+    BACKFILL = "backfill"       # Backfill indexing_state from existing data
+
 
 class IndexerSettings:
-    """Indexer settings loaded from environment variables."""
+    """Simplified indexer settings."""
     
     def __init__(self):
-        # Blockchain settings
+        # Core settings
         self.eth_rpc_url = os.environ.get("ETH_RPC_URL", "")
         self.network_name = os.environ.get("NETWORK_NAME", "gnosis")
-        self.confirmation_blocks = int(os.environ.get("CONFIRMATION_BLOCKS", "20"))
-        self.poll_interval = int(os.environ.get("POLL_INTERVAL", "15"))
-        self.max_blocks_per_batch = int(os.environ.get("MAX_BLOCKS_PER_BATCH", "1000"))
-        
-        # Chain-specific settings
-        self.genesis_timestamp = int(os.environ.get("GENESIS_TIMESTAMP", "1539024180"))  # Default for Gnosis chain
-        self.seconds_per_block = int(os.environ.get("SECONDS_PER_BLOCK", "5"))  # Default for Gnosis chain
-        self.chain_id = int(os.environ.get("CHAIN_ID", "100"))  # Default for Gnosis chain
         
         # ClickHouse settings
         self.clickhouse_host = os.environ.get("CLICKHOUSE_HOST", "")
@@ -41,186 +37,110 @@ class IndexerSettings:
         self.clickhouse_port = int(os.environ.get("CLICKHOUSE_PORT", "8443"))
         self.clickhouse_secure = os.environ.get("CLICKHOUSE_SECURE", "true").lower() == "true"
         
-        # Migration settings
-        self.run_migrations = os.environ.get("RUN_MIGRATIONS", "true").lower() == "true"
+        # Operation settings
+        self.operation = OperationType(os.environ.get("OPERATION", "continuous").lower())
+        self.mode = IndexMode(os.environ.get("MODE", "default").lower())
         
-        # Paths
+        # Block range settings
+        self.start_block = int(os.environ.get("START_BLOCK", "0"))
+        self.end_block = int(os.environ.get("END_BLOCK", "0"))
+        
+        # Performance settings
+        self.workers = int(os.environ.get("WORKERS", "1"))
+        self.batch_size = int(os.environ.get("BATCH_SIZE", "1000"))
+        self.max_retries = int(os.environ.get("MAX_RETRIES", "3"))
+        
+        # Continuous mode settings
+        self.confirmation_blocks = int(os.environ.get("CONFIRMATION_BLOCKS", "12"))
+        self.poll_interval = int(os.environ.get("POLL_INTERVAL", "10"))
+        
+        # Cryo performance settings
+        self.requests_per_second = int(os.environ.get("REQUESTS_PER_SECOND", "50"))
+        self.max_concurrent_requests = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "5"))
+        self.cryo_timeout = int(os.environ.get("CRYO_TIMEOUT", "300"))  # 5 minutes default
+        
+        # Backfill settings
+        self.backfill_batch_size = int(os.environ.get("BACKFILL_BATCH_SIZE", "1000"))
+        self.backfill_chunk_size = int(os.environ.get("BACKFILL_CHUNK_SIZE", "100000"))
+        self.backfill_force = os.environ.get("BACKFILL_FORCE", "false").lower() == "true"
+        
+        # Gap detection settings
+        self.gap_detection_state_chunk_size = int(os.environ.get("GAP_DETECTION_STATE_CHUNK_SIZE", "100000"))
+        self.gap_detection_table_chunk_size = int(os.environ.get("GAP_DETECTION_TABLE_CHUNK_SIZE", "10000"))
+        self.gap_detection_threshold = float(os.environ.get("GAP_DETECTION_THRESHOLD", "0.8"))
+        
+        # Directories
         self.data_dir = os.environ.get("DATA_DIR", "/app/data")
-        self.state_dir = os.environ.get("STATE_DIR", "/app/state")
         self.log_dir = os.environ.get("LOG_DIR", "/app/logs")
         self.migrations_dir = os.environ.get("MIGRATIONS_DIR", "/app/migrations")
         
         # Logging
         self.log_level = os.environ.get("LOG_LEVEL", "INFO")
         
-        # Indexer mode
-        self.mode_name = os.environ.get("INDEXER_MODE", "default")
+        # Get datasets based on mode
+        self.datasets = self._get_datasets()
         
-        # Default start block (can be overridden by mode)
-        self.default_start_block = int(os.environ.get("START_BLOCK", "0"))
-        self.end_block = int(os.environ.get("END_BLOCK", "0"))
-        
-        # Parallel processing settings
-        self.operation_mode = os.environ.get("OPERATION_MODE", "scraper")
-        self.parallel_workers = int(os.environ.get("PARALLEL_WORKERS", "1"))
-        self.worker_batch_size = int(os.environ.get("WORKER_BATCH_SIZE", str(self.max_blocks_per_batch)))
-        self.max_concurrent_workers = int(os.environ.get("MAX_CONCURRENT_WORKERS", "3"))
-        
-        # Define indexer modes
-        self._define_modes()
-        
-        # Set datasets and start_block based on the selected mode
-        self._configure_from_mode()
-    
-    def _define_modes(self):
-        """Define available indexer modes with their specific configurations."""
-
-        self.available_modes = {
-            # Default mode for basic data
-            "default": IndexerMode(
-                name="default",
-                datasets=["blocks", "transactions", "logs"],
-                start_block=self.default_start_block,
-                description="Default mode for indexing blocks, transactions, and logs"
-            ),
+    def _get_datasets(self) -> List[str]:
+        """Get datasets based on mode."""
+        # Check for custom datasets first
+        custom_datasets = os.environ.get("DATASETS", "")
+        if custom_datasets:
+            return [d.strip() for d in custom_datasets.split(",")]
             
-            # Mode for block data only
-            "blocks": IndexerMode(
-                name="blocks",
-                datasets=["blocks"],
-                start_block=self.default_start_block,
-                description="Index blocks only"
-            ),
-            
-            # Mode for transaction data
-            "transactions": IndexerMode(
-                name="transactions",
-                datasets=["transactions"],
-                start_block=self.default_start_block,
-                description="Index transactions only"
-            ),
-            
-            # Mode for logs/events
-            "logs": IndexerMode(
-                name="logs",
-                datasets=["logs"],
-                start_block=self.default_start_block,
-                description="Index logs/events only"
-            ),
-            
-            # Mode for contract creation data
-            "contracts": IndexerMode(
-                name="contracts",
-                datasets=["contracts"],
-                start_block=self.default_start_block,
-                description="Index contract creations only"
-            ),
-            
-            # Mode for native ETH transfers
-            "transfers": IndexerMode(
-                name="transfers",
-                datasets=["native_transfers"],
-                start_block=self.default_start_block,
-                description="Index native ETH transfers only"
-            ),
-            
-            # Mode for all transaction-related data
-            "tx_data": IndexerMode(
-                name="tx_data", 
-                datasets=["blocks", "transactions", "logs", "contracts", "traces", "native_transfers"],
-                start_block=self.default_start_block,
-                description="Index all transaction-related data"
-            ),
-            
-            # Mode for trace data
-            "traces": IndexerMode(
-                name="traces",
-                datasets=["traces"],
-                start_block=self.default_start_block,
-                description="Index transaction traces"
-            ),
-            
-            # Mode for state differences
-            "state_diffs": IndexerMode(
-                name="state_diffs",
-                datasets=["balance_diffs", "code_diffs", "nonce_diffs", "storage_diffs"],
-                start_block=self.default_start_block, 
-                description="Index state differences (balance, code, nonce, storage)"
-            ),
-            
-            # Mode for ERC20 token data
-            "erc20": IndexerMode(
-                name="erc20",
-                datasets=["erc20_transfers", "erc20_metadata"],
-                start_block=self.default_start_block,
-                description="Index ERC20 token transfers and metadata"
-            ),
-            
-            # Mode for ERC721 token data
-            "erc721": IndexerMode(
-                name="erc721",
-                datasets=["erc721_transfers", "erc721_metadata"],
-                start_block=self.default_start_block,
-                description="Index ERC721 token transfers and metadata"
-            ),
-            
-            # Mode for all on-chain data (full indexing)
-            "full": IndexerMode(
-                name="full",
-                datasets=[
-                    "blocks", "transactions", "logs", "contracts", 
-                    "native_transfers", "traces", "balance_diffs", 
-                    "code_diffs", "nonce_diffs", "storage_diffs"
-                ],
-                start_block=self.default_start_block,
-                description="Index all available data types"
-            ),
-            
-            # Custom mode, configured through environment variables
-            "custom": IndexerMode(
-                name="custom",
-                datasets=os.environ.get("DATASETS", "blocks,transactions,logs").split(","),
-                start_block=int(os.environ.get("START_BLOCK", "0")),
-                description="Custom indexing mode configured via DATASETS and START_BLOCK"
-            ),
-            
-            # Parallel mode for parallel indexing with multiple workers
-            "parallel": IndexerMode(
-                name="parallel",
-                datasets=os.environ.get("DATASETS", "blocks,transactions,logs").split(","),
-                start_block=int(os.environ.get("START_BLOCK", "0")),
-                description="Parallel indexing with multiple workers"
-            )
+        # Otherwise use mode defaults
+        mode_datasets = {
+            IndexMode.DEFAULT: ["blocks", "transactions", "logs"],
+            IndexMode.MINIMAL: ["blocks"],
+            IndexMode.FULL: [
+                "blocks", "transactions", "logs", "contracts", 
+                "native_transfers", "traces", "balance_diffs", 
+                "code_diffs", "nonce_diffs", "storage_diffs"
+            ],
+            IndexMode.CUSTOM: ["blocks", "transactions", "logs"]
         }
-    
-    def _configure_from_mode(self):
-        """Configure indexer settings based on the selected mode."""
-        # Get the mode configuration (default to custom if not found)
-        mode = self.available_modes.get(self.mode_name, self.available_modes["custom"])
         
-        # Override datasets if DATASETS environment variable is explicitly set
-        if "DATASETS" in os.environ:
-            self.datasets = os.environ.get("DATASETS").split(",")
-            # Also update the custom mode
-            self.available_modes["custom"].datasets = self.datasets
-        else:
-            self.datasets = mode.datasets
-        
-        # Override start_block if START_BLOCK environment variable is explicitly set
-        if "START_BLOCK" in os.environ:
-            self.start_block = int(os.environ.get("START_BLOCK"))
-            # Also update the custom mode
-            self.available_modes["custom"].start_block = self.start_block
-        else:
-            self.start_block = mode.start_block
+        return mode_datasets.get(self.mode, ["blocks", "transactions", "logs"])
     
-    def get_available_modes(self) -> Dict[str, IndexerMode]:
-        """Get all available indexer modes."""
-        return self.available_modes
-    
-    def get_current_mode(self) -> IndexerMode:
-        """Get the currently active indexer mode."""
-        return self.available_modes.get(self.mode_name, self.available_modes["custom"])
+    def validate(self) -> None:
+        """Validate required settings."""
+        # RPC not required for backfill operation
+        if self.operation != OperationType.BACKFILL and not self.eth_rpc_url:
+            raise ValueError("ETH_RPC_URL is required for non-backfill operations")
+            
+        if not self.clickhouse_host:
+            raise ValueError("CLICKHOUSE_HOST is required")
+            
+        if self.operation == OperationType.HISTORICAL:
+            if self.start_block >= self.end_block:
+                raise ValueError("For historical operation, END_BLOCK must be greater than START_BLOCK")
+                
+        if self.workers < 1:
+            raise ValueError("WORKERS must be at least 1")
+            
+        if self.batch_size < 1:
+            raise ValueError("BATCH_SIZE must be at least 1")
+            
+        if self.requests_per_second < 1:
+            raise ValueError("REQUESTS_PER_SECOND must be at least 1")
+            
+        if self.max_concurrent_requests < 1:
+            raise ValueError("MAX_CONCURRENT_REQUESTS must be at least 1")
+            
+        if self.backfill_batch_size < 1:
+            raise ValueError("BACKFILL_BATCH_SIZE must be at least 1")
+            
+        if self.backfill_chunk_size < 1:
+            raise ValueError("BACKFILL_CHUNK_SIZE must be at least 1")
+            
+        if self.gap_detection_state_chunk_size < 1:
+            raise ValueError("GAP_DETECTION_STATE_CHUNK_SIZE must be at least 1")
+            
+        if self.gap_detection_table_chunk_size < 1:
+            raise ValueError("GAP_DETECTION_TABLE_CHUNK_SIZE must be at least 1")
+            
+        if not 0.0 <= self.gap_detection_threshold <= 1.0:
+            raise ValueError("GAP_DETECTION_THRESHOLD must be between 0.0 and 1.0")
 
-# Create settings instance
+
+# Create global settings instance
 settings = IndexerSettings()

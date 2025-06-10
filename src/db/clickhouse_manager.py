@@ -7,10 +7,11 @@ from clickhouse_connect.driver.summary import QuerySummary
 from typing import Dict, Any, List, Optional, Tuple, Union
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
+import time
 
-from .config import settings
+from ..config import settings
 from .clickhouse_pool import ClickHouseConnectionPool
-from .utils import read_parquet_to_pandas, parse_dataset_name_from_file
+from ..core.utils import read_parquet_to_pandas, parse_dataset_name_from_file
 
 
 class ClickHouseManager:
@@ -62,16 +63,6 @@ class ClickHouseManager:
             logger.info(f"Using database: {self.database}")
         except Exception as e:
             logger.error(f"Error ensuring database exists: {e}")
-            raise
-    
-    def setup_tables(self) -> None:
-        """Set up necessary tables for blockchain data."""
-        try:
-            # Tables are now managed by migration scripts
-            # This method is maintained for backward compatibility
-            logger.info("Tables will be created through migrations")
-        except Exception as e:
-            logger.error(f"Error setting up tables: {e}")
             raise
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
@@ -154,9 +145,6 @@ class ClickHouseManager:
             # Convert binary columns to hex strings for ClickHouse
             self._convert_binary_columns(df)
             
-            # Insert using a ReplacingMergeTree strategy
-            # For ReplacingMergeTree tables, ClickHouse will eventually deduplicate rows
-            # with the same primary key during merges
             result = client.insert_df(f"{self.database}.{table_name}", df)
             
             # Handle the QuerySummary object properly
@@ -179,22 +167,19 @@ class ClickHouseManager:
             unique_blocks = df['block_number'].dropna().unique()
             block_timestamps = {}
             
-            for block_num in unique_blocks:
-                try:
-                    # Query the timestamp from blocks table
-                    client = self._connect()
-                    query = f"""
-                    SELECT timestamp 
-                    FROM {self.database}.blocks 
-                    WHERE block_number = {int(block_num)} 
-                    LIMIT 1
-                    """
-                    result = client.query(query)
-                    if result.result_rows:
-                        timestamp = result.result_rows[0][0]
-                        block_timestamps[block_num] = timestamp
-                except Exception as e:
-                    logger.warning(f"Error getting timestamp for block {block_num}: {e}")
+            # Batch query for better performance
+            if len(unique_blocks) > 0:
+                client = self._connect()
+                blocks_str = ','.join(str(int(b)) for b in unique_blocks)
+                query = f"""
+                SELECT block_number, timestamp 
+                FROM {self.database}.blocks 
+                WHERE block_number IN ({blocks_str})
+                """
+                result = client.query(query)
+                
+                for row in result.result_rows:
+                    block_timestamps[row[0]] = row[1]
             
             # Map block numbers to timestamps
             df['block_timestamp'] = df['block_number'].map(
@@ -250,7 +235,7 @@ class ClickHouseManager:
         missing_columns = [col for col in table_columns if col not in df.columns]
         for col in missing_columns:
             if col not in ['block_timestamp', 'month']:  # Skip materialized columns
-                logger.info(f"Adding missing column: {col}")
+                logger.debug(f"Adding missing column: {col}")
                 df[col] = None
         
         # Ensure columns are in the correct order (except materialized columns)
@@ -298,53 +283,6 @@ class ClickHouseManager:
         except Exception as e:
             logger.error(f"Error getting blocks in range {start_block}-{end_block}: {e}")
             return []
-    
-    def rollback_to_block(self, block_number: int) -> bool:
-        """
-        Delete all data after a specific block number.
-        Used for handling reorgs.
-        """
-        try:
-            client = self._connect()
-            
-            # List of tables to rollback
-            tables = [
-                'blocks', 
-                'transactions', 
-                'logs',
-                'contracts',
-                'native_transfers',
-                'traces',
-                'balance_diffs',
-                'code_diffs',
-                'nonce_diffs',
-                'storage_diffs',
-                'balance_reads',
-                'code_reads',
-                'storage_reads',
-                'erc20_transfers',
-                'erc721_transfers'
-            ]
-            
-            for table in tables:
-                # Check if table exists before attempting to delete from it
-                table_exists = client.query(f"""
-                SELECT 1 FROM system.tables 
-                WHERE database = '{self.database}' AND name = '{table}'
-                """)
-                
-                if table_exists.result_rows:
-                    client.command(f"""
-                    ALTER TABLE {self.database}.{table}
-                    DELETE WHERE block_number > {block_number}
-                    """)
-                    logger.info(f"Rolled back table {table} to block {block_number}")
-            
-            logger.info(f"Successfully rolled back database to block {block_number}")
-            return True
-        except Exception as e:
-            logger.error(f"Error rolling back to block {block_number}: {e}")
-            return False
     
     def run_migrations(self, migrations_dir: str) -> bool:
         """Run SQL migrations from the provided directory."""
@@ -396,10 +334,28 @@ class ClickHouseManager:
                 # Execute the SQL
                 try:
                     # Execute each statement separately (split by semicolon)
-                    for statement in sql.split(';'):
-                        statement = statement.strip()
-                        if statement:
+                    statements = []
+                    current_statement = ""
+                    
+                    for line in sql.split('\n'):
+                        # Skip empty lines and comments
+                        if line.strip() and not line.strip().startswith('--'):
+                            current_statement += line + '\n'
+                            if line.strip().endswith(';'):
+                                statements.append(current_statement.strip())
+                                current_statement = ""
+                    
+                    # Add any remaining statement
+                    if current_statement.strip():
+                        statements.append(current_statement.strip())
+                    
+                    logger.info(f"Found {len(statements)} SQL statements in {file_name}")
+                    
+                    for i, statement in enumerate(statements):
+                        if statement and not statement.startswith('--'):
+                            logger.debug(f"Executing statement {i+1}: {statement[:100]}...")
                             client.command(statement)
+                            logger.debug(f"Statement {i+1} executed successfully")
                     
                     # Record successful migration
                     client.command(f"""
@@ -416,33 +372,10 @@ class ClickHouseManager:
         except Exception as e:
             logger.error(f"Error running migrations: {e}")
             return False
-        
-    def get_latest_block_for_table(self, table_name: str) -> int:
-        """Get the latest block number for a specific table."""
+    
+    def close(self) -> None:
+        """Close all connections in the pool."""
         try:
-            client = self._connect()
-            
-            # Check if the table exists first
-            table_exists = self._check_table_exists(table_name)
-            if not table_exists:
-                logger.warning(f"Table {table_name} does not exist")
-                return 0
-                
-            # Check if the table has a block_number column
-            columns = self._get_table_columns(table_name)
-            if 'block_number' not in columns:
-                logger.warning(f"Table {table_name} does not have a block_number column")
-                return 0
-            
-            # Query the max block number
-            result = client.query(f"""
-            SELECT MAX(block_number) as max_block 
-            FROM {self.database}.{table_name}
-            """)
-            
-            if result.result_rows and result.result_rows[0][0] is not None:
-                return result.result_rows[0][0]
-            return 0
+            self.connection_pool.close_all()
         except Exception as e:
-            logger.error(f"Error getting latest block for table {table_name}: {e}")
-            return 0
+            logger.error(f"Error closing connections: {e}")

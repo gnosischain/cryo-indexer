@@ -1,34 +1,95 @@
 services:
-  # Main indexer service - configurable via environment variables
   cryo-indexer:
     image: cryo-indexer:latest
-    container_name: cryo-indexer
+    container_name: cryo-indexer-${OPERATION:-continuous}
     volumes:
       - indexer_data:/app/data
       - indexer_logs:/app/logs
-      - indexer_state:/app/state
       - ./migrations:/app/migrations
     environment:
+      # Core settings
       - ETH_RPC_URL=${ETH_RPC_URL}
+      - NETWORK_NAME=${NETWORK_NAME:-ethereum}
+      
+      # ClickHouse settings
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
       - CLICKHOUSE_USER=${CLICKHOUSE_USER}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
       - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE:-blockchain}
-      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-9440} 
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8443}
       - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE:-true}
-      - CONFIRMATION_BLOCKS=${CONFIRMATION_BLOCKS:-20}
-      - POLL_INTERVAL=${POLL_INTERVAL:-15}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      
+      # Operation settings
+      - OPERATION=${OPERATION:-continuous}  # continuous, historical, fill_gaps, validate, backfill
+      - MODE=${MODE:-default}               # default, minimal, full, custom
+      
+      # Block range (for historical/fill_gaps/backfill)
       - START_BLOCK=${START_BLOCK:-0}
       - END_BLOCK=${END_BLOCK:-0}
-      - MAX_BLOCKS_PER_BATCH=${MAX_BLOCKS_PER_BATCH:-1000}
-      - OPERATION_MODE=scraper
-      - INDEXER_MODE=${INDEXER_MODE:-default}
-      - DATASETS=${DATASETS:-blocks,transactions,logs}
-      - NETWORK_NAME=${NETWORK_NAME:-gnosis}
-    #restart: unless-stopped
+      
+      # Performance settings
+      - WORKERS=${WORKERS:-1}
+      - BATCH_SIZE=${BATCH_SIZE:-1000}
+      - MAX_RETRIES=${MAX_RETRIES:-3}
+      
+      # Cryo performance settings
+      - REQUESTS_PER_SECOND=${REQUESTS_PER_SECOND:-50}
+      - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-5}
+      - CRYO_TIMEOUT=${CRYO_TIMEOUT:-300}
+      
+      # Continuous mode settings
+      - CONFIRMATION_BLOCKS=${CONFIRMATION_BLOCKS:-12}
+      - POLL_INTERVAL=${POLL_INTERVAL:-10}
+      
+      # Backfill settings
+      - BACKFILL_BATCH_SIZE=${BACKFILL_BATCH_SIZE:-1000}
+      - BACKFILL_CHUNK_SIZE=${BACKFILL_CHUNK_SIZE:-100000}
+      - BACKFILL_FORCE=${BACKFILL_FORCE:-false}
+      
+      # Gap detection settings
+      - GAP_DETECTION_STATE_CHUNK_SIZE=${GAP_DETECTION_STATE_CHUNK_SIZE:-100000}
+      - GAP_DETECTION_TABLE_CHUNK_SIZE=${GAP_DETECTION_TABLE_CHUNK_SIZE:-10000}
+      - GAP_DETECTION_THRESHOLD=${GAP_DETECTION_THRESHOLD:-0.8}
+      
+      # Custom datasets (optional)
+      - DATASETS=${DATASETS:-}
+      
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      
+    restart: ${RESTART_POLICY:-unless-stopped}
+    
+    deploy:
+      resources:
+        limits:
+          memory: ${MEMORY_LIMIT:-4G}
+          cpus: ${CPU_LIMIT:-2}
+        reservations:
+          memory: ${MEMORY_RESERVATION:-2G}
+          cpus: ${CPU_RESERVATION:-1}
+
+  # Migration service - runs once and exits
+  migrations:
+    image: cryo-indexer:latest
+    container_name: cryo-migrations-${TIMESTAMP:-default}
+    volumes:
+      - ./migrations:/app/migrations
+    environment:
+      # ClickHouse settings (same as above)
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE:-blockchain}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8443}
+      - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE:-true}
+      
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    
+    entrypoint: ["python", "-m", "src", "migrations"]
+    restart: "no"
+    profiles: ["migrations"]  # Only runs when explicitly requested
 
 volumes:
   indexer_data:
   indexer_logs:
-  indexer_state:
