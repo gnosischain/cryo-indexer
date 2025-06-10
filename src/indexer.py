@@ -473,13 +473,25 @@ class CryoIndexer:
         else:
             logger.info("Backfilling entire dataset")
         
-        # Run backfill
-        results = backfill_worker.backfill_datasets(
-            datasets=settings.datasets,
-            start_block=start_block,
-            end_block=end_block,
-            force=settings.backfill_force
-        )
+        # Check if parallel mode is requested
+        if settings.workers > 1 and len(settings.datasets) > 1:
+            logger.info(f"Running parallel backfill with {settings.workers} workers for {len(settings.datasets)} datasets")
+            results = backfill_worker.backfill_datasets_parallel(
+                datasets=settings.datasets,
+                start_block=start_block,
+                end_block=end_block,
+                force=settings.backfill_force,
+                max_workers=settings.workers
+            )
+        else:
+            # Single-threaded mode
+            logger.info("Running single-threaded backfill")
+            results = backfill_worker.backfill_datasets(
+                datasets=settings.datasets,
+                start_block=start_block,
+                end_block=end_block,
+                force=settings.backfill_force
+            )
         
         # Validate results
         success = backfill_worker.validate_backfill(settings.datasets)

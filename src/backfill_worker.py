@@ -1,10 +1,14 @@
 """
 Backfill Worker - Analyzes existing data and populates indexing_state table.
+Supports parallel processing both by dataset and within each dataset.
 """
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from loguru import logger
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import math
 
 from .core.state_manager import StateManager
 from .db.clickhouse_manager import ClickHouseManager
@@ -24,10 +28,24 @@ class BackfillStats:
     created_ranges: int = 0
     skipped_ranges: int = 0
     deleted_ranges: int = 0
+    duration: float = 0.0
+    worker_count: int = 1
     
     def __post_init__(self):
         if self.continuous_ranges is None:
             self.continuous_ranges = []
+
+
+@dataclass
+class DatasetWorkItem:
+    """Work item for parallel processing within a dataset."""
+    dataset: str
+    table_name: str
+    start_block: int
+    end_block: int
+    ranges: List[Tuple[int, int]]
+    force: bool
+    worker_id: int
 
 
 class BackfillWorker:
@@ -61,7 +79,341 @@ class BackfillWorker:
             'txs': 'transactions',
         }
         
+        # Thread-local storage for database connections
+        self._thread_local = threading.local()
+        
+        # Shared statistics lock
+        self._stats_lock = threading.Lock()
+        
         logger.info(f"BackfillWorker initialized for mode {mode}")
+    
+    def _get_thread_clickhouse(self) -> ClickHouseManager:
+        """Get a thread-local ClickHouse connection."""
+        if not hasattr(self._thread_local, 'clickhouse'):
+            # Create a new connection for this thread
+            self._thread_local.clickhouse = ClickHouseManager(
+                host=self.clickhouse.host,
+                user=self.clickhouse.user,
+                password=self.clickhouse.password,
+                database=self.clickhouse.database,
+                port=self.clickhouse.port,
+                secure=self.clickhouse.secure
+            )
+        return self._thread_local.clickhouse
+    
+    def backfill_datasets_parallel(
+        self,
+        datasets: List[str],
+        start_block: Optional[int] = None,
+        end_block: Optional[int] = None,
+        force: bool = False,
+        max_workers: Optional[int] = None
+    ) -> Dict[str, BackfillStats]:
+        """
+        Backfill indexing_state for specified datasets in parallel.
+        Supports multiple workers per dataset.
+        
+        Args:
+            datasets: List of datasets to backfill
+            start_block: Optional start block (None = from beginning)
+            end_block: Optional end block (None = to end)
+            force: Force recreation of existing entries
+            max_workers: Maximum number of parallel workers
+            
+        Returns:
+            Dictionary of dataset -> BackfillStats
+        """
+        results = {}
+        
+        # Determine number of workers
+        if max_workers is None:
+            max_workers = settings.workers
+        
+        logger.info(f"Starting parallel backfill for {len(datasets)} datasets with {max_workers} workers")
+        if start_block is not None and end_block is not None:
+            logger.info(f"Block range: {start_block} to {end_block}")
+        if force:
+            logger.info("FORCE MODE: Will delete and recreate existing entries")
+        
+        start_time = time.time()
+        
+        # First pass: analyze all datasets to find work
+        dataset_work = {}
+        for dataset in datasets:
+            work_info = self._analyze_dataset(dataset, start_block, end_block, force)
+            if work_info:
+                dataset_work[dataset] = work_info
+        
+        if not dataset_work:
+            logger.warning("No work found for any dataset")
+            return results
+        
+        # Distribute workers across datasets
+        work_items = self._distribute_work(dataset_work, max_workers)
+        
+        logger.info(f"Created {len(work_items)} work items across {len(dataset_work)} datasets")
+        
+        # Process all work items in parallel
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_work = {
+                executor.submit(self._process_work_item, item): item
+                for item in work_items
+            }
+            
+            # Initialize results
+            for dataset in dataset_work:
+                results[dataset] = BackfillStats(
+                    dataset=dataset,
+                    table_name=self.dataset_tables.get(dataset, dataset),
+                    exists=True,
+                    min_block=dataset_work[dataset]['min_block'],
+                    max_block=dataset_work[dataset]['max_block'],
+                    total_rows=dataset_work[dataset]['total_rows'],
+                    continuous_ranges=dataset_work[dataset]['ranges'],
+                    worker_count=sum(1 for item in work_items if item.dataset == dataset)
+                )
+            
+            # Collect results as they complete
+            completed = 0
+            for future in as_completed(future_to_work):
+                work_item = future_to_work[future]
+                completed += 1
+                
+                try:
+                    created, skipped = future.result()
+                    
+                    # Update statistics
+                    with self._stats_lock:
+                        results[work_item.dataset].created_ranges += created
+                        results[work_item.dataset].skipped_ranges += skipped
+                    
+                    logger.info(
+                        f"[{completed}/{len(work_items)}] {work_item.dataset} "
+                        f"worker {work_item.worker_id}: Created {created}, Skipped {skipped}"
+                    )
+                    
+                except Exception as e:
+                    logger.error(
+                        f"Error processing {work_item.dataset} worker {work_item.worker_id}: {e}",
+                        exc_info=True
+                    )
+        
+        # Calculate durations
+        total_duration = time.time() - start_time
+        for stats in results.values():
+            stats.duration = total_duration
+        
+        logger.info(f"Parallel backfill completed in {total_duration:.2f}s")
+        
+        # Print summary
+        self._print_backfill_summary(results)
+        return results
+    
+    def _analyze_dataset(
+        self,
+        dataset: str,
+        start_block: Optional[int],
+        end_block: Optional[int],
+        force: bool
+    ) -> Optional[Dict]:
+        """Analyze a dataset to find work to be done."""
+        table_name = self.dataset_tables.get(dataset, dataset)
+        
+        # Check if table exists
+        if not self._table_exists(table_name):
+            logger.warning(f"{dataset}: Table {table_name} does not exist")
+            return None
+        
+        # Get data range and statistics
+        table_stats = self._get_table_stats(table_name, start_block, end_block)
+        if not table_stats:
+            logger.warning(f"No data found in {table_name}")
+            return None
+        
+        min_block, max_block, total_rows = table_stats
+        
+        logger.info(
+            f"{dataset}: blocks {min_block}-{max_block}, "
+            f"{total_rows:,} rows"
+        )
+        
+        # If force mode, handle deletions
+        if force:
+            if start_block is not None and end_block is not None:
+                self._delete_existing_entries_in_range(dataset, start_block, end_block)
+            else:
+                self._delete_existing_entries(dataset, min_block, max_block)
+        
+        # Find continuous ranges
+        continuous_ranges = self._find_continuous_ranges(table_name, min_block, max_block)
+        
+        logger.info(f"{dataset}: Found {len(continuous_ranges)} continuous ranges")
+        
+        return {
+            'dataset': dataset,
+            'table_name': table_name,
+            'min_block': min_block,
+            'max_block': max_block,
+            'total_rows': total_rows,
+            'ranges': continuous_ranges,
+            'force': force
+        }
+    
+    def _distribute_work(
+        self,
+        dataset_work: Dict[str, Dict],
+        max_workers: int
+    ) -> List[DatasetWorkItem]:
+        """Distribute work across workers."""
+        work_items = []
+        
+        # Calculate total work units (ranges)
+        total_ranges = sum(len(info['ranges']) for info in dataset_work.values())
+        
+        if total_ranges == 0:
+            return work_items
+        
+        # Distribute workers proportionally to work
+        for dataset, info in dataset_work.items():
+            dataset_ranges = info['ranges']
+            if not dataset_ranges:
+                continue
+            
+            # Calculate workers for this dataset
+            dataset_worker_count = max(1, int(
+                (len(dataset_ranges) / total_ranges) * max_workers
+            ))
+            
+            # Ensure we don't exceed max_workers
+            dataset_worker_count = min(dataset_worker_count, len(dataset_ranges))
+            
+            logger.info(
+                f"{dataset}: Assigning {dataset_worker_count} workers "
+                f"for {len(dataset_ranges)} ranges"
+            )
+            
+            # Divide ranges among workers
+            ranges_per_worker = math.ceil(len(dataset_ranges) / dataset_worker_count)
+            
+            for worker_id in range(dataset_worker_count):
+                start_idx = worker_id * ranges_per_worker
+                end_idx = min(start_idx + ranges_per_worker, len(dataset_ranges))
+                
+                if start_idx >= len(dataset_ranges):
+                    break
+                
+                worker_ranges = dataset_ranges[start_idx:end_idx]
+                
+                work_item = DatasetWorkItem(
+                    dataset=dataset,
+                    table_name=info['table_name'],
+                    start_block=min(r[0] for r in worker_ranges),
+                    end_block=max(r[1] for r in worker_ranges),
+                    ranges=worker_ranges,
+                    force=info['force'],
+                    worker_id=worker_id
+                )
+                
+                work_items.append(work_item)
+        
+        return work_items
+    
+    def _process_work_item(self, work_item: DatasetWorkItem) -> Tuple[int, int]:
+        """Process a single work item in a thread."""
+        logger.debug(
+            f"Processing {work_item.dataset} worker {work_item.worker_id}: "
+            f"{len(work_item.ranges)} ranges"
+        )
+        
+        # Use thread-local connection
+        thread_clickhouse = self._get_thread_clickhouse()
+        
+        created = 0
+        skipped = 0
+        
+        for start, end in work_item.ranges:
+            # Check if entry already exists
+            if not work_item.force and self._entry_exists(work_item.dataset, start, end + 1):
+                skipped += 1
+                continue
+            
+            # Calculate batch ranges based on backfill_batch_size
+            current = start
+            while current <= end:
+                batch_end = min(current + settings.backfill_batch_size, end + 1)
+                
+                # Count rows in this range
+                rows_count = self._count_rows_in_range_thread_safe(
+                    thread_clickhouse,
+                    work_item.table_name,
+                    current,
+                    batch_end
+                )
+                
+                # Create the entry
+                if self._create_entry_thread_safe(
+                    thread_clickhouse,
+                    work_item.dataset,
+                    current,
+                    batch_end,
+                    rows_count
+                ):
+                    created += 1
+                else:
+                    logger.error(
+                        f"Failed to create entry for {work_item.dataset} "
+                        f"{current}-{batch_end}"
+                    )
+                
+                current = batch_end
+        
+        return created, skipped
+    
+    def _count_rows_in_range_thread_safe(
+        self,
+        clickhouse: ClickHouseManager,
+        table_name: str,
+        start_block: int,
+        end_block: int
+    ) -> int:
+        """Thread-safe version of count_rows_in_range."""
+        try:
+            client = clickhouse._connect()
+            result = client.query(f"""
+            SELECT COUNT(*) 
+            FROM {self.database}.{table_name}
+            WHERE block_number >= {start_block} 
+              AND block_number < {end_block}
+              AND block_number IS NOT NULL
+            """)
+            return result.result_rows[0][0] if result.result_rows else 0
+        except Exception as e:
+            logger.error(f"Error counting rows in range: {e}")
+            return 0
+    
+    def _create_entry_thread_safe(
+        self,
+        clickhouse: ClickHouseManager,
+        dataset: str,
+        start_block: int,
+        end_block: int,
+        rows_count: int
+    ) -> bool:
+        """Thread-safe version of create_entry."""
+        try:
+            client = clickhouse._connect()
+            client.command(f"""
+            INSERT INTO {self.database}.indexing_state
+            (mode, dataset, start_block, end_block, status, completed_at, rows_indexed, batch_id)
+            VALUES
+            ('{self.mode}', '{dataset}', {start_block}, {end_block}, 
+             'completed', now(), {rows_count}, 'backfill')
+            """)
+            return True
+        except Exception as e:
+            logger.error(f"Error creating indexing_state entry: {e}")
+            return False
     
     def backfill_datasets(
         self,
@@ -71,16 +423,8 @@ class BackfillWorker:
         force: bool = False
     ) -> Dict[str, BackfillStats]:
         """
-        Backfill indexing_state for specified datasets.
-        
-        Args:
-            datasets: List of datasets to backfill
-            start_block: Optional start block (None = from beginning)
-            end_block: Optional end block (None = to end)
-            force: Force recreation of existing entries
-            
-        Returns:
-            Dictionary of dataset -> BackfillStats
+        Backfill indexing_state for specified datasets (single-threaded).
+        Kept for backward compatibility.
         """
         results = {}
         
@@ -92,13 +436,16 @@ class BackfillWorker:
         
         for dataset in datasets:
             logger.info(f"Processing dataset: {dataset}")
+            start_time = time.time()
             stats = self._backfill_dataset(dataset, start_block, end_block, force)
+            stats.duration = time.time() - start_time
             results[dataset] = stats
             
             if stats.exists:
                 logger.info(
                     f"{dataset}: Created {stats.created_ranges} ranges, "
-                    f"skipped {stats.skipped_ranges} existing ranges"
+                    f"skipped {stats.skipped_ranges} existing ranges "
+                    f"in {stats.duration:.2f}s"
                 )
                 if force and stats.deleted_ranges > 0:
                     logger.info(f"{dataset}: Deleted {stats.deleted_ranges} existing ranges")
@@ -476,6 +823,7 @@ class BackfillWorker:
         total_created = 0
         total_skipped = 0
         total_deleted = 0
+        total_duration = 0
         
         for dataset, stats in results.items():
             if not stats.exists:
@@ -491,6 +839,8 @@ class BackfillWorker:
             print(f"  Skipped entries: {stats.skipped_ranges}")
             if stats.deleted_ranges > 0:
                 print(f"  Deleted entries: {stats.deleted_ranges}")
+            print(f"  Duration: {stats.duration:.2f}s")
+            print(f"  Workers used: {stats.worker_count}")
             
             if stats.continuous_ranges:
                 print("  Ranges:")
@@ -502,10 +852,12 @@ class BackfillWorker:
             total_created += stats.created_ranges
             total_skipped += stats.skipped_ranges
             total_deleted += stats.deleted_ranges
+            total_duration = max(total_duration, stats.duration)  # Max because parallel
         
         print(f"\nTOTAL: Created {total_created}, Skipped {total_skipped}")
         if total_deleted > 0:
             print(f"       Deleted {total_deleted} (force mode)")
+        print(f"Total Duration: {total_duration:.2f}s")
         print("=" * 60 + "\n")
     
     def validate_backfill(self, datasets: List[str]) -> bool:
