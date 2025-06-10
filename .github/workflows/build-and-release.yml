@@ -11,11 +11,13 @@ concurrency:
 
 jobs:
   build:
-
+    strategy:
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
     runs-on: ubuntu-latest
-
     steps:
-      
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -30,6 +32,9 @@ jobs:
         id: commit
         uses: prompt/actions-commit-hash@v3
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -40,14 +45,60 @@ jobs:
           username: ${{ steps.org_name.outputs.org_name }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push Latest
+      # Extract platform name for tagging
+      - name: Extract platform name
+        id: platform
         run: |
-          docker buildx build --platform linux/amd64,linux/arm64 \
-            --tag ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-cryo-indexer:latest \
-            --push .
-    
-      - name: Push Versioned
+          platform="${{ matrix.platform }}"
+          platform_tag="${platform//\//-}"
+          echo "platform_tag=$platform_tag" >> $GITHUB_OUTPUT
+
+      # Build for single platform
+      - name: Build and Push Platform Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-cryo-indexer:${{ steps.commit.outputs.short }}-${{ steps.platform.outputs.platform_tag }}
+          cache-from: type=registry,ref=ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-cryo-indexer:buildcache-${{ steps.platform.outputs.platform_tag }}
+          cache-to: type=registry,ref=ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-cryo-indexer:buildcache-${{ steps.platform.outputs.platform_tag }},mode=max
+
+  # Combine platform images into multi-arch manifests
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Organization Name
+        id: org_name
         run: |
-          docker buildx build --platform linux/amd64,linux/arm64 \
-            --tag ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-cryo-indexer:${{ steps.commit.outputs.short }} \
-            --push .
+          org_name=$(echo "${{ github.repository_owner }}")
+          echo "Organization Name: $org_name"
+          echo "org_name=$org_name" >> $GITHUB_OUTPUT
+
+      - name: Extract commit
+        id: commit
+        uses: prompt/actions-commit-hash@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ steps.org_name.outputs.org_name }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest
+        run: |
+          docker manifest create \
+            ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-cryo-indexer:latest \
+            ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-cryo-indexer:${{ steps.commit.outputs.short }}-linux-amd64 \
+            ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-cryo-indexer:${{ steps.commit.outputs.short }}-linux-arm64
+          
+          docker manifest create \
+            ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-cryo-indexer:${{ steps.commit.outputs.short }} \
+            ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-cryo-indexer:${{ steps.commit.outputs.short }}-linux-amd64 \
+            ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-cryo-indexer:${{ steps.commit.outputs.short }}-linux-arm64
+          
+          docker manifest push ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-cryo-indexer:latest
+          docker manifest push ghcr.io/${{ steps.org_name.outputs.org_name }}/gc-cryo-indexer:${{ steps.commit.outputs.short }}
