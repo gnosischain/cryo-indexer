@@ -1,6 +1,7 @@
 """
 Backfill Worker - Analyzes existing data and populates indexing_state table.
 Supports parallel processing both by dataset and within each dataset.
+Uses streaming approach to write entries as they're found, not storing everything in memory.
 """
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
@@ -24,7 +25,7 @@ class BackfillStats:
     min_block: Optional[int] = None
     max_block: Optional[int] = None
     total_rows: int = 0
-    continuous_ranges: List[Tuple[int, int]] = None
+    continuous_ranges: int = 0  # Changed from List to count
     created_ranges: int = 0
     skipped_ranges: int = 0
     deleted_ranges: int = 0
@@ -32,8 +33,7 @@ class BackfillStats:
     worker_count: int = 1
     
     def __post_init__(self):
-        if self.continuous_ranges is None:
-            self.continuous_ranges = []
+        pass
 
 
 @dataclass
@@ -43,7 +43,6 @@ class DatasetWorkItem:
     table_name: str
     start_block: int
     end_block: int
-    ranges: List[Tuple[int, int]]
     force: bool
     worker_id: int
 
@@ -153,26 +152,25 @@ class BackfillWorker:
         
         logger.info(f"Created {len(work_items)} work items across {len(dataset_work)} datasets")
         
+        # Initialize results
+        for dataset in dataset_work:
+            results[dataset] = BackfillStats(
+                dataset=dataset,
+                table_name=self.dataset_tables.get(dataset, dataset),
+                exists=True,
+                min_block=dataset_work[dataset]['min_block'],
+                max_block=dataset_work[dataset]['max_block'],
+                total_rows=dataset_work[dataset]['total_rows'],
+                worker_count=sum(1 for item in work_items if item.dataset == dataset)
+            )
+        
         # Process all work items in parallel
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks
             future_to_work = {
-                executor.submit(self._process_work_item, item): item
+                executor.submit(self._process_work_item_streaming, item): item
                 for item in work_items
             }
-            
-            # Initialize results
-            for dataset in dataset_work:
-                results[dataset] = BackfillStats(
-                    dataset=dataset,
-                    table_name=self.dataset_tables.get(dataset, dataset),
-                    exists=True,
-                    min_block=dataset_work[dataset]['min_block'],
-                    max_block=dataset_work[dataset]['max_block'],
-                    total_rows=dataset_work[dataset]['total_rows'],
-                    continuous_ranges=dataset_work[dataset]['ranges'],
-                    worker_count=sum(1 for item in work_items if item.dataset == dataset)
-                )
             
             # Collect results as they complete
             completed = 0
@@ -181,16 +179,18 @@ class BackfillWorker:
                 completed += 1
                 
                 try:
-                    created, skipped = future.result()
+                    created, skipped, ranges_found = future.result()
                     
                     # Update statistics
                     with self._stats_lock:
                         results[work_item.dataset].created_ranges += created
                         results[work_item.dataset].skipped_ranges += skipped
+                        results[work_item.dataset].continuous_ranges += ranges_found
                     
                     logger.info(
                         f"[{completed}/{len(work_items)}] {work_item.dataset} "
-                        f"worker {work_item.worker_id}: Created {created}, Skipped {skipped}"
+                        f"worker {work_item.worker_id}: Created {created}, Skipped {skipped}, "
+                        f"Ranges found: {ranges_found}"
                     )
                     
                 except Exception as e:
@@ -245,18 +245,12 @@ class BackfillWorker:
             else:
                 self._delete_existing_entries(dataset, min_block, max_block)
         
-        # Find continuous ranges
-        continuous_ranges = self._find_continuous_ranges(table_name, min_block, max_block)
-        
-        logger.info(f"{dataset}: Found {len(continuous_ranges)} continuous ranges")
-        
         return {
             'dataset': dataset,
             'table_name': table_name,
             'min_block': min_block,
             'max_block': max_block,
             'total_rows': total_rows,
-            'ranges': continuous_ranges,
             'force': force
         }
     
@@ -268,49 +262,50 @@ class BackfillWorker:
         """Distribute work across workers."""
         work_items = []
         
-        # Calculate total work units (ranges)
-        total_ranges = sum(len(info['ranges']) for info in dataset_work.values())
+        # Calculate total block ranges
+        total_blocks = sum(
+            info['max_block'] - info['min_block'] + 1 
+            for info in dataset_work.values()
+        )
         
-        if total_ranges == 0:
+        if total_blocks == 0:
             return work_items
         
-        # Distribute workers proportionally to work
+        # Distribute workers proportionally to block ranges
         for dataset, info in dataset_work.items():
-            dataset_ranges = info['ranges']
-            if not dataset_ranges:
-                continue
+            dataset_blocks = info['max_block'] - info['min_block'] + 1
             
             # Calculate workers for this dataset
             dataset_worker_count = max(1, int(
-                (len(dataset_ranges) / total_ranges) * max_workers
+                (dataset_blocks / total_blocks) * max_workers
             ))
             
             # Ensure we don't exceed max_workers
-            dataset_worker_count = min(dataset_worker_count, len(dataset_ranges))
+            dataset_worker_count = min(dataset_worker_count, max_workers)
             
             logger.info(
                 f"{dataset}: Assigning {dataset_worker_count} workers "
-                f"for {len(dataset_ranges)} ranges"
+                f"for {dataset_blocks:,} blocks"
             )
             
-            # Divide ranges among workers
-            ranges_per_worker = math.ceil(len(dataset_ranges) / dataset_worker_count)
+            # Divide block range among workers
+            blocks_per_worker = math.ceil(dataset_blocks / dataset_worker_count)
             
             for worker_id in range(dataset_worker_count):
-                start_idx = worker_id * ranges_per_worker
-                end_idx = min(start_idx + ranges_per_worker, len(dataset_ranges))
+                worker_start = info['min_block'] + (worker_id * blocks_per_worker)
+                worker_end = min(
+                    worker_start + blocks_per_worker - 1,
+                    info['max_block']
+                )
                 
-                if start_idx >= len(dataset_ranges):
+                if worker_start > info['max_block']:
                     break
-                
-                worker_ranges = dataset_ranges[start_idx:end_idx]
                 
                 work_item = DatasetWorkItem(
                     dataset=dataset,
                     table_name=info['table_name'],
-                    start_block=min(r[0] for r in worker_ranges),
-                    end_block=max(r[1] for r in worker_ranges),
-                    ranges=worker_ranges,
+                    start_block=worker_start,
+                    end_block=worker_end,
                     force=info['force'],
                     worker_id=worker_id
                 )
@@ -319,56 +314,210 @@ class BackfillWorker:
         
         return work_items
     
-    def _process_work_item(self, work_item: DatasetWorkItem) -> Tuple[int, int]:
-        """Process a single work item in a thread."""
-        logger.debug(
+    def _process_work_item_streaming(
+        self, 
+        work_item: DatasetWorkItem
+    ) -> Tuple[int, int, int]:
+        """Process a work item using streaming approach."""
+        logger.info(
             f"Processing {work_item.dataset} worker {work_item.worker_id}: "
-            f"{len(work_item.ranges)} ranges"
+            f"blocks {work_item.start_block:,} to {work_item.end_block:,}"
         )
         
         # Use thread-local connection
         thread_clickhouse = self._get_thread_clickhouse()
         
+        # Process using streaming approach
+        created, skipped, ranges_found = self._find_continuous_ranges_streaming(
+            thread_clickhouse,
+            work_item.table_name,
+            work_item.dataset,
+            work_item.start_block,
+            work_item.end_block,
+            work_item.force
+        )
+        
+        return created, skipped, ranges_found
+    
+    def _find_continuous_ranges_streaming(
+        self,
+        clickhouse: ClickHouseManager,
+        table_name: str,
+        dataset: str,
+        min_block: int,
+        max_block: int,
+        force: bool
+    ) -> Tuple[int, int, int]:
+        """Find continuous ranges and write them immediately as found."""
+        try:
+            client = clickhouse._connect()
+            chunk_size = settings.backfill_chunk_size
+            
+            created = 0
+            skipped = 0
+            ranges_found = 0
+            current_range_start = None
+            current_range_end = None
+            
+            logger.info(f"Scanning and writing blocks for {table_name} from {min_block:,} to {max_block:,}")
+            
+            current = min_block
+            while current <= max_block:
+                chunk_end = min(current + chunk_size - 1, max_block)
+                
+                # Get blocks in this chunk
+                result = client.query(f"""
+                SELECT DISTINCT block_number 
+                FROM {self.database}.{table_name}
+                WHERE block_number >= {current} 
+                  AND block_number <= {chunk_end}
+                  AND block_number IS NOT NULL
+                ORDER BY block_number
+                """)
+                
+                chunk_blocks = [row[0] for row in result.result_rows]
+                logger.debug(f"Chunk {current}-{chunk_end}: {len(chunk_blocks)} blocks")
+                
+                # Process blocks in this chunk
+                for block in chunk_blocks:
+                    if current_range_start is None:
+                        # Start new range
+                        current_range_start = block
+                        current_range_end = block
+                    elif block == current_range_end + 1:
+                        # Extend current range
+                        current_range_end = block
+                    else:
+                        # Gap found - write current range
+                        c, s = self._write_range_entries(
+                            clickhouse, dataset, current_range_start, current_range_end, force
+                        )
+                        created += c
+                        skipped += s
+                        ranges_found += 1
+                        
+                        # Start new range
+                        current_range_start = block
+                        current_range_end = block
+                
+                # Check if we should close the range at chunk boundary
+                if current_range_start is not None and chunk_end < max_block:
+                    # Check if the range continues in the next chunk
+                    next_block = chunk_end + 1
+                    check_result = client.query(f"""
+                    SELECT COUNT(*) 
+                    FROM {self.database}.{table_name}
+                    WHERE block_number = {next_block}
+                    """)
+                    
+                    if check_result.result_rows[0][0] == 0:
+                        # No block at start of next chunk, close range
+                        c, s = self._write_range_entries(
+                            clickhouse, dataset, current_range_start, current_range_end, force
+                        )
+                        created += c
+                        skipped += s
+                        ranges_found += 1
+                        current_range_start = None
+                        current_range_end = None
+                
+                current = chunk_end + 1
+            
+            # Write final range if exists
+            if current_range_start is not None:
+                c, s = self._write_range_entries(
+                    clickhouse, dataset, current_range_start, current_range_end, force
+                )
+                created += c
+                skipped += s
+                ranges_found += 1
+            
+            logger.info(
+                f"Completed scanning {table_name}: "
+                f"Created {created}, Skipped {skipped}, Ranges found: {ranges_found}"
+            )
+            return created, skipped, ranges_found
+            
+        except Exception as e:
+            logger.error(f"Error in streaming scan for {table_name}: {e}")
+            return 0, 0, 0
+    
+    def _write_range_entries(
+        self,
+        clickhouse: ClickHouseManager,
+        dataset: str,
+        start: int,
+        end: int,
+        force: bool
+    ) -> Tuple[int, int]:
+        """Write indexing_state entries for a continuous range."""
         created = 0
         skipped = 0
         
-        for start, end in work_item.ranges:
+        logger.debug(f"Writing range entries for {dataset}: {start:,} to {end:,}")
+        
+        # Calculate batch ranges based on backfill_batch_size
+        current = start
+        while current <= end:
+            batch_end = min(current + settings.backfill_batch_size - 1, end)
+            
             # Check if entry already exists
-            if not work_item.force and self._entry_exists(work_item.dataset, start, end + 1):
+            if not force and self._entry_exists_thread_safe(
+                clickhouse, dataset, current, batch_end + 1
+            ):
                 skipped += 1
+                current = batch_end + 1
                 continue
             
-            # Calculate batch ranges based on backfill_batch_size
-            current = start
-            while current <= end:
-                batch_end = min(current + settings.backfill_batch_size, end + 1)
-                
-                # Count rows in this range
-                rows_count = self._count_rows_in_range_thread_safe(
-                    thread_clickhouse,
-                    work_item.table_name,
-                    current,
-                    batch_end
+            # Count rows in this range
+            rows_count = self._count_rows_in_range_thread_safe(
+                clickhouse,
+                self.dataset_tables[dataset], 
+                current, 
+                batch_end + 1
+            )
+            
+            # Create the entry
+            if self._create_entry_thread_safe(
+                clickhouse, dataset, current, batch_end + 1, rows_count
+            ):
+                created += 1
+                logger.debug(
+                    f"Created entry for {dataset} {current:,}-{batch_end + 1:,} "
+                    f"({rows_count:,} rows)"
                 )
-                
-                # Create the entry
-                if self._create_entry_thread_safe(
-                    thread_clickhouse,
-                    work_item.dataset,
-                    current,
-                    batch_end,
-                    rows_count
-                ):
-                    created += 1
-                else:
-                    logger.error(
-                        f"Failed to create entry for {work_item.dataset} "
-                        f"{current}-{batch_end}"
-                    )
-                
-                current = batch_end
+            else:
+                logger.error(
+                    f"Failed to create entry for {dataset} {current:,}-{batch_end + 1:,}"
+                )
+            
+            current = batch_end + 1
         
         return created, skipped
+    
+    def _entry_exists_thread_safe(
+        self,
+        clickhouse: ClickHouseManager,
+        dataset: str,
+        start_block: int,
+        end_block: int
+    ) -> bool:
+        """Thread-safe check if an indexing_state entry already exists."""
+        try:
+            client = clickhouse._connect()
+            result = client.query(f"""
+            SELECT COUNT() 
+            FROM {self.database}.indexing_state
+            WHERE mode = '{self.mode}'
+              AND dataset = '{dataset}'
+              AND start_block = {start_block}
+              AND end_block = {end_block}
+              AND status = 'completed'
+            """)
+            return result.result_rows[0][0] > 0
+        except Exception as e:
+            logger.error(f"Error checking entry existence: {e}")
+            return False
     
     def _count_rows_in_range_thread_safe(
         self,
@@ -424,7 +573,7 @@ class BackfillWorker:
     ) -> Dict[str, BackfillStats]:
         """
         Backfill indexing_state for specified datasets (single-threaded).
-        Kept for backward compatibility.
+        Uses streaming approach for memory efficiency.
         """
         results = {}
         
@@ -463,7 +612,7 @@ class BackfillWorker:
         end_block: Optional[int],
         force: bool
     ) -> BackfillStats:
-        """Backfill a single dataset."""
+        """Backfill a single dataset using streaming approach."""
         stats = BackfillStats(dataset=dataset, table_name="")
         
         # Get table name
@@ -507,19 +656,19 @@ class BackfillWorker:
             if deleted_count > 0:
                 logger.info(f"{dataset}: Deleted {deleted_count} existing entries")
         
-        # Find continuous ranges
-        continuous_ranges = self._find_continuous_ranges(
-            table_name, stats.min_block, stats.max_block
+        # Use streaming approach to find and write ranges
+        created, skipped, ranges_found = self._find_continuous_ranges_streaming(
+            self.clickhouse,
+            table_name,
+            dataset,
+            stats.min_block,
+            stats.max_block,
+            force
         )
-        stats.continuous_ranges = continuous_ranges
-        logger.info(f"{dataset}: Found {len(continuous_ranges)} continuous ranges")
         
-        # Create indexing_state entries
-        created, skipped = self._create_indexing_state_entries(
-            dataset, continuous_ranges, force
-        )
         stats.created_ranges = created
         stats.skipped_ranges = skipped
+        stats.continuous_ranges = ranges_found
         
         return stats
     
@@ -613,70 +762,6 @@ class BackfillWorker:
             logger.error(f"Error deleting existing entries: {e}")
             return 0
     
-    def _find_continuous_ranges(
-        self,
-        table_name: str,
-        min_block: int,
-        max_block: int
-    ) -> List[Tuple[int, int]]:
-        """Find continuous block ranges in a table."""
-        try:
-            client = self.clickhouse._connect()
-            
-            # Use chunked approach for large ranges
-            chunk_size = settings.backfill_chunk_size
-            all_blocks = set()
-            
-            logger.debug(f"Scanning blocks in {table_name} from {min_block} to {max_block}")
-            
-            current = min_block
-            while current <= max_block:
-                chunk_end = min(current + chunk_size, max_block)
-                
-                # Get distinct blocks in this chunk
-                result = client.query(f"""
-                SELECT DISTINCT block_number 
-                FROM {self.database}.{table_name}
-                WHERE block_number >= {current} 
-                  AND block_number <= {chunk_end}
-                  AND block_number IS NOT NULL
-                ORDER BY block_number
-                """)
-                
-                chunk_blocks = [row[0] for row in result.result_rows]
-                all_blocks.update(chunk_blocks)
-                
-                logger.debug(f"Chunk {current}-{chunk_end}: {len(chunk_blocks)} blocks")
-                current = chunk_end + 1
-            
-            # Convert to sorted list
-            sorted_blocks = sorted(all_blocks)
-            
-            if not sorted_blocks:
-                return []
-            
-            # Find continuous ranges
-            ranges = []
-            start = sorted_blocks[0]
-            end = sorted_blocks[0]
-            
-            for i in range(1, len(sorted_blocks)):
-                if sorted_blocks[i] == end + 1:
-                    end = sorted_blocks[i]
-                else:
-                    ranges.append((start, end))
-                    start = sorted_blocks[i]
-                    end = sorted_blocks[i]
-            
-            ranges.append((start, end))
-            
-            logger.debug(f"Found {len(ranges)} continuous ranges in {table_name}")
-            return ranges
-            
-        except Exception as e:
-            logger.error(f"Error finding continuous ranges in {table_name}: {e}")
-            return []
-    
     def _delete_existing_entries(
         self,
         dataset: str,
@@ -736,62 +821,6 @@ class BackfillWorker:
             logger.error(f"Error checking entry existence: {e}")
             return False
     
-    def _create_indexing_state_entries(
-        self,
-        dataset: str,
-        continuous_ranges: List[Tuple[int, int]],
-        force: bool
-    ) -> Tuple[int, int]:
-        """Create indexing_state entries for continuous ranges."""
-        created = 0
-        skipped = 0
-        
-        for start, end in continuous_ranges:
-            # Check if entry already exists
-            if not force and self._entry_exists(dataset, start, end + 1):
-                skipped += 1
-                logger.debug(f"Entry already exists for {dataset} {start}-{end + 1}, skipping")
-                continue
-            
-            # Calculate batch ranges based on backfill_batch_size
-            current = start
-            while current <= end:
-                batch_end = min(current + settings.backfill_batch_size, end + 1)
-                
-                # Count rows in this range for accurate tracking
-                rows_count = self._count_rows_in_range(
-                    self.dataset_tables[dataset], 
-                    current, 
-                    batch_end
-                )
-                
-                # Create the entry
-                if self._create_entry(dataset, current, batch_end, rows_count):
-                    created += 1
-                    logger.debug(f"Created entry for {dataset} {current}-{batch_end} ({rows_count} rows)")
-                else:
-                    logger.error(f"Failed to create entry for {dataset} {current}-{batch_end}")
-                
-                current = batch_end
-        
-        return created, skipped
-    
-    def _count_rows_in_range(self, table_name: str, start_block: int, end_block: int) -> int:
-        """Count rows in a specific block range."""
-        try:
-            client = self.clickhouse._connect()
-            result = client.query(f"""
-            SELECT COUNT(*) 
-            FROM {self.database}.{table_name}
-            WHERE block_number >= {start_block} 
-              AND block_number < {end_block}
-              AND block_number IS NOT NULL
-            """)
-            return result.result_rows[0][0] if result.result_rows else 0
-        except Exception as e:
-            logger.error(f"Error counting rows in range: {e}")
-            return 0
-    
     def _create_entry(
         self,
         dataset: str,
@@ -814,6 +843,22 @@ class BackfillWorker:
             logger.error(f"Error creating indexing_state entry: {e}")
             return False
     
+    def _count_rows_in_range(self, table_name: str, start_block: int, end_block: int) -> int:
+        """Count rows in a specific block range."""
+        try:
+            client = self.clickhouse._connect()
+            result = client.query(f"""
+            SELECT COUNT(*) 
+            FROM {self.database}.{table_name}
+            WHERE block_number >= {start_block} 
+              AND block_number < {end_block}
+              AND block_number IS NOT NULL
+            """)
+            return result.result_rows[0][0] if result.result_rows else 0
+        except Exception as e:
+            logger.error(f"Error counting rows in range: {e}")
+            return 0
+    
     def _print_backfill_summary(self, results: Dict[str, BackfillStats]) -> None:
         """Print a summary of the backfill operation."""
         print("\n" + "=" * 60)
@@ -832,22 +877,16 @@ class BackfillWorker:
             
             print(f"\n{dataset}:")
             print(f"  Table: {stats.table_name}")
-            print(f"  Block range: {stats.min_block} - {stats.max_block}")
+            print(f"  Block range: {stats.min_block:,} - {stats.max_block:,}")
             print(f"  Total rows: {stats.total_rows:,}")
-            print(f"  Continuous ranges: {len(stats.continuous_ranges)}")
+            print(f"  Continuous ranges found: {stats.continuous_ranges}")
             print(f"  Created entries: {stats.created_ranges}")
             print(f"  Skipped entries: {stats.skipped_ranges}")
             if stats.deleted_ranges > 0:
                 print(f"  Deleted entries: {stats.deleted_ranges}")
             print(f"  Duration: {stats.duration:.2f}s")
-            print(f"  Workers used: {stats.worker_count}")
-            
-            if stats.continuous_ranges:
-                print("  Ranges:")
-                for i, (start, end) in enumerate(stats.continuous_ranges[:5]):
-                    print(f"    {i+1}. {start:,} - {end:,} ({end-start+1:,} blocks)")
-                if len(stats.continuous_ranges) > 5:
-                    print(f"    ... and {len(stats.continuous_ranges) - 5} more ranges")
+            if stats.worker_count > 1:
+                print(f"  Workers used: {stats.worker_count}")
             
             total_created += stats.created_ranges
             total_skipped += stats.skipped_ranges
