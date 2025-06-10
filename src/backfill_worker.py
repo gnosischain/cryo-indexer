@@ -389,6 +389,62 @@ class BackfillWorker:
             logger.error(f"Error checking entry existence: {e}")
             return False
     
+    def _create_indexing_state_entries(
+        self,
+        dataset: str,
+        continuous_ranges: List[Tuple[int, int]],
+        force: bool
+    ) -> Tuple[int, int]:
+        """Create indexing_state entries for continuous ranges."""
+        created = 0
+        skipped = 0
+        
+        for start, end in continuous_ranges:
+            # Check if entry already exists
+            if not force and self._entry_exists(dataset, start, end + 1):
+                skipped += 1
+                logger.debug(f"Entry already exists for {dataset} {start}-{end + 1}, skipping")
+                continue
+            
+            # Calculate batch ranges based on backfill_batch_size
+            current = start
+            while current <= end:
+                batch_end = min(current + settings.backfill_batch_size, end + 1)
+                
+                # Count rows in this range for accurate tracking
+                rows_count = self._count_rows_in_range(
+                    self.dataset_tables[dataset], 
+                    current, 
+                    batch_end
+                )
+                
+                # Create the entry
+                if self._create_entry(dataset, current, batch_end, rows_count):
+                    created += 1
+                    logger.debug(f"Created entry for {dataset} {current}-{batch_end} ({rows_count} rows)")
+                else:
+                    logger.error(f"Failed to create entry for {dataset} {current}-{batch_end}")
+                
+                current = batch_end
+        
+        return created, skipped
+    
+    def _count_rows_in_range(self, table_name: str, start_block: int, end_block: int) -> int:
+        """Count rows in a specific block range."""
+        try:
+            client = self.clickhouse._connect()
+            result = client.query(f"""
+            SELECT COUNT(*) 
+            FROM {self.database}.{table_name}
+            WHERE block_number >= {start_block} 
+              AND block_number < {end_block}
+              AND block_number IS NOT NULL
+            """)
+            return result.result_rows[0][0] if result.result_rows else 0
+        except Exception as e:
+            logger.error(f"Error counting rows in range: {e}")
+            return 0
+    
     def _create_entry(
         self,
         dataset: str,
