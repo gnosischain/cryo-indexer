@@ -65,6 +65,9 @@ class IndexerWorker:
             bool: True if successful, False otherwise
         """
         try:
+            # Define diff datasets that need special handling
+            diff_datasets = ['balance_diffs', 'code_diffs', 'nonce_diffs', 'storage_diffs']
+            
             # In force mode, just process everything without checking
             if force:
                 logger.info(f"Worker {self.worker_id}: Force processing {start_block}-{end_block} for datasets: {datasets}")
@@ -81,8 +84,13 @@ class IndexerWorker:
                 
                 # Mark as completed in the state
                 for dataset in datasets:
+                    # Adjust start block for diff datasets when recording in state
+                    dataset_start = start_block
+                    if dataset in diff_datasets and start_block == 0:
+                        dataset_start = 1
+                    
                     self.state_manager.complete_range(
-                        self.mode, dataset, start_block, end_block, total_rows
+                        self.mode, dataset, dataset_start, end_block, total_rows
                     )
                 
                 logger.info(f"Worker {self.worker_id}: Successfully force-processed {start_block}-{end_block} ({total_rows} rows)")
@@ -115,27 +123,33 @@ class IndexerWorker:
             
             # Now process other datasets
             for dataset in other_datasets:
+                # Adjust start block for diff datasets
+                dataset_start = start_block
+                if dataset in diff_datasets and start_block == 0:
+                    dataset_start = 1
+                    logger.info(f"Worker {self.worker_id}: Adjusted start block for {dataset} from 0 to 1")
+                
                 # Check if we should process this dataset
                 if not self.state_manager.should_process_range(
-                    self.mode, dataset, start_block, end_block
+                    self.mode, dataset, dataset_start, end_block
                 ):
-                    logger.info(f"Worker {self.worker_id}: {dataset} range {start_block}-{end_block} already completed")
+                    logger.info(f"Worker {self.worker_id}: {dataset} range {dataset_start}-{end_block} already completed")
                     continue
                 
                 # Claim the range
                 if self.state_manager.claim_range(
-                    self.mode, dataset, start_block, end_block, 
+                    self.mode, dataset, dataset_start, end_block, 
                     self.worker_id, self.batch_id
                 ):
-                    logger.info(f"Worker {self.worker_id}: Processing {dataset} {start_block}-{end_block}")
-                    if not self._process_dataset_range(start_block, end_block, [dataset]):
+                    logger.info(f"Worker {self.worker_id}: Processing {dataset} {dataset_start}-{end_block}")
+                    if not self._process_dataset_range(dataset_start, end_block, [dataset]):
                         # Mark as failed but continue with other datasets
                         self.state_manager.fail_range(
-                            self.mode, dataset, start_block, end_block, 
+                            self.mode, dataset, dataset_start, end_block, 
                             "Processing failed"
                         )
                 else:
-                    logger.warning(f"Worker {self.worker_id}: Could not claim {dataset} range {start_block}-{end_block}")
+                    logger.warning(f"Worker {self.worker_id}: Could not claim {dataset} range {dataset_start}-{end_block}")
                     continue  # Someone else is processing it
             
             logger.info(f"Worker {self.worker_id}: Successfully completed all datasets for {start_block}-{end_block}")
@@ -144,12 +158,20 @@ class IndexerWorker:
         except Exception as e:
             logger.error(f"Worker {self.worker_id}: Error processing {start_block}-{end_block}: {e}", exc_info=True)
             
+            # Define diff datasets here too for error handling
+            diff_datasets = ['balance_diffs', 'code_diffs', 'nonce_diffs', 'storage_diffs']
+            
             # Mark all datasets as failed if in force mode
             if force:
                 for dataset in datasets:
                     try:
+                        # Adjust start block for diff datasets
+                        dataset_start = start_block
+                        if dataset in diff_datasets and start_block == 0:
+                            dataset_start = 1
+                        
                         self.state_manager.fail_range(
-                            self.mode, dataset, start_block, end_block, str(e)
+                            self.mode, dataset, dataset_start, end_block, str(e)[:500]
                         )
                     except:
                         pass
@@ -207,38 +229,79 @@ class IndexerWorker:
     def _run_cryo(self, start_block: int, end_block: int, datasets: List[str]) -> None:
         """Run Cryo to extract blockchain data."""
         try:
-            cmd = [
-                "cryo",
-                *datasets,
-                "--blocks", format_block_range(start_block, end_block),
-                "--output-dir", self.data_dir,
-                "--rpc", self.rpc_url,
-                "--overwrite",
-                "--requests-per-second", str(settings.requests_per_second),
-                "--max-concurrent-requests", str(settings.max_concurrent_requests)
-            ]
+            # Define diff datasets
+            diff_datasets = ['balance_diffs', 'code_diffs', 'nonce_diffs', 'storage_diffs']
             
-            if self.network_name:
-                cmd.extend(["--network-name", self.network_name])
-            
-            logger.debug(f"Worker {self.worker_id}: Running {' '.join(cmd)}")
-            
-            process = subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=settings.cryo_timeout
-            )
-            
-            if process.returncode != 0:
-                raise Exception(f"Cryo failed: {process.stderr}")
+            # Adjust start block for diff datasets
+            adjusted_start = start_block
+            if start_block == 0 and any(d in diff_datasets for d in datasets):
+                # Check if we have any diff datasets
+                has_diff = False
+                has_non_diff = False
+                for d in datasets:
+                    if d in diff_datasets:
+                        has_diff = True
+                    else:
+                        has_non_diff = True
                 
-        except subprocess.TimeoutExpired:
-            raise Exception(f"Cryo command timed out after {settings.cryo_timeout} seconds")
+                if has_diff and not has_non_diff:
+                    # All datasets are diffs, adjust start
+                    adjusted_start = 1
+                    logger.info(f"Worker {self.worker_id}: Adjusted start block from 0 to 1 for diff datasets")
+                elif has_diff and has_non_diff:
+                    # Mixed datasets - need to run cryo twice
+                    logger.info(f"Worker {self.worker_id}: Mixed diff and non-diff datasets, running cryo twice")
+                    
+                    # First run non-diff datasets
+                    non_diff_datasets = [d for d in datasets if d not in diff_datasets]
+                    if non_diff_datasets:
+                        self._run_cryo_command(start_block, end_block, non_diff_datasets)
+                    
+                    # Then run diff datasets with adjusted start
+                    diff_datasets_to_run = [d for d in datasets if d in diff_datasets]
+                    if diff_datasets_to_run:
+                        self._run_cryo_command(1, end_block, diff_datasets_to_run)
+                    
+                    return
+            
+            # Normal case or already adjusted
+            self._run_cryo_command(adjusted_start, end_block, datasets)
+                
         except Exception as e:
             logger.error(f"Worker {self.worker_id}: Cryo error: {e}")
             raise
+    
+    def _run_cryo_command(self, start_block: int, end_block: int, datasets: List[str]) -> None:
+        """Execute the actual cryo command."""
+        cmd = [
+            "cryo",
+            *datasets,
+            "--blocks", format_block_range(start_block, end_block),
+            "--output-dir", self.data_dir,
+            "--rpc", self.rpc_url,
+            "--overwrite",
+            "--requests-per-second", str(settings.requests_per_second),
+            "--max-concurrent-requests", str(settings.max_concurrent_requests)
+        ]
+        
+        if self.network_name:
+            cmd.extend(["--network-name", self.network_name])
+        
+        logger.debug(f"Worker {self.worker_id}: Running {' '.join(cmd)}")
+        
+        process = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=settings.cryo_timeout
+        )
+        
+        if process.returncode != 0:
+            error_msg = f"Cryo failed with code {process.returncode}: {process.stderr}"
+            logger.error(f"Worker {self.worker_id}: {error_msg}")
+            logger.error(f"stdout: {process.stdout}")
+            raise Exception(error_msg)
     
     def _load_to_clickhouse(self, datasets: List[str]) -> int:
         """Load extracted data to ClickHouse."""
