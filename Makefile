@@ -65,7 +65,7 @@ help:
 
 # Build
 build:
-	docker build -t cryo-indexer:latest .
+	docker build -t cryo-indexer:latest . --no-cache
 
 # Run migrations
 run-migrations:

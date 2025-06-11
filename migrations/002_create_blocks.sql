@@ -9,11 +9,15 @@ CREATE TABLE IF NOT EXISTS {{database}}.blocks
     `timestamp` Nullable(UInt32),
     `base_fee_per_gas` Nullable(UInt64),
     `chain_id` Nullable(UInt64),
-    `block_timestamp` DateTime MATERIALIZED toDateTime(timestamp)
+    `block_timestamp` DateTime MATERIALIZED toDateTime(timestamp),
+    `insert_version` UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
 )
-ENGINE = ReplacingMergeTree()
+ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(block_timestamp)
 ORDER BY block_number
 SETTINGS allow_nullable_key = 1,
-replicated_deduplication_window         = 10,   -- last 10 parts
-replicated_deduplication_window_seconds = 900;  -- or 15 minutes
+replicated_deduplication_window         = 10,   
+replicated_deduplication_window_seconds = 900; 
+
+
+INSERT INTO {{database}}.migrations (name) VALUES ('002_create_blocks');

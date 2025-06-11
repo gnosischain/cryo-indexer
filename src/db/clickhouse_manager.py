@@ -15,7 +15,7 @@ from ..core.utils import read_parquet_to_pandas, parse_dataset_name_from_file
 
 
 class ClickHouseManager:
-    """Manager for ClickHouse database operations."""
+    """Manager for ClickHouse database operations with insert_version support."""
     
     def __init__(
         self,
@@ -33,18 +33,7 @@ class ClickHouseManager:
         self.port = port
         self.secure = secure
         
-        # Create connection pool
-        self.connection_pool = ClickHouseConnectionPool(
-            host=host,
-            user=user,
-            password=password,
-            database=database,
-            port=port,
-            secure=secure
-        )
-        
-        # Get a client from the pool for initial setup
-        self.client = self.connection_pool.get_client()
+        # First ensure the database exists before creating the connection pool
         self._ensure_database_exists()
         
     def _connect(self) -> Client:
@@ -54,13 +43,37 @@ class ClickHouseManager:
     def _ensure_database_exists(self) -> None:
         """Make sure the target database exists."""
         try:
-            # Try to create the database if it doesn't exist
-            client = self._connect()
-            client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
+            # First, get a client without specifying the database
+            # This avoids the error when the database doesn't exist
+            temp_client = clickhouse_connect.get_client(
+                host=self.host,
+                user=self.user,
+                password=self.password,
+                port=self.port,
+                secure=self.secure
+                # Note: no database parameter here
+            )
             
-            # Set the current database
-            client.command(f"USE {self.database}")
-            logger.info(f"Using database: {self.database}")
+            # Create the database if it doesn't exist
+            temp_client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
+            logger.info(f"Ensured database {self.database} exists")
+            
+            # Close the temporary client
+            temp_client.close()
+            
+            # Now update the connection pool to use the database
+            self.connection_pool = ClickHouseConnectionPool(
+                host=self.host,
+                user=self.user,
+                password=self.password,
+                database=self.database,
+                port=self.port,
+                secure=self.secure
+            )
+            
+            # Get a new client with the database specified
+            self.client = self.connection_pool.get_client()
+            
         except Exception as e:
             logger.error(f"Error ensuring database exists: {e}")
             raise
@@ -145,6 +158,11 @@ class ClickHouseManager:
             # Convert binary columns to hex strings for ClickHouse
             self._convert_binary_columns(df)
             
+            # IMPORTANT: Do not include insert_version in the DataFrame
+            # It's a MATERIALIZED column that ClickHouse will populate automatically
+            if 'insert_version' in df.columns:
+                df = df.drop(columns=['insert_version'])
+            
             result = client.insert_df(f"{self.database}.{table_name}", df)
             
             # Handle the QuerySummary object properly
@@ -228,18 +246,18 @@ class ClickHouseManager:
     
     def _adjust_dataframe_to_schema(self, df: pd.DataFrame, table_columns: List[str]) -> pd.DataFrame:
         """Adjust DataFrame columns to match the table schema."""
-        # Filter only columns that exist in the table
-        existing_columns = [col for col in df.columns if col in table_columns]
+        # Filter only columns that exist in the table (excluding MATERIALIZED columns)
+        materialized_columns = ['block_timestamp', 'month', 'insert_version']
+        existing_columns = [col for col in df.columns if col in table_columns and col not in materialized_columns]
         
-        # Fill missing columns with None/NULL
-        missing_columns = [col for col in table_columns if col not in df.columns]
+        # Fill missing columns with None/NULL (excluding MATERIALIZED columns)
+        missing_columns = [col for col in table_columns if col not in df.columns and col not in materialized_columns]
         for col in missing_columns:
-            if col not in ['block_timestamp', 'month']:  # Skip materialized columns
-                logger.debug(f"Adding missing column: {col}")
-                df[col] = None
+            logger.debug(f"Adding missing column: {col}")
+            df[col] = None
         
-        # Ensure columns are in the correct order (except materialized columns)
-        columns_to_select = [col for col in table_columns if col in df.columns and col not in ['block_timestamp', 'month']]
+        # Ensure columns are in the correct order (excluding MATERIALIZED columns)
+        columns_to_select = [col for col in table_columns if col in df.columns and col not in materialized_columns]
         return df[columns_to_select]
     
     def get_latest_processed_block(self) -> int:
@@ -297,24 +315,18 @@ class ClickHouseManager:
             
             logger.info(f"Found {len(migration_files)} migration files")
             
-            # Create migrations table if it doesn't exist
-            client.command(f"""
-            CREATE TABLE IF NOT EXISTS {self.database}.migrations
-            (
-                `name` String,
-                `executed_at` DateTime DEFAULT now(),
-                `success` UInt8 DEFAULT 1
-            )
-            ENGINE = MergeTree()
-            ORDER BY (name)
-            """)
+            # Ensure we're using the correct database
+            client.command(f"USE {self.database}")
             
-            # Get already executed migrations
-            executed_migrations = client.query(f"""
-            SELECT name FROM {self.database}.migrations
-            """)
-            
-            executed = set([row[0] for row in executed_migrations.result_rows])
+            # Check if migrations table exists (it might not if this is the first run)
+            try:
+                executed_migrations = client.query(f"""
+                SELECT name FROM {self.database}.migrations
+                """)
+                executed = set([row[0] for row in executed_migrations.result_rows])
+            except Exception:
+                # Table doesn't exist yet, will be created by 001_create_database.sql
+                executed = set()
             
             # Execute each migration file if not already executed
             for file_name in migration_files:
@@ -353,16 +365,22 @@ class ClickHouseManager:
                     
                     for i, statement in enumerate(statements):
                         if statement and not statement.startswith('--'):
+                            # Skip INSERT INTO migrations statements if they're duplicates
+                            if 'INSERT INTO' in statement and '.migrations' in statement and 'VALUES' in statement:
+                                # Extract the migration name
+                                import re
+                                match = re.search(r"VALUES\s*\(\s*'([^']+)'", statement)
+                                if match and match.group(1) in executed:
+                                    logger.debug(f"Skipping duplicate migration record for {match.group(1)}")
+                                    continue
+                            
                             logger.debug(f"Executing statement {i+1}: {statement[:100]}...")
                             client.command(statement)
                             logger.debug(f"Statement {i+1} executed successfully")
                     
-                    # Record successful migration
-                    client.command(f"""
-                    INSERT INTO {self.database}.migrations (name) VALUES ('{file_name}')
-                    """)
-                    
                     logger.info(f"Migration {file_name} executed successfully")
+                    executed.add(file_name)  # Add to executed set
+                    
                 except Exception as e:
                     logger.error(f"Error executing migration {file_name}: {e}")
                     raise

@@ -13,7 +13,7 @@ def run_migrations():
     
     logger.info("Running database migrations...")
     
-    # Create ClickHouse manager
+    # Create ClickHouse manager - it will automatically create the database if needed
     clickhouse = ClickHouseManager(
         host=settings.clickhouse_host,
         user=settings.clickhouse_user,

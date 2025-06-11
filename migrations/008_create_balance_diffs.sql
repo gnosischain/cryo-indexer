@@ -11,9 +11,13 @@ CREATE TABLE IF NOT EXISTS {{database}}.balance_diffs
     `to_value_string` Nullable(String),
     `to_value_f64` Nullable(Float64),
     `chain_id` Nullable(UInt64),
-    `block_timestamp` DateTime64(0, 'UTC')
+    `block_timestamp` DateTime64(0, 'UTC'),
+    `insert_version` UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
 )
-ENGINE = ReplacingMergeTree()
+ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(block_timestamp)
 ORDER BY (block_number, transaction_index)
 SETTINGS allow_nullable_key = 1;
+
+
+INSERT INTO {{database}}.migrations (name) VALUES ('008_create_balance_diffs');

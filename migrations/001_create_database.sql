@@ -1,4 +1,7 @@
--- Create a table to track migrations
+
+CREATE DATABASE IF NOT EXISTS {{database}};
+
+
 CREATE TABLE IF NOT EXISTS {{database}}.migrations
 (
     name String,
@@ -8,5 +11,5 @@ CREATE TABLE IF NOT EXISTS {{database}}.migrations
 ENGINE = MergeTree()
 ORDER BY name;
 
--- Insert migration record
+
 INSERT INTO {{database}}.migrations (name) VALUES ('001_create_database');

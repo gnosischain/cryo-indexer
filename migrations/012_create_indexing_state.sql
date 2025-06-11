@@ -1,7 +1,7 @@
 -- Create comprehensive indexing state management tables
 -- Optimized for ClickHouse Cloud with minimal RAM usage
 
--- Main indexing state table
+
 CREATE TABLE IF NOT EXISTS {{database}}.indexing_state
 (
     `mode` String,                    -- Indexing mode (default, full, minimal, etc.)
@@ -18,17 +18,18 @@ CREATE TABLE IF NOT EXISTS {{database}}.indexing_state
     `error_message` Nullable(String),
     `batch_id` String DEFAULT '',     -- For grouping related ranges
     `version` DateTime DEFAULT now(), -- Version column for ReplacingMergeTree
+    `insert_version` UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9)),
     
-    -- Indexes for efficient queries
+   
     INDEX idx_status (status) TYPE minmax GRANULARITY 4,
     INDEX idx_mode_dataset (mode, dataset) TYPE minmax GRANULARITY 4
 )
-ENGINE = ReplacingMergeTree(version)
+ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toYYYYMM(created_at)
 ORDER BY (mode, dataset, start_block)
 SETTINGS index_granularity = 8192;
 
--- Lightweight progress tracking view
+
 CREATE VIEW IF NOT EXISTS {{database}}.indexing_progress AS
 SELECT 
     mode,
@@ -42,17 +43,18 @@ SELECT
 FROM {{database}}.indexing_state
 GROUP BY mode, dataset;
 
--- Table for tracking continuous sync position
+
 CREATE TABLE IF NOT EXISTS {{database}}.sync_position
 (
     `mode` String,
     `dataset` String,
     `last_synced_block` UInt32,
-    `updated_at` DateTime DEFAULT now()
+    `updated_at` DateTime DEFAULT now(),
+    `insert_version` UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
 )
-ENGINE = ReplacingMergeTree(updated_at)
+ENGINE = ReplacingMergeTree(insert_version)
 ORDER BY (mode, dataset)
 SETTINGS index_granularity = 8192;
 
--- Insert migration record
+
 INSERT INTO {{database}}.migrations (name) VALUES ('012_create_indexing_state');
