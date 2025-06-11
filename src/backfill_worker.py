@@ -168,14 +168,9 @@ class BackfillWorker:
                 stats.skipped_ranges = skipped
                 stats.total_ranges = created + skipped
                 
-                # For blocks dataset, mark all as incomplete (need verification)
-                # For other datasets, mark all as completed (sparse data is OK)
-                if dataset == 'blocks':
-                    stats.incomplete_ranges = created
-                    stats.completed_ranges = 0
-                else:
-                    stats.completed_ranges = created
-                    stats.incomplete_ranges = 0
+                # All marked as completed since we have existing data
+                stats.completed_ranges = created
+                stats.incomplete_ranges = 0
                     
             except Exception as e:
                 logger.error(f"Error processing {dataset}: {e}")
@@ -320,12 +315,9 @@ class BackfillWorker:
                 )
                 
                 if has_data:
-                    # For blocks dataset, mark as incomplete (needs verification)
-                    # For other datasets, mark as completed
-                    if dataset == 'blocks':
-                        status = 'incomplete'
-                    else:
-                        status = 'completed'
+                    # Since we have existing data and can't verify due to memory constraints,
+                    # mark as 'completed' to avoid re-downloading and creating duplicates
+                    status = 'completed'
                     
                     # Create the entry
                     if self._create_range_entry_simple(
@@ -533,12 +525,7 @@ class BackfillWorker:
             print(f"  Range size: {self.range_size} blocks")
             print(f"  Created entries: {stats.created_ranges}")
             print(f"  Skipped entries: {stats.skipped_ranges}")
-            
-            if dataset == 'blocks':
-                print(f"  Status: All marked as 'incomplete' (needs verification)")
-            else:
-                print(f"  Status: All marked as 'completed' (sparse data OK)")
-            
+            print(f"  Status: All marked as 'completed' (trusting existing data)")
             print(f"  Duration: {stats.duration:.2f}s")
             
             total_created += stats.created_ranges
