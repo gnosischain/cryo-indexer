@@ -50,6 +50,9 @@ class IndexerSettings:
         self.batch_size = int(os.environ.get("BATCH_SIZE", "1000"))
         self.max_retries = int(os.environ.get("MAX_RETRIES", "3"))
         
+        # Fixed range size for all operations
+        self.indexing_range_size = int(os.environ.get("INDEXING_RANGE_SIZE", "1000"))
+        
         # Continuous mode settings
         self.confirmation_blocks = int(os.environ.get("CONFIRMATION_BLOCKS", "12"))
         self.poll_interval = int(os.environ.get("POLL_INTERVAL", "10"))
@@ -59,8 +62,8 @@ class IndexerSettings:
         self.max_concurrent_requests = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "5"))
         self.cryo_timeout = int(os.environ.get("CRYO_TIMEOUT", "300"))  # 5 minutes default
         
-        # Backfill settings
-        self.backfill_batch_size = int(os.environ.get("BACKFILL_BATCH_SIZE", "1000"))
+        # Backfill settings (note: batch_size is now the fixed range size)
+        self.backfill_batch_size = self.indexing_range_size  # Use fixed range size
         self.backfill_chunk_size = int(os.environ.get("BACKFILL_CHUNK_SIZE", "100000"))
         self.backfill_force = os.environ.get("BACKFILL_FORCE", "false").lower() == "true"
         
@@ -120,14 +123,14 @@ class IndexerSettings:
         if self.batch_size < 1:
             raise ValueError("BATCH_SIZE must be at least 1")
             
+        if self.indexing_range_size < 1:
+            raise ValueError("INDEXING_RANGE_SIZE must be at least 1")
+            
         if self.requests_per_second < 1:
             raise ValueError("REQUESTS_PER_SECOND must be at least 1")
             
         if self.max_concurrent_requests < 1:
             raise ValueError("MAX_CONCURRENT_REQUESTS must be at least 1")
-            
-        if self.backfill_batch_size < 1:
-            raise ValueError("BACKFILL_BATCH_SIZE must be at least 1")
             
         if self.backfill_chunk_size < 1:
             raise ValueError("BACKFILL_CHUNK_SIZE must be at least 1")

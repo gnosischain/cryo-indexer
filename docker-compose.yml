@@ -32,6 +32,9 @@ services:
       - BATCH_SIZE=${BATCH_SIZE:-1000}
       - MAX_RETRIES=${MAX_RETRIES:-3}
       
+      # Fixed range size for indexing (NEW!)
+      - INDEXING_RANGE_SIZE=${INDEXING_RANGE_SIZE:-1000}
+      
       # Cryo performance settings
       - REQUESTS_PER_SECOND=${REQUESTS_PER_SECOND:-50}
       - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-5}

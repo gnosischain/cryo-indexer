@@ -1,6 +1,6 @@
 """
 Database-based state management for the indexer.
-Replaces file-based state with ClickHouse tables.
+Includes fixed-range gap detection for efficient processing.
 """
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
@@ -34,6 +34,9 @@ class StateManager:
     def __init__(self, clickhouse_manager):
         self.db = clickhouse_manager
         self.database = clickhouse_manager.database
+        
+        # Get range size from settings
+        self.range_size = getattr(settings, 'indexing_range_size', 1000)
         
     def claim_range(self, mode: str, dataset: str, start_block: int, end_block: int, 
                    worker_id: str, batch_id: str = "", force: bool = False) -> bool:
@@ -192,179 +195,101 @@ class StateManager:
     def find_gaps(self, mode: str, dataset: str, start_block: int, 
                   end_block: int, min_gap_size: int = 1) -> List[Tuple[int, int]]:
         """
-        Find gaps in indexed data for a specific dataset.
-        Uses hybrid approach: indexing_state first, fallback to table data.
+        Find gaps in indexed data for fixed-range approach.
+        For blocks dataset: returns incomplete ranges
+        For other datasets: returns missing ranges
         """
-        # First try the indexing_state approach
-        gaps_from_state = self._find_gaps_from_state(mode, dataset, start_block, end_block, min_gap_size)
-        
-        # If we find gaps covering most of the range, check if we have actual table data
-        total_range = end_block - start_block
-        gaps_total = sum(gap[1] - gap[0] for gap in gaps_from_state)
-        
-        # Use configurable threshold from settings
-        if gaps_total >= total_range * settings.gap_detection_threshold:
-            logger.info(f"Large gap percentage detected for {dataset}, checking actual table data...")
-            gaps_from_table = self._find_gaps_from_table(dataset, start_block, end_block, min_gap_size)
-            
-            # If table-based method finds significantly fewer gaps, use that
-            table_gaps_total = sum(gap[1] - gap[0] for gap in gaps_from_table)
-            if table_gaps_total < gaps_total * 0.5:  # Table method finds <50% of state gaps
-                logger.info(f"Using table-based gap detection for {dataset}")
-                return gaps_from_table
-        
-        return gaps_from_state
-    
-    def _find_gaps_from_state(self, mode: str, dataset: str, start_block: int, 
-                             end_block: int, min_gap_size: int = 1) -> List[Tuple[int, int]]:
-        """Original method: Find gaps using indexing_state table."""
         gaps = []
+        
         try:
             client = self.db._connect()
             
-            # Use configurable chunk size from settings
-            chunk_size = settings.gap_detection_state_chunk_size
-            current = start_block
+            # Align to range boundaries
+            aligned_start = (start_block // self.range_size) * self.range_size
+            aligned_end = ((end_block // self.range_size) + 1) * self.range_size
             
-            while current < end_block:
-                chunk_end = min(current + chunk_size, end_block)
-                
-                # Get completed ranges in this chunk
-                query = f"""
+            # For blocks dataset, find incomplete ranges
+            if dataset == 'blocks':
+                incomplete_query = f"""
                 SELECT start_block, end_block
                 FROM {self.database}.indexing_state
                 WHERE mode = '{mode}'
                   AND dataset = '{dataset}'
-                  AND status = 'completed'
-                  AND start_block >= {current}
-                  AND end_block <= {chunk_end}
+                  AND status = 'incomplete'
+                  AND start_block >= {aligned_start}
+                  AND end_block <= {aligned_end}
                 ORDER BY start_block
-                LIMIT 10000
                 """
-                result = client.query(query)
+                result = client.query(incomplete_query)
                 
-                # Find gaps in this chunk
-                chunk_ranges = [(row[0], row[1]) for row in result.result_rows]
-                chunk_gaps = self._find_gaps_in_ranges(chunk_ranges, current, chunk_end, min_gap_size)
-                gaps.extend(chunk_gaps)
+                for row in result.result_rows:
+                    gaps.append((row[0], row[1]))
+                    logger.debug(f"Found incomplete range for {dataset}: {row[0]}-{row[1]}")
+            
+            # Find completely missing ranges for all datasets
+            current = aligned_start
+            while current < aligned_end:
+                range_end = min(current + self.range_size, aligned_end)
                 
-                current = chunk_end
-                
-        except Exception as e:
-            logger.error(f"Error finding gaps from state: {e}")
-            
-        return gaps
-    
-    def _find_gaps_from_table(self, dataset: str, start_block: int, 
-                             end_block: int, min_gap_size: int = 1) -> List[Tuple[int, int]]:
-        """Alternative method: Find gaps by checking actual table data."""
-        gaps = []
-        
-        # Table mappings
-        table_mappings = {
-            'blocks': 'blocks',
-            'transactions': 'transactions',
-            'logs': 'logs',
-            'contracts': 'contracts',
-            'native_transfers': 'native_transfers',
-            'traces': 'traces',
-            'balance_diffs': 'balance_diffs',
-            'code_diffs': 'code_diffs',
-            'nonce_diffs': 'nonce_diffs',
-            'storage_diffs': 'storage_diffs',
-            # Aliases
-            'events': 'logs',
-            'txs': 'transactions',
-        }
-        
-        table_name = table_mappings.get(dataset, dataset)
-        
-        try:
-            client = self.db._connect()
-            
-            # Check if table exists
-            table_check = client.query(f"""
-            SELECT count() FROM system.tables 
-            WHERE database = '{self.database}' AND name = '{table_name}'
-            """)
-            
-            if table_check.result_rows[0][0] == 0:
-                logger.warning(f"Table {table_name} does not exist")
-                return [(start_block, end_block)]  # Entire range is a gap
-            
-            # Use configurable chunk size from settings
-            chunk_size = settings.gap_detection_table_chunk_size
-            current = start_block
-            
-            while current < end_block:
-                chunk_end = min(current + chunk_size, end_block)
-                
-                # Check which blocks exist in this chunk
-                existing_blocks_query = f"""
-                SELECT DISTINCT block_number
-                FROM {self.database}.{table_name}
-                WHERE block_number >= {current} 
-                  AND block_number < {chunk_end}
-                  AND block_number IS NOT NULL
-                ORDER BY block_number
+                # Check if this range exists
+                check_query = f"""
+                SELECT COUNT(*)
+                FROM {self.database}.indexing_state
+                WHERE mode = '{mode}'
+                  AND dataset = '{dataset}'
+                  AND start_block = {current}
+                  AND end_block = {range_end}
                 """
+                result = client.query(check_query)
                 
-                result = client.query(existing_blocks_query)
-                existing_blocks = [row[0] for row in result.result_rows]
+                if result.result_rows[0][0] == 0:
+                    # Range doesn't exist at all
+                    gaps.append((current, range_end))
+                    logger.debug(f"Found missing range for {dataset}: {current}-{range_end}")
                 
-                # Find gaps in this chunk
-                chunk_gaps = self._find_gaps_in_block_list(
-                    existing_blocks, current, chunk_end, min_gap_size
-                )
-                gaps.extend(chunk_gaps)
-                
-                current = chunk_end
-                
-            logger.info(f"Found {len(gaps)} gaps in {dataset} by checking table data")
+                current = range_end
+            
+            logger.info(f"Found {len(gaps)} gaps for {dataset} in range {start_block}-{end_block}")
             return gaps
             
         except Exception as e:
-            logger.error(f"Error finding gaps from table data: {e}")
-            # Fallback to assuming everything is a gap
-            return [(start_block, end_block)]
+            logger.error(f"Error finding gaps: {e}")
+            return []
     
-    def _find_gaps_in_block_list(self, existing_blocks: List[int], 
-                                start: int, end: int, min_gap_size: int) -> List[Tuple[int, int]]:
-        """Find gaps in a list of existing block numbers."""
-        if not existing_blocks:
-            return [(start, end)] if end - start >= min_gap_size else []
-        
-        gaps = []
-        current = start
-        
-        for block_num in sorted(existing_blocks):
-            if block_num > current and block_num - current >= min_gap_size:
-                gaps.append((current, block_num))
-            current = max(current, block_num + 1)
-        
-        if current < end and end - current >= min_gap_size:
-            gaps.append((current, end))
-        
-        return gaps
-    
-    def _find_gaps_in_ranges(self, ranges: List[Tuple[int, int]], 
-                            start: int, end: int, min_gap_size: int) -> List[Tuple[int, int]]:
-        """Find gaps in a list of ranges."""
-        if not ranges:
-            return [(start, end)] if end - start >= min_gap_size else []
+    def should_process_range(self, mode: str, dataset: str, 
+                           start_block: int, end_block: int) -> bool:
+        """
+        Check if a range should be processed.
+        For fixed ranges: only process if status is 'incomplete' or doesn't exist
+        """
+        try:
+            client = self.db._connect()
             
-        gaps = []
-        current = start
-        
-        for range_start, range_end in sorted(ranges):
-            if range_start > current and range_start - current >= min_gap_size:
-                gaps.append((current, range_start))
-            current = max(current, range_end)
+            # Check if range exists and its status
+            query = f"""
+            SELECT status
+            FROM {self.database}.indexing_state
+            WHERE mode = '{mode}'
+              AND dataset = '{dataset}'
+              AND start_block = {start_block}
+              AND end_block = {end_block}
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+            result = client.query(query)
             
-        if current < end and end - current >= min_gap_size:
-            gaps.append((current, end))
+            if not result.result_rows:
+                # Range doesn't exist, should process
+                return True
+                
+            status = result.result_rows[0][0]
             
-        return gaps
+            # Only process if incomplete (for blocks) or doesn't exist
+            return status == 'incomplete'
+            
+        except Exception as e:
+            logger.error(f"Error checking if range should be processed: {e}")
+            return True  # Process on error
     
     def get_stale_jobs(self, timeout_minutes: int = 30) -> List[IndexingRange]:
         """Find jobs that have been processing for too long."""
@@ -410,12 +335,16 @@ class StateManager:
             reset_count = 0
             for job in stale_jobs:
                 next_attempt = job.attempt_count + 1
+                
+                # For fixed ranges, keep the status as incomplete if it was processing
+                status = 'incomplete' if job.dataset == 'blocks' else 'pending'
+                
                 reset_query = f"""
                 INSERT INTO {self.database}.indexing_state
                 (mode, dataset, start_block, end_block, status, attempt_count)
                 VALUES
                 ('{job.mode}', '{job.dataset}', {job.start_block}, {job.end_block}, 
-                 'pending', {next_attempt})
+                 '{status}', {next_attempt})
                 """
                 client.command(reset_query)
                 reset_count += 1
@@ -430,25 +359,41 @@ class StateManager:
             return 0
     
     def get_progress_summary(self, mode: str) -> Dict[str, Dict]:
-        """Get indexing progress summary."""
+        """Get indexing progress summary for fixed ranges."""
         try:
             client = self.db._connect()
+            
+            # Modified query to handle fixed ranges
             query = f"""
-            SELECT *
-            FROM {self.database}.indexing_progress
+            SELECT 
+                dataset,
+                COUNT(*) as total_ranges,
+                countIf(status = 'completed') as completed_ranges,
+                countIf(status = 'incomplete') as incomplete_ranges,
+                countIf(status = 'processing') as processing_ranges,
+                countIf(status = 'failed') as failed_ranges,
+                countIf(status = 'pending') as pending_ranges,
+                MAX(end_block) as highest_block,
+                SUM(rows_indexed) as total_rows_indexed
+            FROM {self.database}.indexing_state
             WHERE mode = '{mode}'
+            GROUP BY dataset
             """
             result = client.query(query)
             
             summary = {}
-            columns = ['mode', 'dataset', 'completed_ranges', 'processing_ranges', 
-                      'failed_ranges', 'pending_ranges', 'highest_completed_block', 
-                      'total_rows_indexed']
-            
             for row in result.result_rows:
-                dataset = row[1]
+                dataset = row[0]
                 summary[dataset] = {
-                    columns[i]: row[i] for i in range(2, len(columns))
+                    'total_ranges': row[1],
+                    'completed_ranges': row[2],
+                    'incomplete_ranges': row[3],
+                    'processing_ranges': row[4],
+                    'failed_ranges': row[5],
+                    'pending_ranges': row[6],
+                    'highest_block': row[7],
+                    'total_rows_indexed': row[8] or 0,
+                    'range_size': self.range_size
                 }
                 
             return summary
@@ -456,28 +401,3 @@ class StateManager:
         except Exception as e:
             logger.error(f"Error getting progress summary: {e}")
             return {}
-    
-    def should_process_range(self, mode: str, dataset: str, 
-                           start_block: int, end_block: int) -> bool:
-        """
-        Check if a range should be processed.
-        Returns True if the range hasn't been completed yet.
-        """
-        try:
-            client = self.db._connect()
-            query = f"""
-            SELECT COUNT(*)
-            FROM {self.database}.indexing_state
-            WHERE mode = '{mode}'
-              AND dataset = '{dataset}'
-              AND start_block = {start_block}
-              AND end_block = {end_block}
-              AND status = 'completed'
-            """
-            result = client.query(query)
-            
-            return result.result_rows[0][0] == 0
-            
-        except Exception as e:
-            logger.error(f"Error checking if range should be processed: {e}")
-            return True  # Process on error
