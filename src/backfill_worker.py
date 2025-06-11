@@ -1,12 +1,11 @@
 """
-Backfill Worker - Partition-aware version that processes one month at a time.
+Backfill Worker - Uses blocks table to drive partition-based processing.
 """
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from loguru import logger
 import time
-from datetime import datetime, timedelta
-import calendar
+from datetime import datetime
 
 from .core.state_manager import StateManager
 from .db.clickhouse_manager import ClickHouseManager
@@ -30,6 +29,15 @@ class BackfillStats:
     deleted_ranges: int = 0
     duration: float = 0.0
     worker_count: int = 1
+
+
+@dataclass
+class PartitionInfo:
+    """Information about a partition."""
+    partition_month: datetime
+    min_block: int
+    max_block: int
+    block_count: int
 
 
 class BackfillWorker:
@@ -64,7 +72,7 @@ class BackfillWorker:
         self.range_size = getattr(settings, 'indexing_range_size', 1000)
         
         logger.info(f"BackfillWorker initialized for mode {mode} with range size {self.range_size}")
-        logger.info("Using partition-aware processing")
+        logger.info("Using blocks table to drive partition-based processing")
     
     def backfill_datasets_parallel(
         self,
@@ -85,11 +93,11 @@ class BackfillWorker:
         force: bool = False
     ) -> Dict[str, BackfillStats]:
         """
-        Backfill indexing_state for specified datasets using partition-aware processing.
+        Backfill indexing_state for specified datasets using blocks table partitions.
         """
         results = {}
         
-        logger.info(f"Starting partition-aware backfill for datasets: {datasets}")
+        logger.info(f"Starting blocks-driven backfill for datasets: {datasets}")
         logger.info(f"Using fixed range size: {self.range_size} blocks")
         if start_block is not None and end_block is not None:
             logger.info(f"Block range: {start_block:,} to {end_block:,}")
@@ -98,9 +106,20 @@ class BackfillWorker:
         
         start_time = time.time()
         
+        # First, get all partitions from blocks table
+        partitions = self._get_partitions_from_blocks(start_block, end_block)
+        if not partitions:
+            logger.error("No partitions found in blocks table")
+            return results
+        
+        logger.info(f"Found {len(partitions)} partitions to process")
+        
+        # Process each dataset
         for dataset in datasets:
             logger.info(f"Processing dataset: {dataset}")
-            stats = self._backfill_dataset_by_partition(dataset, start_block, end_block, force)
+            stats = self._backfill_dataset_using_partitions(
+                dataset, partitions, start_block, end_block, force
+            )
             stats.duration = time.time() - start_time
             results[dataset] = stats
         
@@ -108,163 +127,138 @@ class BackfillWorker:
         self._print_backfill_summary(results)
         return results
     
-    def _backfill_dataset_by_partition(
+    def _get_partitions_from_blocks(
+        self,
+        start_block: Optional[int],
+        end_block: Optional[int]
+    ) -> List[PartitionInfo]:
+        """Get partition information from blocks table."""
+        try:
+            client = self.clickhouse._connect()
+            
+            # Build WHERE clause
+            where_parts = []
+            if start_block is not None:
+                where_parts.append(f"block_number >= {start_block}")
+            if end_block is not None:
+                where_parts.append(f"block_number <= {end_block}")
+            
+            where_clause = ""
+            if where_parts:
+                where_clause = "WHERE " + " AND ".join(where_parts)
+            
+            # Get partitions with their block ranges
+            query = f"""
+            SELECT 
+                toStartOfMonth(block_timestamp) as partition_month,
+                MIN(block_number) as min_block,
+                MAX(block_number) as max_block,
+                COUNT() as block_count
+            FROM {self.database}.blocks
+            {where_clause}
+            GROUP BY partition_month
+            ORDER BY partition_month
+            """
+            
+            logger.info("Getting partitions from blocks table...")
+            result = client.query(query)
+            
+            partitions = []
+            for row in result.result_rows:
+                partitions.append(PartitionInfo(
+                    partition_month=row[0],
+                    min_block=row[1],
+                    max_block=row[2],
+                    block_count=row[3]
+                ))
+                logger.debug(
+                    f"Partition {row[0].strftime('%Y-%m')}: "
+                    f"blocks {row[1]:,}-{row[2]:,} ({row[3]:,} blocks)"
+                )
+            
+            return partitions
+            
+        except Exception as e:
+            logger.error(f"Error getting partitions from blocks: {e}")
+            return []
+    
+    def _backfill_dataset_using_partitions(
         self,
         dataset: str,
+        partitions: List[PartitionInfo],
         start_block: Optional[int],
         end_block: Optional[int],
         force: bool
     ) -> BackfillStats:
-        """Backfill a single dataset by processing one partition at a time."""
+        """Backfill a dataset using the partition information."""
         stats = BackfillStats(dataset=dataset, table_name="")
         
         # Get table name
         table_name = self.dataset_tables.get(dataset, dataset)
         stats.table_name = table_name
         
-        # Check if table exists using system.tables
-        try:
-            client = self.clickhouse._connect()
-            result = client.query(f"""
-            SELECT 1 FROM system.tables 
-            WHERE database = '{self.database}' AND name = '{table_name}'
-            LIMIT 1
-            """)
-            if len(result.result_rows) == 0:
-                stats.exists = False
-                logger.warning(f"{dataset}: Table {table_name} does not exist")
-                return stats
-        except Exception as e:
-            logger.error(f"Error checking table existence: {e}")
+        # Check if table exists
+        if not self._table_exists(table_name):
             stats.exists = False
+            logger.warning(f"{dataset}: Table {table_name} does not exist")
             return stats
         
         stats.exists = True
         
-        # Get list of partitions from system.parts
-        try:
-            partitions = self._get_partitions_list(table_name, start_block, end_block)
-            if not partitions:
-                logger.warning(f"No partitions found for {dataset}")
-                return stats
+        # Process each partition
+        for partition in partitions:
+            logger.info(
+                f"Processing {dataset} for partition {partition.partition_month.strftime('%Y-%m')}"
+            )
             
-            logger.info(f"{dataset}: Found {len(partitions)} partitions to process")
+            # Determine block range for this partition
+            partition_start = partition.min_block
+            partition_end = partition.max_block
             
-            # Process each partition separately
-            for partition_info in partitions:
-                partition = partition_info['partition']
-                partition_min_block = partition_info['min_block']
-                partition_max_block = partition_info['max_block']
-                partition_rows = partition_info['rows']
-                
-                logger.info(
-                    f"Processing partition {partition}: blocks {partition_min_block:,}-{partition_max_block:,}, "
-                    f"~{partition_rows:,} rows"
-                )
-                
-                # Apply block range constraints if specified
-                process_start = partition_min_block
-                process_end = partition_max_block
-                
-                if start_block is not None and process_start < start_block:
-                    process_start = start_block
-                if end_block is not None and process_end > end_block:
-                    process_end = end_block
-                
-                # Skip if partition is outside requested range
-                if process_start > process_end:
-                    logger.debug(f"Skipping partition {partition} - outside requested range")
-                    continue
-                
-                # Align to range boundaries
-                aligned_start = (process_start // self.range_size) * self.range_size
-                aligned_end = ((process_end // self.range_size) + 1) * self.range_size
-                
-                # Process this partition's ranges
-                created, skipped = self._process_partition_ranges(
-                    dataset, table_name, partition, aligned_start, aligned_end, force
-                )
-                
-                stats.created_ranges += created
-                stats.skipped_ranges += skipped
-                stats.total_rows += partition_rows
-                
-                # Update min/max blocks
-                if stats.min_block is None or partition_min_block < stats.min_block:
-                    stats.min_block = partition_min_block
-                if stats.max_block is None or partition_max_block > stats.max_block:
-                    stats.max_block = partition_max_block
+            # Apply constraints if specified
+            if start_block is not None and partition_start < start_block:
+                partition_start = start_block
+            if end_block is not None and partition_end > end_block:
+                partition_end = end_block
             
-            stats.total_ranges = stats.created_ranges + stats.skipped_ranges
-            stats.completed_ranges = stats.created_ranges
-            stats.incomplete_ranges = 0
+            # Skip if partition is outside requested range
+            if partition_start > partition_end:
+                continue
             
-        except Exception as e:
-            logger.error(f"Error processing dataset {dataset}: {e}", exc_info=True)
+            # Align to range boundaries
+            aligned_start = (partition_start // self.range_size) * self.range_size
+            aligned_end = ((partition_end // self.range_size) + 1) * self.range_size
+            
+            # Process this partition's ranges
+            created, skipped = self._process_partition_ranges(
+                dataset,
+                table_name,
+                partition.partition_month,
+                aligned_start,
+                aligned_end,
+                force
+            )
+            
+            stats.created_ranges += created
+            stats.skipped_ranges += skipped
+            
+            # Update min/max blocks
+            if stats.min_block is None or partition.min_block < stats.min_block:
+                stats.min_block = partition.min_block
+            if stats.max_block is None or partition.max_block > stats.max_block:
+                stats.max_block = partition.max_block
+        
+        stats.total_ranges = stats.created_ranges + stats.skipped_ranges
+        stats.completed_ranges = stats.created_ranges
+        stats.incomplete_ranges = 0
         
         return stats
-    
-    def _get_partitions_list(
-        self,
-        table_name: str,
-        start_block: Optional[int],
-        end_block: Optional[int]
-    ) -> List[Dict]:
-        """Get list of partitions with their block ranges."""
-        try:
-            client = self.clickhouse._connect()
-            
-            # Build WHERE clause
-            where_parts = [
-                f"database = '{self.database}'",
-                f"table = '{table_name}'",
-                "active = 1"
-            ]
-            
-            if start_block is not None:
-                where_parts.append(f"max_block_number >= {start_block}")
-            if end_block is not None:
-                where_parts.append(f"min_block_number <= {end_block}")
-            
-            where_clause = " AND ".join(where_parts)
-            
-            # Get partition statistics
-            query = f"""
-            SELECT 
-                partition,
-                MIN(min_block_number) as min_block,
-                MAX(max_block_number) as max_block,
-                SUM(rows) as total_rows,
-                COUNT() as parts_count
-            FROM system.parts
-            WHERE {where_clause}
-            GROUP BY partition
-            ORDER BY partition
-            """
-            
-            result = client.query(query)
-            
-            partitions = []
-            for row in result.result_rows:
-                partitions.append({
-                    'partition': row[0],
-                    'min_block': row[1],
-                    'max_block': row[2],
-                    'rows': row[3],
-                    'parts_count': row[4]
-                })
-            
-            return partitions
-            
-        except Exception as e:
-            logger.error(f"Error getting partitions list: {e}")
-            return []
     
     def _process_partition_ranges(
         self,
         dataset: str,
         table_name: str,
-        partition: str,
+        partition_month: datetime,
         start_block: int,
         end_block: int,
         force: bool
@@ -277,9 +271,13 @@ class BackfillWorker:
         if force:
             self._delete_existing_entries_in_range(dataset, start_block, end_block)
         
-        # For blocks dataset, we need to check completeness
-        # For other datasets, we assume if partition has data, the ranges are complete
-        is_blocks_dataset = (dataset == 'blocks')
+        # Get timestamp range for this partition
+        month_start = partition_month
+        # Get last second of the month
+        if partition_month.month == 12:
+            month_end = datetime(partition_month.year + 1, 1, 1) - timedelta(seconds=1)
+        else:
+            month_end = datetime(partition_month.year, partition_month.month + 1, 1) - timedelta(seconds=1)
         
         # Process in fixed-size chunks
         current = start_block
@@ -293,28 +291,35 @@ class BackfillWorker:
                     current = range_end
                     continue
                 
-                # For blocks dataset, check if range is complete
-                if is_blocks_dataset:
-                    block_count = self._count_blocks_in_range_for_partition(
-                        table_name, partition, current, range_end
+                # For blocks dataset, check completeness
+                if dataset == 'blocks':
+                    block_count = self._count_blocks_in_range(
+                        table_name, current, range_end, month_start, month_end
                     )
                     expected_blocks = range_end - current
                     is_complete = (block_count == expected_blocks)
                     status = 'completed' if is_complete else 'incomplete'
                 else:
-                    # For other datasets, trust that partition data is complete
-                    status = 'completed'
+                    # For other datasets, check if any data exists
+                    has_data = self._check_data_exists(
+                        table_name, current, range_end, month_start, month_end
+                    )
+                    status = 'completed' if has_data else 'pending'
                 
-                # Create the entry
-                if self._create_range_entry(
-                    dataset=dataset,
-                    start_block=current,
-                    end_block=range_end,
-                    status=status,
-                    metadata=f"partition:{partition}"
-                ):
-                    created += 1
-                    logger.debug(f"Created entry for {dataset} {current:,}-{range_end:,} (status={status})")
+                # Only create entry if there's data or it's incomplete
+                if status != 'pending' or dataset == 'blocks':
+                    if self._create_range_entry(
+                        dataset=dataset,
+                        start_block=current,
+                        end_block=range_end,
+                        status=status,
+                        metadata=f"partition:{partition_month.strftime('%Y-%m')}"
+                    ):
+                        created += 1
+                        logger.debug(
+                            f"Created entry for {dataset} {current:,}-{range_end:,} "
+                            f"(status={status})"
+                        )
                 
             except Exception as e:
                 logger.error(f"Error processing range {current}-{range_end}: {e}")
@@ -323,42 +328,77 @@ class BackfillWorker:
         
         return created, skipped
     
-    def _count_blocks_in_range_for_partition(
+    def _count_blocks_in_range(
         self,
         table_name: str,
-        partition: str,
         start_block: int,
-        end_block: int
+        end_block: int,
+        month_start: datetime,
+        month_end: datetime
     ) -> int:
-        """Count blocks in a range for a specific partition (efficient query)."""
+        """Count blocks in a range with partition filtering."""
         try:
             client = self.clickhouse._connect()
             
-            # Convert partition (YYYYMM) to date range for efficient querying
-            year = int(partition[:4])
-            month = int(partition[4:6])
-            
-            # Get first and last day of the month
-            first_day = datetime(year, month, 1)
-            last_day = datetime(year, month, calendar.monthrange(year, month)[1], 23, 59, 59)
-            
-            # Query with partition pruning
             query = f"""
-            SELECT COUNT(DISTINCT block_number) 
+            SELECT COUNT(*) 
             FROM {self.database}.{table_name}
             WHERE block_number >= {start_block} 
               AND block_number < {end_block}
-              AND block_timestamp >= '{first_day.strftime('%Y-%m-%d %H:%M:%S')}'
-              AND block_timestamp <= '{last_day.strftime('%Y-%m-%d %H:%M:%S')}'
-            SETTINGS max_memory_usage = 1000000000
+              AND block_timestamp >= '{month_start.strftime('%Y-%m-%d %H:%M:%S')}'
+              AND block_timestamp <= '{month_end.strftime('%Y-%m-%d %H:%M:%S')}'
             """
             
             result = client.query(query)
             return result.result_rows[0][0] if result.result_rows else 0
             
         except Exception as e:
-            logger.warning(f"Error counting blocks (assuming incomplete): {e}")
-            return 0  # Assume incomplete on error
+            logger.warning(f"Error counting blocks: {e}")
+            return 0
+    
+    def _check_data_exists(
+        self,
+        table_name: str,
+        start_block: int,
+        end_block: int,
+        month_start: datetime,
+        month_end: datetime
+    ) -> bool:
+        """Check if any data exists in range with partition filtering."""
+        try:
+            client = self.clickhouse._connect()
+            
+            query = f"""
+            SELECT 1
+            FROM {self.database}.{table_name}
+            WHERE block_number >= {start_block} 
+              AND block_number < {end_block}
+              AND block_timestamp >= '{month_start.strftime('%Y-%m-%d %H:%M:%S')}'
+              AND block_timestamp <= '{month_end.strftime('%Y-%m-%d %H:%M:%S')}'
+            LIMIT 1
+            """
+            
+            result = client.query(query)
+            return len(result.result_rows) > 0
+            
+        except Exception as e:
+            logger.warning(f"Error checking data existence: {e}")
+            return False
+    
+    def _table_exists(self, table_name: str) -> bool:
+        """Check if a table exists."""
+        try:
+            client = self.clickhouse._connect()
+            query = f"""
+            SELECT 1 FROM system.tables 
+            WHERE database = '{self.database}' AND name = '{table_name}'
+            LIMIT 1
+            """
+            result = client.query(query)
+            return len(result.result_rows) > 0
+        except Exception as e:
+            logger.error(f"Error checking table existence: {e}")
+            return False
     
     def _entry_exists(
         self,
@@ -402,7 +442,7 @@ class BackfillWorker:
              completed_at, rows_indexed, batch_id, error_message)
             VALUES
             ('{self.mode}', '{dataset}', {start_block}, {end_block}, 
-             '{status}', now(), 0, 'backfill-partition', '{metadata}')
+             '{status}', now(), 0, 'backfill-blocks', '{metadata}')
             """
             
             client.command(query)
@@ -442,7 +482,7 @@ class BackfillWorker:
     def _print_backfill_summary(self, results: Dict[str, BackfillStats]) -> None:
         """Print a summary of the backfill operation."""
         print("\n" + "=" * 80)
-        print("BACKFILL SUMMARY (Partition-aware Mode)")
+        print("BACKFILL SUMMARY (Blocks-driven)")
         print("=" * 80)
         
         total_created = 0
@@ -457,11 +497,9 @@ class BackfillWorker:
             print(f"  Table: {stats.table_name}")
             if stats.min_block is not None and stats.max_block is not None:
                 print(f"  Block range: {stats.min_block:,} - {stats.max_block:,}")
-            print(f"  Total rows: ~{stats.total_rows:,}")
             print(f"  Range size: {self.range_size} blocks")
             print(f"  Created entries: {stats.created_ranges}")
             print(f"  Skipped entries: {stats.skipped_ranges}")
-            print(f"  Status: Marked as 'completed' (partition-based)")
             print(f"  Duration: {stats.duration:.2f}s")
             
             total_created += stats.created_ranges
@@ -471,7 +509,6 @@ class BackfillWorker:
         print(f"  Created: {total_created}")
         print(f"  Skipped: {total_skipped}")
         print(f"  Duration: {results[list(results.keys())[0]].duration:.2f}s if results else 0")
-        print("\nNote: Processed by partition to avoid memory issues.")
         print("=" * 80 + "\n")
     
     def validate_backfill(self, datasets: List[str]) -> bool:
@@ -491,7 +528,6 @@ class BackfillWorker:
                 FROM {self.database}.indexing_state
                 WHERE mode = '{self.mode}'
                   AND dataset = '{dataset}'
-                LIMIT 1
                 """
                 
                 result = client.query(query)
