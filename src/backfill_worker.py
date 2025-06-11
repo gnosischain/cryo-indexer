@@ -1,6 +1,7 @@
 """
 Backfill Worker - Analyzes existing data and populates indexing_state table.
 Uses fixed-size ranges for predictable and efficient processing.
+Includes partition-aware queries to avoid memory issues.
 """
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
@@ -86,6 +87,10 @@ class BackfillWorker:
         # Fixed range size from settings
         self.range_size = getattr(settings, 'indexing_range_size', 1000)
         
+        # Cache for block timestamps
+        self._timestamp_cache = {}
+        self._timestamp_cache_lock = threading.Lock()
+        
         logger.info(f"BackfillWorker initialized for mode {mode} with range size {self.range_size}")
     
     def _get_thread_clickhouse(self) -> ClickHouseManager:
@@ -101,6 +106,44 @@ class BackfillWorker:
                 secure=self.clickhouse.secure
             )
         return self._thread_local.clickhouse
+    
+    def _get_block_timestamp_range(
+        self,
+        clickhouse: ClickHouseManager,
+        start_block: int,
+        end_block: int
+    ) -> Optional[Tuple[int, int]]:
+        """Get timestamp range for a block range, with caching."""
+        cache_key = (start_block, end_block)
+        
+        # Check cache first
+        with self._timestamp_cache_lock:
+            if cache_key in self._timestamp_cache:
+                return self._timestamp_cache[cache_key]
+        
+        try:
+            client = clickhouse._connect()
+            result = client.query(f"""
+            SELECT 
+                MIN(timestamp) as min_ts,
+                MAX(timestamp) as max_ts
+            FROM {self.database}.blocks
+            WHERE block_number >= {start_block} 
+              AND block_number < {end_block}
+              AND timestamp IS NOT NULL
+            """)
+            
+            if result.result_rows and result.result_rows[0][0] is not None:
+                min_ts, max_ts = result.result_rows[0]
+                # Cache the result
+                with self._timestamp_cache_lock:
+                    self._timestamp_cache[cache_key] = (min_ts, max_ts)
+                return (min_ts, max_ts)
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error getting timestamp range for blocks {start_block}-{end_block}: {e}")
+            return None
     
     def backfill_datasets_parallel(
         self,
@@ -438,17 +481,42 @@ class BackfillWorker:
         start_block: int,
         end_block: int
     ) -> int:
-        """Count distinct block numbers in range."""
+        """Count distinct block numbers in range using partition pruning."""
         try:
             client = clickhouse._connect()
+            
+            # For blocks table, direct count is fine
+            if table_name == 'blocks':
+                result = client.query(f"""
+                SELECT COUNT(DISTINCT block_number) 
+                FROM {self.database}.{table_name}
+                WHERE block_number >= {start_block} 
+                  AND block_number < {end_block}
+                  AND block_number IS NOT NULL
+                """)
+                return result.result_rows[0][0] if result.result_rows else 0
+            
+            # For other tables, use timestamp filtering for partition pruning
+            ts_range = self._get_block_timestamp_range(clickhouse, start_block, end_block)
+            if not ts_range:
+                # No blocks in this range
+                return 0
+            
+            min_ts, max_ts = ts_range
+            
+            # Add some buffer to timestamps (1 hour each side) to account for any clock drift
             result = client.query(f"""
             SELECT COUNT(DISTINCT block_number) 
             FROM {self.database}.{table_name}
             WHERE block_number >= {start_block} 
               AND block_number < {end_block}
               AND block_number IS NOT NULL
+              AND block_timestamp >= toDateTime({min_ts} - 3600)
+              AND block_timestamp <= toDateTime({max_ts} + 3600)
             """)
+            
             return result.result_rows[0][0] if result.result_rows else 0
+            
         except Exception as e:
             logger.error(f"Error counting distinct blocks: {e}")
             return 0
@@ -460,17 +528,40 @@ class BackfillWorker:
         start_block: int,
         end_block: int
     ) -> int:
-        """Thread-safe version of count_rows_in_range."""
+        """Thread-safe version of count_rows_in_range with partition pruning."""
         try:
             client = clickhouse._connect()
+            
+            # For blocks table, direct count is fine
+            if table_name == 'blocks':
+                result = client.query(f"""
+                SELECT COUNT(*) 
+                FROM {self.database}.{table_name}
+                WHERE block_number >= {start_block} 
+                  AND block_number < {end_block}
+                  AND block_number IS NOT NULL
+                """)
+                return result.result_rows[0][0] if result.result_rows else 0
+            
+            # For other tables, use timestamp filtering
+            ts_range = self._get_block_timestamp_range(clickhouse, start_block, end_block)
+            if not ts_range:
+                return 0
+            
+            min_ts, max_ts = ts_range
+            
             result = client.query(f"""
             SELECT COUNT(*) 
             FROM {self.database}.{table_name}
             WHERE block_number >= {start_block} 
               AND block_number < {end_block}
               AND block_number IS NOT NULL
+              AND block_timestamp >= toDateTime({min_ts} - 3600)
+              AND block_timestamp <= toDateTime({max_ts} + 3600)
             """)
+            
             return result.result_rows[0][0] if result.result_rows else 0
+            
         except Exception as e:
             logger.error(f"Error counting rows in range: {e}")
             return 0
@@ -661,7 +752,7 @@ class BackfillWorker:
         start_block: Optional[int],
         end_block: Optional[int]
     ) -> Optional[Tuple[int, int, int]]:
-        """Get min/max block and row count from table."""
+        """Get min/max block and row count from table using partitions."""
         try:
             client = self.clickhouse._connect()
             
@@ -672,14 +763,43 @@ class BackfillWorker:
             if end_block is not None:
                 where_clause += f" AND block_number <= {end_block}"
             
-            result = client.query(f"""
-            SELECT 
-                MIN(block_number) as min_block,
-                MAX(block_number) as max_block,
-                COUNT() as total_rows
-            FROM {self.database}.{table_name}
-            {where_clause}
-            """)
+            # For blocks table, we can query directly
+            if table_name == 'blocks':
+                result = client.query(f"""
+                SELECT 
+                    MIN(block_number) as min_block,
+                    MAX(block_number) as max_block,
+                    COUNT() as total_rows
+                FROM {self.database}.{table_name}
+                {where_clause}
+                """)
+            else:
+                # For other tables, use system.parts to get approximate stats first
+                parts_query = f"""
+                SELECT 
+                    MIN(min_block_number) as min_block,
+                    MAX(max_block_number) as max_block,
+                    SUM(rows) as total_rows
+                FROM system.parts
+                WHERE database = '{self.database}'
+                  AND table = '{table_name}'
+                  AND active = 1
+                """
+                
+                if start_block is not None or end_block is not None:
+                    # If we have block constraints, we need to query the actual table
+                    # but limit the scan to avoid memory issues
+                    result = client.query(f"""
+                    SELECT 
+                        MIN(block_number) as min_block,
+                        MAX(block_number) as max_block,
+                        COUNT() as total_rows
+                    FROM {self.database}.{table_name}
+                    {where_clause}
+                    SETTINGS max_memory_usage = 1000000000
+                    """)
+                else:
+                    result = client.query(parts_query)
             
             if not result.result_rows or result.result_rows[0][0] is None:
                 return None
