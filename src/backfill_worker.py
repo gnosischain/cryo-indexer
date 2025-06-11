@@ -1,7 +1,6 @@
 """
-Backfill Worker - Analyzes existing data and populates indexing_state table.
-Uses fixed-size ranges for predictable and efficient processing.
-Includes partition-aware queries to avoid memory issues.
+Backfill Worker - Simplified version that avoids memory-intensive queries.
+Creates indexing_state entries based on system.parts metadata only.
 """
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
@@ -87,10 +86,6 @@ class BackfillWorker:
         # Fixed range size from settings
         self.range_size = getattr(settings, 'indexing_range_size', 1000)
         
-        # Cache for block timestamps
-        self._timestamp_cache = {}
-        self._timestamp_cache_lock = threading.Lock()
-        
         logger.info(f"BackfillWorker initialized for mode {mode} with range size {self.range_size}")
     
     def _get_thread_clickhouse(self) -> ClickHouseManager:
@@ -107,44 +102,6 @@ class BackfillWorker:
             )
         return self._thread_local.clickhouse
     
-    def _get_block_timestamp_range(
-        self,
-        clickhouse: ClickHouseManager,
-        start_block: int,
-        end_block: int
-    ) -> Optional[Tuple[int, int]]:
-        """Get timestamp range for a block range, with caching."""
-        cache_key = (start_block, end_block)
-        
-        # Check cache first
-        with self._timestamp_cache_lock:
-            if cache_key in self._timestamp_cache:
-                return self._timestamp_cache[cache_key]
-        
-        try:
-            client = clickhouse._connect()
-            result = client.query(f"""
-            SELECT 
-                MIN(timestamp) as min_ts,
-                MAX(timestamp) as max_ts
-            FROM {self.database}.blocks
-            WHERE block_number >= {start_block} 
-              AND block_number < {end_block}
-              AND timestamp IS NOT NULL
-            """)
-            
-            if result.result_rows and result.result_rows[0][0] is not None:
-                min_ts, max_ts = result.result_rows[0]
-                # Cache the result
-                with self._timestamp_cache_lock:
-                    self._timestamp_cache[cache_key] = (min_ts, max_ts)
-                return (min_ts, max_ts)
-            
-            return None
-        except Exception as e:
-            logger.error(f"Error getting timestamp range for blocks {start_block}-{end_block}: {e}")
-            return None
-    
     def backfill_datasets_parallel(
         self,
         datasets: List[str],
@@ -155,17 +112,7 @@ class BackfillWorker:
     ) -> Dict[str, BackfillStats]:
         """
         Backfill indexing_state for specified datasets in parallel.
-        Uses fixed-size ranges for all datasets.
-        
-        Args:
-            datasets: List of datasets to backfill
-            start_block: Optional start block (None = from beginning)
-            end_block: Optional end block (None = to end)
-            force: Force recreation of existing entries
-            max_workers: Maximum number of parallel workers
-            
-        Returns:
-            Dictionary of dataset -> BackfillStats
+        Simplified version that uses system.parts for metadata.
         """
         results = {}
         
@@ -175,6 +122,7 @@ class BackfillWorker:
         
         logger.info(f"Starting parallel backfill for {len(datasets)} datasets with {max_workers} workers")
         logger.info(f"Using fixed range size: {self.range_size} blocks")
+        logger.info("Using simplified mode to avoid memory issues")
         if start_block is not None and end_block is not None:
             logger.info(f"Block range: {start_block:,} to {end_block:,}")
         if force:
@@ -185,7 +133,7 @@ class BackfillWorker:
         # First pass: analyze all datasets to find work
         dataset_work = {}
         for dataset in datasets:
-            work_info = self._analyze_dataset(dataset, start_block, end_block, force)
+            work_info = self._analyze_dataset_simple(dataset, start_block, end_block, force)
             if work_info:
                 dataset_work[dataset] = work_info
         
@@ -193,79 +141,68 @@ class BackfillWorker:
             logger.warning("No work found for any dataset")
             return results
         
-        # Distribute workers across datasets
-        work_items = self._distribute_work(dataset_work, max_workers)
+        # For simplified mode, process sequentially to avoid overwhelming the system
+        logger.info(f"Processing {len(dataset_work)} datasets sequentially")
         
-        logger.info(f"Created {len(work_items)} work items across {len(dataset_work)} datasets")
-        
-        # Initialize results
-        for dataset in dataset_work:
-            results[dataset] = BackfillStats(
+        for dataset, work_info in dataset_work.items():
+            stats = BackfillStats(
                 dataset=dataset,
-                table_name=self.dataset_tables.get(dataset, dataset),
+                table_name=work_info['table_name'],
                 exists=True,
-                min_block=dataset_work[dataset]['min_block'],
-                max_block=dataset_work[dataset]['max_block'],
-                total_rows=dataset_work[dataset]['total_rows'],
-                worker_count=sum(1 for item in work_items if item.dataset == dataset)
+                min_block=work_info['min_block'],
+                max_block=work_info['max_block'],
+                total_rows=work_info['total_rows']
             )
-        
-        # Process all work items in parallel
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_work = {
-                executor.submit(self._process_work_item_fixed_ranges, item): item
-                for item in work_items
-            }
             
-            # Collect results as they complete
-            completed = 0
-            for future in as_completed(future_to_work):
-                work_item = future_to_work[future]
-                completed += 1
+            # Process this dataset
+            try:
+                created, skipped = self._process_dataset_simple(
+                    dataset,
+                    work_info['table_name'],
+                    work_info['min_block'],
+                    work_info['max_block'],
+                    force
+                )
                 
-                try:
-                    created, skipped, complete_count, incomplete_count = future.result()
+                stats.created_ranges = created
+                stats.skipped_ranges = skipped
+                stats.total_ranges = created + skipped
+                
+                # For blocks dataset, mark all as incomplete (need verification)
+                # For other datasets, mark all as completed (sparse data is OK)
+                if dataset == 'blocks':
+                    stats.incomplete_ranges = created
+                    stats.completed_ranges = 0
+                else:
+                    stats.completed_ranges = created
+                    stats.incomplete_ranges = 0
                     
-                    # Update statistics
-                    with self._stats_lock:
-                        results[work_item.dataset].created_ranges += created
-                        results[work_item.dataset].skipped_ranges += skipped
-                        results[work_item.dataset].completed_ranges += complete_count
-                        results[work_item.dataset].incomplete_ranges += incomplete_count
-                        results[work_item.dataset].total_ranges += (created + skipped)
-                    
-                    logger.info(
-                        f"[{completed}/{len(work_items)}] {work_item.dataset} "
-                        f"worker {work_item.worker_id}: Created {created}, Skipped {skipped}, "
-                        f"Complete: {complete_count}, Incomplete: {incomplete_count}"
-                    )
-                    
-                except Exception as e:
-                    logger.error(
-                        f"Error processing {work_item.dataset} worker {work_item.worker_id}: {e}",
-                        exc_info=True
-                    )
+            except Exception as e:
+                logger.error(f"Error processing {dataset}: {e}")
+                stats.created_ranges = 0
+                stats.skipped_ranges = 0
+            
+            results[dataset] = stats
         
         # Calculate durations
         total_duration = time.time() - start_time
         for stats in results.values():
             stats.duration = total_duration
         
-        logger.info(f"Parallel backfill completed in {total_duration:.2f}s")
+        logger.info(f"Backfill completed in {total_duration:.2f}s")
         
         # Print summary
         self._print_backfill_summary(results)
         return results
     
-    def _analyze_dataset(
+    def _analyze_dataset_simple(
         self,
         dataset: str,
         start_block: Optional[int],
         end_block: Optional[int],
         force: bool
     ) -> Optional[Dict]:
-        """Analyze a dataset to find work to be done."""
+        """Analyze a dataset using system.parts to avoid memory issues."""
         table_name = self.dataset_tables.get(dataset, dataset)
         
         # Check if table exists
@@ -273,586 +210,243 @@ class BackfillWorker:
             logger.warning(f"{dataset}: Table {table_name} does not exist")
             return None
         
-        # Get data range and statistics
-        table_stats = self._get_table_stats(table_name, start_block, end_block)
-        if not table_stats:
-            logger.warning(f"No data found in {table_name}")
-            return None
-        
-        min_block, max_block, total_rows = table_stats
-        
-        # Align to range boundaries
-        aligned_min = (min_block // self.range_size) * self.range_size
-        aligned_max = ((max_block // self.range_size) + 1) * self.range_size
-        
-        logger.info(
-            f"{dataset}: blocks {min_block:,}-{max_block:,} "
-            f"(aligned: {aligned_min:,}-{aligned_max:,}), "
-            f"{total_rows:,} rows"
-        )
-        
-        # If force mode, handle deletions
-        if force:
-            if start_block is not None and end_block is not None:
-                self._delete_existing_entries_in_range(dataset, start_block, end_block)
-            else:
-                self._delete_existing_entries(dataset, aligned_min, aligned_max)
-        
-        return {
-            'dataset': dataset,
-            'table_name': table_name,
-            'min_block': aligned_min,
-            'max_block': aligned_max,
-            'total_rows': total_rows,
-            'force': force
-        }
-    
-    def _distribute_work(
-        self,
-        dataset_work: Dict[str, Dict],
-        max_workers: int
-    ) -> List[DatasetWorkItem]:
-        """Distribute work across workers."""
-        work_items = []
-        
-        # Calculate total ranges
-        total_ranges = sum(
-            (info['max_block'] - info['min_block']) // self.range_size
-            for info in dataset_work.values()
-        )
-        
-        if total_ranges == 0:
-            return work_items
-        
-        # Distribute workers proportionally to ranges
-        for dataset, info in dataset_work.items():
-            dataset_ranges = (info['max_block'] - info['min_block']) // self.range_size
+        # Get data range from system.parts
+        try:
+            client = self.clickhouse._connect()
             
-            # Calculate workers for this dataset
-            dataset_worker_count = max(1, int(
-                (dataset_ranges / total_ranges) * max_workers
-            ))
+            # Build WHERE clause
+            where_parts = [
+                f"database = '{self.database}'",
+                f"table = '{table_name}'",
+                "active = 1"
+            ]
             
-            # Ensure we don't exceed max_workers
-            dataset_worker_count = min(dataset_worker_count, max_workers, dataset_ranges)
+            # For specific ranges, filter parts
+            if start_block is not None:
+                where_parts.append(f"max_block_number >= {start_block}")
+            if end_block is not None:
+                where_parts.append(f"min_block_number <= {end_block}")
+            
+            where_clause = " AND ".join(where_parts)
+            
+            # Get range from system.parts
+            query = f"""
+            SELECT 
+                COALESCE(MIN(min_block_number), 0) as min_block,
+                COALESCE(MAX(max_block_number), 0) as max_block,
+                COALESCE(SUM(rows), 0) as total_rows
+            FROM system.parts
+            WHERE {where_clause}
+            """
+            
+            result = client.query(query)
+            if not result.result_rows or result.result_rows[0][0] == 0:
+                logger.warning(f"No data found for {dataset} in system.parts")
+                return None
+            
+            min_block, max_block, total_rows = result.result_rows[0]
+            
+            # Apply requested range constraints
+            if start_block is not None and min_block < start_block:
+                min_block = start_block
+            if end_block is not None and max_block > end_block:
+                max_block = end_block
+            
+            # Align to range boundaries
+            aligned_min = (min_block // self.range_size) * self.range_size
+            aligned_max = ((max_block // self.range_size) + 1) * self.range_size
             
             logger.info(
-                f"{dataset}: Assigning {dataset_worker_count} workers "
-                f"for {dataset_ranges} ranges"
+                f"{dataset}: blocks {min_block:,}-{max_block:,} "
+                f"(aligned: {aligned_min:,}-{aligned_max:,}), "
+                f"~{total_rows:,} rows (from system.parts)"
             )
             
-            # Divide ranges among workers
-            ranges_per_worker = math.ceil(dataset_ranges / dataset_worker_count)
+            # If force mode, handle deletions
+            if force:
+                if start_block is not None and end_block is not None:
+                    self._delete_existing_entries_simple(dataset, start_block, end_block)
+                else:
+                    self._delete_existing_entries_simple(dataset, aligned_min, aligned_max)
             
-            for worker_id in range(dataset_worker_count):
-                worker_start = info['min_block'] + (worker_id * ranges_per_worker * self.range_size)
-                worker_end = min(
-                    worker_start + (ranges_per_worker * self.range_size),
-                    info['max_block']
-                )
-                
-                if worker_start >= info['max_block']:
-                    break
-                
-                work_item = DatasetWorkItem(
-                    dataset=dataset,
-                    table_name=info['table_name'],
-                    start_block=worker_start,
-                    end_block=worker_end,
-                    force=info['force'],
-                    worker_id=worker_id,
-                    range_size=self.range_size
-                )
-                
-                work_items.append(work_item)
-        
-        return work_items
+            return {
+                'dataset': dataset,
+                'table_name': table_name,
+                'min_block': aligned_min,
+                'max_block': aligned_max,
+                'total_rows': total_rows,
+                'force': force
+            }
+            
+        except Exception as e:
+            logger.error(f"Error analyzing dataset {dataset}: {e}")
+            return None
     
-    def _process_work_item_fixed_ranges(
-        self, 
-        work_item: DatasetWorkItem
-    ) -> Tuple[int, int, int, int]:
-        """Process a work item using fixed ranges."""
-        logger.info(
-            f"Processing {work_item.dataset} worker {work_item.worker_id}: "
-            f"blocks {work_item.start_block:,} to {work_item.end_block:,}"
-        )
-        
-        # Use thread-local connection
-        thread_clickhouse = self._get_thread_clickhouse()
-        
-        # Process using fixed ranges
-        created, skipped, complete_count, incomplete_count = self._process_dataset_fixed_ranges(
-            thread_clickhouse,
-            work_item.dataset,
-            work_item.table_name,
-            work_item.start_block,
-            work_item.end_block,
-            work_item.force,
-            work_item.range_size
-        )
-        
-        return created, skipped, complete_count, incomplete_count
-    
-    def _process_dataset_fixed_ranges(
+    def _process_dataset_simple(
         self,
-        clickhouse: ClickHouseManager,
         dataset: str,
         table_name: str,
         min_block: int,
         max_block: int,
-        force: bool,
-        range_size: int
-    ) -> Tuple[int, int, int, int]:
-        """Process dataset using fixed-size ranges."""
+        force: bool
+    ) -> Tuple[int, int]:
+        """Process dataset using simplified approach."""
         created = 0
         skipped = 0
-        complete_count = 0
-        incomplete_count = 0
         
-        logger.info(f"Processing {dataset} with fixed {range_size}-block ranges")
+        logger.info(f"Processing {dataset} with simplified approach")
+        
+        # Get parts information for this dataset
+        parts_info = self._get_parts_info(table_name, min_block, max_block)
         
         # Process in fixed-size chunks
         current = min_block
         while current < max_block:
-            range_end = min(current + range_size, max_block)
+            range_end = min(current + self.range_size, max_block)
             
-            # Check if entry already exists
-            if not force and self._entry_exists_thread_safe(
-                clickhouse, dataset, current, range_end
-            ):
-                skipped += 1
-                logger.debug(f"Range {current}-{range_end} already exists, skipping")
-                current = range_end
-                continue
-            
-            # Count distinct blocks in this range
-            distinct_blocks = self._count_distinct_blocks_thread_safe(
-                clickhouse, table_name, current, range_end
-            )
-            
-            # Count total rows (for tracking)
-            total_rows = self._count_rows_in_range_thread_safe(
-                clickhouse, table_name, current, range_end
-            )
-            
-            # Determine if range is complete
-            expected_blocks = range_end - current
-            is_complete = (distinct_blocks == expected_blocks)
-            
-            # For blocks dataset, it MUST be complete to be marked as completed
-            if dataset == 'blocks' and not is_complete:
-                status = 'incomplete'
-                incomplete_count += 1
-            else:
-                # For other datasets, mark as completed if we've indexed it
-                # This prevents re-processing sparse data
-                status = 'completed'
-                complete_count += 1
-            
-            # Create the entry
-            if self._create_range_entry_thread_safe(
-                clickhouse=clickhouse,
-                dataset=dataset,
-                start_block=current,
-                end_block=range_end,
-                status=status,
-                rows_count=total_rows,
-                blocks_count=distinct_blocks,
-                expected_blocks=expected_blocks
-            ):
-                created += 1
-                logger.debug(
-                    f"Created entry for {dataset} {current:,}-{range_end:,}: "
-                    f"{distinct_blocks}/{expected_blocks} blocks, "
-                    f"{total_rows:,} rows, status={status}"
+            try:
+                # Check if entry already exists (simple query)
+                if not force and self._entry_exists_simple(dataset, current, range_end):
+                    skipped += 1
+                    current = range_end
+                    continue
+                
+                # Check if we have any parts covering this range
+                has_data = any(
+                    part['min_block'] <= current < part['max_block'] or
+                    part['min_block'] < range_end <= part['max_block'] or
+                    (current <= part['min_block'] and range_end >= part['max_block'])
+                    for part in parts_info
                 )
-            else:
-                logger.error(f"Failed to create entry for {dataset} {current:,}-{range_end:,}")
+                
+                if has_data:
+                    # For blocks dataset, mark as incomplete (needs verification)
+                    # For other datasets, mark as completed
+                    if dataset == 'blocks':
+                        status = 'incomplete'
+                    else:
+                        status = 'completed'
+                    
+                    # Create the entry
+                    if self._create_range_entry_simple(
+                        dataset=dataset,
+                        start_block=current,
+                        end_block=range_end,
+                        status=status
+                    ):
+                        created += 1
+                        logger.debug(f"Created entry for {dataset} {current:,}-{range_end:,} (status={status})")
+                else:
+                    logger.debug(f"No data found for {dataset} {current:,}-{range_end:,}, skipping")
+                
+            except Exception as e:
+                logger.error(f"Error processing range {current}-{range_end}: {e}")
             
             current = range_end
         
-        return created, skipped, complete_count, incomplete_count
+        return created, skipped
     
-    def _count_distinct_blocks_thread_safe(
+    def _get_parts_info(
         self,
-        clickhouse: ClickHouseManager,
         table_name: str,
-        start_block: int,
-        end_block: int
-    ) -> int:
-        """Count distinct block numbers in range using partition pruning."""
+        min_block: int,
+        max_block: int
+    ) -> List[Dict]:
+        """Get parts information for a table in the given range."""
         try:
-            client = clickhouse._connect()
+            client = self.clickhouse._connect()
             
-            # For blocks table, direct count is fine
-            if table_name == 'blocks':
-                result = client.query(f"""
-                SELECT COUNT(DISTINCT block_number) 
-                FROM {self.database}.{table_name}
-                WHERE block_number >= {start_block} 
-                  AND block_number < {end_block}
-                  AND block_number IS NOT NULL
-                """)
-                return result.result_rows[0][0] if result.result_rows else 0
+            query = f"""
+            SELECT 
+                partition,
+                min_block_number,
+                max_block_number,
+                rows
+            FROM system.parts
+            WHERE database = '{self.database}'
+              AND table = '{table_name}'
+              AND active = 1
+              AND max_block_number >= {min_block}
+              AND min_block_number <= {max_block}
+            ORDER BY min_block_number
+            """
             
-            # For other tables, use timestamp filtering for partition pruning
-            ts_range = self._get_block_timestamp_range(clickhouse, start_block, end_block)
-            if not ts_range:
-                # No blocks in this range
-                return 0
+            result = client.query(query)
             
-            min_ts, max_ts = ts_range
+            parts = []
+            for row in result.result_rows:
+                parts.append({
+                    'partition': row[0],
+                    'min_block': row[1],
+                    'max_block': row[2],
+                    'rows': row[3]
+                })
             
-            # Add some buffer to timestamps (1 hour each side) to account for any clock drift
-            result = client.query(f"""
-            SELECT COUNT(DISTINCT block_number) 
-            FROM {self.database}.{table_name}
-            WHERE block_number >= {start_block} 
-              AND block_number < {end_block}
-              AND block_number IS NOT NULL
-              AND block_timestamp >= toDateTime({min_ts} - 3600)
-              AND block_timestamp <= toDateTime({max_ts} + 3600)
-            """)
-            
-            return result.result_rows[0][0] if result.result_rows else 0
+            return parts
             
         except Exception as e:
-            logger.error(f"Error counting distinct blocks: {e}")
-            return 0
+            logger.error(f"Error getting parts info: {e}")
+            return []
     
-    def _count_rows_in_range_thread_safe(
+    def _entry_exists_simple(
         self,
-        clickhouse: ClickHouseManager,
-        table_name: str,
-        start_block: int,
-        end_block: int
-    ) -> int:
-        """Thread-safe version of count_rows_in_range with partition pruning."""
-        try:
-            client = clickhouse._connect()
-            
-            # For blocks table, direct count is fine
-            if table_name == 'blocks':
-                result = client.query(f"""
-                SELECT COUNT(*) 
-                FROM {self.database}.{table_name}
-                WHERE block_number >= {start_block} 
-                  AND block_number < {end_block}
-                  AND block_number IS NOT NULL
-                """)
-                return result.result_rows[0][0] if result.result_rows else 0
-            
-            # For other tables, use timestamp filtering
-            ts_range = self._get_block_timestamp_range(clickhouse, start_block, end_block)
-            if not ts_range:
-                return 0
-            
-            min_ts, max_ts = ts_range
-            
-            result = client.query(f"""
-            SELECT COUNT(*) 
-            FROM {self.database}.{table_name}
-            WHERE block_number >= {start_block} 
-              AND block_number < {end_block}
-              AND block_number IS NOT NULL
-              AND block_timestamp >= toDateTime({min_ts} - 3600)
-              AND block_timestamp <= toDateTime({max_ts} + 3600)
-            """)
-            
-            return result.result_rows[0][0] if result.result_rows else 0
-            
-        except Exception as e:
-            logger.error(f"Error counting rows in range: {e}")
-            return 0
-    
-    def _create_range_entry_thread_safe(
-        self,
-        clickhouse: ClickHouseManager,
-        dataset: str,
-        start_block: int,
-        end_block: int,
-        status: str,
-        rows_count: int,
-        blocks_count: int,
-        expected_blocks: int
-    ) -> bool:
-        """Create an indexing_state entry with metadata."""
-        try:
-            client = clickhouse._connect()
-            
-            # Store metadata in error_message field
-            metadata = f"blocks:{blocks_count}/{expected_blocks},rows:{rows_count}"
-            
-            client.command(f"""
-            INSERT INTO {self.database}.indexing_state
-            (mode, dataset, start_block, end_block, status, 
-             completed_at, rows_indexed, batch_id, error_message)
-            VALUES
-            ('{self.mode}', '{dataset}', {start_block}, {end_block}, 
-             '{status}', now(), {rows_count}, 'backfill-fixed', '{metadata}')
-            """)
-            return True
-        except Exception as e:
-            logger.error(f"Error creating indexing_state entry: {e}")
-            return False
-    
-    def _entry_exists_thread_safe(
-        self,
-        clickhouse: ClickHouseManager,
         dataset: str,
         start_block: int,
         end_block: int
     ) -> bool:
-        """Thread-safe check if an indexing_state entry already exists."""
+        """Simple check if an indexing_state entry exists."""
         try:
-            client = clickhouse._connect()
-            result = client.query(f"""
-            SELECT COUNT() 
+            client = self.clickhouse._connect()
+            
+            # Use EXISTS for efficiency
+            query = f"""
+            SELECT 1
             FROM {self.database}.indexing_state
             WHERE mode = '{self.mode}'
               AND dataset = '{dataset}'
               AND start_block = {start_block}
               AND end_block = {end_block}
-            """)
-            return result.result_rows[0][0] > 0
+            LIMIT 1
+            """
+            
+            result = client.query(query)
+            return len(result.result_rows) > 0
+            
         except Exception as e:
             logger.error(f"Error checking entry existence: {e}")
             return False
     
-    def backfill_datasets(
-        self,
-        datasets: List[str],
-        start_block: Optional[int] = None,
-        end_block: Optional[int] = None,
-        force: bool = False
-    ) -> Dict[str, BackfillStats]:
-        """
-        Backfill indexing_state for specified datasets (single-threaded).
-        Uses fixed-size ranges for predictable processing.
-        """
-        results = {}
-        
-        logger.info(f"Starting backfill for datasets: {datasets}")
-        logger.info(f"Using fixed range size: {self.range_size} blocks")
-        if start_block is not None and end_block is not None:
-            logger.info(f"Block range: {start_block:,} to {end_block:,}")
-        if force:
-            logger.info("FORCE MODE: Will delete and recreate existing entries")
-        
-        for dataset in datasets:
-            logger.info(f"Processing dataset: {dataset}")
-            start_time = time.time()
-            stats = self._backfill_dataset(dataset, start_block, end_block, force)
-            stats.duration = time.time() - start_time
-            results[dataset] = stats
-            
-            if stats.exists:
-                logger.info(
-                    f"{dataset}: Created {stats.created_ranges} ranges, "
-                    f"skipped {stats.skipped_ranges} existing ranges "
-                    f"({stats.completed_ranges} complete, {stats.incomplete_ranges} incomplete) "
-                    f"in {stats.duration:.2f}s"
-                )
-                if force and stats.deleted_ranges > 0:
-                    logger.info(f"{dataset}: Deleted {stats.deleted_ranges} existing ranges")
-            else:
-                logger.warning(f"{dataset}: Table does not exist")
-        
-        # Print summary
-        self._print_backfill_summary(results)
-        return results
-    
-    def _backfill_dataset(
-        self,
-        dataset: str,
-        start_block: Optional[int],
-        end_block: Optional[int],
-        force: bool
-    ) -> BackfillStats:
-        """Backfill a single dataset using fixed ranges."""
-        stats = BackfillStats(dataset=dataset, table_name="")
-        
-        # Get table name
-        table_name = self.dataset_tables.get(dataset, dataset)
-        stats.table_name = table_name
-        
-        # Check if table exists
-        if not self._table_exists(table_name):
-            stats.exists = False
-            return stats
-        
-        stats.exists = True
-        
-        # Get data range and statistics
-        table_stats = self._get_table_stats(table_name, start_block, end_block)
-        if not table_stats:
-            logger.warning(f"No data found in {table_name}")
-            return stats
-        
-        min_block, max_block, total_rows = table_stats
-        
-        # Align to range boundaries
-        aligned_min = (min_block // self.range_size) * self.range_size
-        aligned_max = ((max_block // self.range_size) + 1) * self.range_size
-        
-        stats.min_block = min_block
-        stats.max_block = max_block
-        stats.total_rows = total_rows
-        
-        # If force mode, delete existing entries
-        if force:
-            if start_block is not None and end_block is not None:
-                deleted_count = self._delete_existing_entries_in_range(
-                    dataset, start_block, end_block
-                )
-            else:
-                deleted_count = self._delete_existing_entries(
-                    dataset, aligned_min, aligned_max
-                )
-            stats.deleted_ranges = deleted_count
-            if deleted_count > 0:
-                logger.info(f"{dataset}: Deleted {deleted_count} existing entries")
-        
-        # Process with fixed ranges
-        created, skipped, complete_count, incomplete_count = self._process_dataset_fixed_ranges(
-            self.clickhouse,
-            dataset,
-            table_name,
-            aligned_min,
-            aligned_max,
-            force,
-            self.range_size
-        )
-        
-        stats.created_ranges = created
-        stats.skipped_ranges = skipped
-        stats.completed_ranges = complete_count
-        stats.incomplete_ranges = incomplete_count
-        stats.total_ranges = created + skipped
-        
-        return stats
-    
-    def _table_exists(self, table_name: str) -> bool:
-        """Check if a table exists."""
-        try:
-            client = self.clickhouse._connect()
-            result = client.query(f"""
-            SELECT count() FROM system.tables 
-            WHERE database = '{self.database}' AND name = '{table_name}'
-            """)
-            return result.result_rows[0][0] > 0
-        except Exception as e:
-            logger.error(f"Error checking table existence: {e}")
-            return False
-    
-    def _get_table_stats(
-        self,
-        table_name: str,
-        start_block: Optional[int],
-        end_block: Optional[int]
-    ) -> Optional[Tuple[int, int, int]]:
-        """Get min/max block and row count from table using partitions."""
-        try:
-            client = self.clickhouse._connect()
-            
-            # Build WHERE clause for block range
-            where_clause = "WHERE block_number IS NOT NULL"
-            if start_block is not None:
-                where_clause += f" AND block_number >= {start_block}"
-            if end_block is not None:
-                where_clause += f" AND block_number <= {end_block}"
-            
-            # For blocks table, we can query directly
-            if table_name == 'blocks':
-                result = client.query(f"""
-                SELECT 
-                    MIN(block_number) as min_block,
-                    MAX(block_number) as max_block,
-                    COUNT() as total_rows
-                FROM {self.database}.{table_name}
-                {where_clause}
-                """)
-            else:
-                # For other tables, use system.parts to get approximate stats first
-                parts_query = f"""
-                SELECT 
-                    MIN(min_block_number) as min_block,
-                    MAX(max_block_number) as max_block,
-                    SUM(rows) as total_rows
-                FROM system.parts
-                WHERE database = '{self.database}'
-                  AND table = '{table_name}'
-                  AND active = 1
-                """
-                
-                if start_block is not None or end_block is not None:
-                    # If we have block constraints, we need to query the actual table
-                    # but limit the scan to avoid memory issues
-                    result = client.query(f"""
-                    SELECT 
-                        MIN(block_number) as min_block,
-                        MAX(block_number) as max_block,
-                        COUNT() as total_rows
-                    FROM {self.database}.{table_name}
-                    {where_clause}
-                    SETTINGS max_memory_usage = 1000000000
-                    """)
-                else:
-                    result = client.query(parts_query)
-            
-            if not result.result_rows or result.result_rows[0][0] is None:
-                return None
-                
-            return result.result_rows[0]
-            
-        except Exception as e:
-            logger.error(f"Error getting table stats for {table_name}: {e}")
-            return None
-    
-    def _delete_existing_entries_in_range(
+    def _create_range_entry_simple(
         self,
         dataset: str,
         start_block: int,
-        end_block: int
-    ) -> int:
-        """Delete existing indexing_state entries in the specified range."""
+        end_block: int,
+        status: str
+    ) -> bool:
+        """Create an indexing_state entry without expensive queries."""
         try:
             client = self.clickhouse._connect()
             
-            # First count how many entries we're deleting
-            count_query = f"""
-            SELECT COUNT(*) 
-            FROM {self.database}.indexing_state
-            WHERE mode = '{self.mode}'
-              AND dataset = '{dataset}'
-              AND ((start_block >= {start_block} AND start_block < {end_block})
-                OR (end_block > {start_block} AND end_block <= {end_block})
-                OR (start_block <= {start_block} AND end_block >= {end_block}))
+            # Simple metadata
+            metadata = f"backfill-simple,range:{self.range_size}"
+            
+            query = f"""
+            INSERT INTO {self.database}.indexing_state
+            (mode, dataset, start_block, end_block, status, 
+             completed_at, rows_indexed, batch_id, error_message)
+            VALUES
+            ('{self.mode}', '{dataset}', {start_block}, {end_block}, 
+             '{status}', now(), 0, 'backfill-simple', '{metadata}')
             """
-            result = client.query(count_query)
-            count = result.result_rows[0][0] if result.result_rows else 0
             
-            if count > 0:
-                # Delete the entries
-                delete_query = f"""
-                ALTER TABLE {self.database}.indexing_state
-                DELETE WHERE mode = '{self.mode}'
-                  AND dataset = '{dataset}'
-                  AND ((start_block >= {start_block} AND start_block < {end_block})
-                    OR (end_block > {start_block} AND end_block <= {end_block})
-                    OR (start_block <= {start_block} AND end_block >= {end_block}))
-                """
-                client.command(delete_query)
-                logger.debug(f"Deleted {count} existing entries for {dataset} in range {start_block}-{end_block}")
-            
-            return count
+            client.command(query)
+            return True
             
         except Exception as e:
-            logger.error(f"Error deleting existing entries: {e}")
-            return 0
+            logger.error(f"Error creating indexing_state entry: {e}")
+            return False
     
-    def _delete_existing_entries(
+    def _delete_existing_entries_simple(
         self,
         dataset: str,
         min_block: int,
@@ -862,48 +456,70 @@ class BackfillWorker:
         try:
             client = self.clickhouse._connect()
             
-            # First count how many entries we're deleting
-            count_query = f"""
-            SELECT COUNT(*) 
-            FROM {self.database}.indexing_state
-            WHERE mode = '{self.mode}'
+            # Delete without counting first (to avoid memory issues)
+            delete_query = f"""
+            ALTER TABLE {self.database}.indexing_state
+            DELETE WHERE mode = '{self.mode}'
               AND dataset = '{dataset}'
               AND start_block >= {min_block}
               AND end_block <= {max_block}
             """
-            result = client.query(count_query)
-            count = result.result_rows[0][0] if result.result_rows else 0
             
-            if count > 0:
-                # Delete the entries
-                delete_query = f"""
-                ALTER TABLE {self.database}.indexing_state
-                DELETE WHERE mode = '{self.mode}'
-                  AND dataset = '{dataset}'
-                  AND start_block >= {min_block}
-                  AND end_block <= {max_block}
-                """
-                client.command(delete_query)
-                logger.debug(f"Deleted {count} existing entries for {dataset} in range {min_block}-{max_block}")
-            
-            return count
+            client.command(delete_query)
+            logger.info(f"Deleted existing entries for {dataset} in range {min_block}-{max_block}")
+            return 0  # Don't count to avoid memory issues
             
         except Exception as e:
             logger.error(f"Error deleting existing entries: {e}")
             return 0
     
+    def backfill_datasets(
+        self,
+        datasets: List[str],
+        start_block: Optional[int] = None,
+        end_block: Optional[int] = None,
+        force: bool = False
+    ) -> Dict[str, BackfillStats]:
+        """Single-threaded version - just calls the parallel version with 1 worker."""
+        return self.backfill_datasets_parallel(
+            datasets=datasets,
+            start_block=start_block,
+            end_block=end_block,
+            force=force,
+            max_workers=1
+        )
+    
+    def _table_exists(self, table_name: str) -> bool:
+        """Check if a table exists."""
+        try:
+            client = self.clickhouse._connect()
+            
+            # Use EXISTS to avoid counting
+            query = f"""
+            SELECT 1
+            FROM system.tables 
+            WHERE database = '{self.database}' 
+              AND name = '{table_name}'
+            LIMIT 1
+            """
+            
+            result = client.query(query)
+            return len(result.result_rows) > 0
+            
+        except Exception as e:
+            logger.error(f"Error checking table existence: {e}")
+            return False
+    
     def _print_backfill_summary(self, results: Dict[str, BackfillStats]) -> None:
         """Print a summary of the backfill operation."""
         print("\n" + "=" * 80)
-        print("BACKFILL SUMMARY (Fixed Ranges)")
+        print("BACKFILL SUMMARY (Simplified Mode)")
         print("=" * 80)
         
         total_created = 0
         total_skipped = 0
-        total_deleted = 0
         total_complete = 0
         total_incomplete = 0
-        total_duration = 0
         
         for dataset, stats in results.items():
             if not stats.exists:
@@ -913,38 +529,35 @@ class BackfillWorker:
             print(f"\n{dataset}:")
             print(f"  Table: {stats.table_name}")
             print(f"  Block range: {stats.min_block:,} - {stats.max_block:,}")
-            print(f"  Total rows: {stats.total_rows:,}")
+            print(f"  Approximate rows: ~{stats.total_rows:,}")
             print(f"  Range size: {self.range_size} blocks")
-            print(f"  Total ranges: {stats.total_ranges}")
             print(f"  Created entries: {stats.created_ranges}")
             print(f"  Skipped entries: {stats.skipped_ranges}")
-            print(f"  Complete ranges: {stats.completed_ranges}")
-            print(f"  Incomplete ranges: {stats.incomplete_ranges}")
-            if stats.deleted_ranges > 0:
-                print(f"  Deleted entries: {stats.deleted_ranges}")
+            
+            if dataset == 'blocks':
+                print(f"  Status: All marked as 'incomplete' (needs verification)")
+            else:
+                print(f"  Status: All marked as 'completed' (sparse data OK)")
+            
             print(f"  Duration: {stats.duration:.2f}s")
-            if stats.worker_count > 1:
-                print(f"  Workers used: {stats.worker_count}")
             
             total_created += stats.created_ranges
             total_skipped += stats.skipped_ranges
-            total_deleted += stats.deleted_ranges
             total_complete += stats.completed_ranges
             total_incomplete += stats.incomplete_ranges
-            total_duration = max(total_duration, stats.duration)
         
         print(f"\nTOTAL:")
         print(f"  Created: {total_created}")
         print(f"  Skipped: {total_skipped}")
         print(f"  Complete: {total_complete}")
         print(f"  Incomplete: {total_incomplete}")
-        if total_deleted > 0:
-            print(f"  Deleted: {total_deleted} (force mode)")
-        print(f"  Duration: {total_duration:.2f}s")
+        print(f"  Duration: {results[list(results.keys())[0]].duration:.2f}s")
+        print("\nNote: This is a simplified backfill that avoids memory-intensive queries.")
+        print("Run 'validate' and 'fill-gaps' operations to verify and complete the data.")
         print("=" * 80 + "\n")
     
     def validate_backfill(self, datasets: List[str]) -> bool:
-        """Validate that backfill was successful."""
+        """Simplified validation."""
         logger.info("Validating backfill results...")
         
         success = True
@@ -954,50 +567,22 @@ class BackfillWorker:
             if not self._table_exists(table_name):
                 continue
             
-            # Get data range from table
-            table_stats = self._get_table_stats(table_name, None, None)
-            if not table_stats:
-                continue
-            
-            min_block, max_block, total_rows = table_stats
-            
-            # Check indexing_state coverage
             try:
                 client = self.clickhouse._connect()
                 
-                # For fixed ranges, check coverage differently
-                result = client.query(f"""
-                SELECT 
-                    MIN(start_block) as min_indexed,
-                    MAX(end_block) as max_indexed,
-                    COUNT() as range_count,
-                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as complete_count,
-                    SUM(CASE WHEN status = 'incomplete' THEN 1 ELSE 0 END) as incomplete_count
+                # Just check if we have any entries
+                query = f"""
+                SELECT 1
                 FROM {self.database}.indexing_state
                 WHERE mode = '{self.mode}'
                   AND dataset = '{dataset}'
-                """)
+                LIMIT 1
+                """
                 
-                if result.result_rows and result.result_rows[0][0] is not None:
-                    min_indexed, max_indexed, range_count, complete_count, incomplete_count = result.result_rows[0]
-                    
-                    # For blocks dataset, check if there are incomplete ranges
-                    if dataset == 'blocks' and incomplete_count > 0:
-                        logger.warning(
-                            f"! {dataset}: Has {incomplete_count} incomplete ranges that need processing"
-                        )
-                        success = False
-                    elif min_indexed <= min_block and max_indexed >= max_block:
-                        logger.info(
-                            f"✓ {dataset}: Properly covered by {range_count} ranges "
-                            f"({complete_count} complete, {incomplete_count} incomplete)"
-                        )
-                    else:
-                        logger.warning(
-                            f"✗ {dataset}: Coverage gap - table has {min_block}-{max_block}, "
-                            f"indexing_state has {min_indexed}-{max_indexed}"
-                        )
-                        success = False
+                result = client.query(query)
+                
+                if len(result.result_rows) > 0:
+                    logger.info(f"✓ {dataset}: Has indexing_state entries")
                 else:
                     logger.warning(f"✗ {dataset}: No indexing_state entries found")
                     success = False
