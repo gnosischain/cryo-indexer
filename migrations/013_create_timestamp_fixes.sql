@@ -1,4 +1,4 @@
--- Create table to track timestamp fix operations
+-- Create table to track timestamp fix operations (if not exists)
 CREATE TABLE IF NOT EXISTS {{database}}.timestamp_fixes
 (
     `table_name` String,
@@ -13,8 +13,11 @@ ENGINE = ReplacingMergeTree(insert_version)
 ORDER BY (table_name, created_at)
 SETTINGS index_granularity = 8192;
 
--- Create index for quick lookups
-ALTER TABLE {{database}}.timestamp_fixes
-ADD INDEX idx_status (status) TYPE minmax GRANULARITY 4;
 
-INSERT INTO {{database}}.migrations (name) VALUES ('013_create_timestamp_fixes');
+-- Record migration completion (only if not already recorded)
+INSERT INTO {{database}}.migrations (name) 
+SELECT '013_create_timestamp_fixes' 
+WHERE NOT EXISTS (
+    SELECT 1 FROM {{database}}.migrations 
+    WHERE name = '013_create_timestamp_fixes'
+);
