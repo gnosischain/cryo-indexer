@@ -15,6 +15,7 @@ from .core.worker_pool import WorkerPool, WorkResult
 from .db.clickhouse_manager import ClickHouseManager
 from .worker import IndexerWorker
 from .backfill_worker import BackfillWorker
+from .timestamp_fixer import TimestampFixer
 
 
 class CryoIndexer:
@@ -93,6 +94,8 @@ class CryoIndexer:
             self._run_validate()
         elif settings.operation == OperationType.BACKFILL:
             self._run_backfill()
+        elif settings.operation == OperationType.FIX_TIMESTAMPS: 
+            self._run_fix_timestamps() 
         else:
             logger.error(f"Unknown operation: {settings.operation}")
             sys.exit(1)
@@ -557,6 +560,61 @@ class CryoIndexer:
         else:
             print("\n✓ Validation passed!")
             sys.exit(0)
+
+    def _run_fix_timestamps(self):
+        """Fix incorrect timestamps in blockchain data tables."""
+        logger.info("Starting timestamp fix operation")
+        
+        # Create timestamp fixer
+        fixer = TimestampFixer(
+            clickhouse=self.clickhouse,
+            state_manager=self.state_manager
+        )
+        
+        # Find affected datasets
+        affected = fixer.find_affected_datasets()
+        
+        if not affected:
+            logger.info("No datasets with timestamp issues found")
+            print("\n✓ All timestamps are correct!")
+            sys.exit(0)
+        
+        # Print affected datasets
+        print("\n=== AFFECTED DATASETS ===\n")
+        total_affected = 0
+        for dataset, count in affected.items():
+            print(f"{dataset}: {count:,} rows with incorrect timestamps")
+            total_affected += count
+        print(f"\nTotal affected rows: {total_affected:,}")
+        
+        # Fix timestamps
+        print("\n=== STARTING FIX ===\n")
+        results = fixer.fix_timestamps(list(affected.keys()))
+        
+        # Print summary
+        fixer.print_fix_summary(results)
+        
+        # Verify fixes
+        print("\n=== VERIFICATION ===\n")
+        verification = fixer.verify_fixes(list(affected.keys()))
+        
+        all_clean = True
+        for dataset, status in verification.items():
+            if status.get('remaining_bad', 0) > 0:
+                print(f"✗ {dataset}: Still has {status['remaining_bad']} bad timestamps")
+                all_clean = False
+            elif 'error' in status:
+                print(f"✗ {dataset}: Error during verification: {status['error']}")
+                all_clean = False
+            else:
+                print(f"✓ {dataset}: Clean")
+        
+        if all_clean:
+            print("\n✓ All timestamps successfully fixed!")
+            sys.exit(0)
+        else:
+            print("\n✗ Some timestamps could not be fixed")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

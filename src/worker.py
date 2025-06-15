@@ -45,6 +45,33 @@ class IndexerWorker:
         
         logger.info(f"Worker {worker_id} initialized for mode {mode}")
     
+    def _verify_blocks_exist(self, start_block: int, end_block: int) -> bool:
+        """Check if all blocks in range exist in database with valid timestamps."""
+        try:
+            client = self.clickhouse._connect()
+            query = f"""
+            SELECT COUNT(DISTINCT block_number) as count
+            FROM {self.clickhouse.database}.blocks
+            WHERE block_number >= {start_block} 
+              AND block_number < {end_block}
+              AND timestamp IS NOT NULL
+              AND timestamp > 0
+            """
+            result = client.query(query)
+            expected_blocks = end_block - start_block
+            actual_blocks = result.result_rows[0][0] if result.result_rows else 0
+            
+            if actual_blocks < expected_blocks:
+                logger.warning(
+                    f"Missing blocks: found {actual_blocks}/{expected_blocks} blocks "
+                    f"in range {start_block}-{end_block}"
+                )
+                
+            return actual_blocks == expected_blocks
+        except Exception as e:
+            logger.error(f"Error verifying blocks: {e}")
+            return False
+    
     def process_range(
         self, 
         start_block: int, 
@@ -67,6 +94,30 @@ class IndexerWorker:
         try:
             # Define diff datasets that need special handling
             diff_datasets = ['balance_diffs', 'code_diffs', 'nonce_diffs', 'storage_diffs']
+            
+            # Check if we need blocks first (unless we're processing blocks)
+            if 'blocks' not in datasets and not self._verify_blocks_exist(start_block, end_block):
+                if settings.strict_timestamp_mode:
+                    logger.error(
+                        f"Cannot process {datasets} without blocks {start_block}-{end_block}. "
+                        f"Blocks must be indexed first in strict mode."
+                    )
+                    return False
+                else:
+                    logger.warning(
+                        f"Blocks {start_block}-{end_block} not fully available. "
+                        f"Processing anyway, but timestamps may be incorrect."
+                    )
+            
+            # In force mode, process blocks first if not already done
+            if force and 'blocks' not in datasets and not self._verify_blocks_exist(start_block, end_block):
+                logger.info(f"Force mode: Processing blocks first for range {start_block}-{end_block}")
+                
+                # Process blocks first
+                if not self._process_dataset_range(start_block, end_block, ['blocks']):
+                    logger.error(f"Failed to process blocks {start_block}-{end_block}")
+                    if settings.strict_timestamp_mode:
+                        return False
             
             # In force mode, just process everything without checking
             if force:

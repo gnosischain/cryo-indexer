@@ -19,6 +19,7 @@ class OperationType(Enum):
     FILL_GAPS = "fill_gaps"     # Find and fill gaps
     VALIDATE = "validate"        # Check data integrity
     BACKFILL = "backfill"       # Backfill indexing_state from existing data
+    FIX_TIMESTAMPS = "fix_timestamps"  # Fix incorrect timestamps 
 
 
 class IndexerSettings:
@@ -76,6 +77,10 @@ class IndexerSettings:
         self.data_dir = os.environ.get("DATA_DIR", "/app/data")
         self.log_dir = os.environ.get("LOG_DIR", "/app/logs")
         self.migrations_dir = os.environ.get("MIGRATIONS_DIR", "/app/migrations")
+
+        # Timestamp fix settings
+        self.timestamp_fix_batch_size = int(os.environ.get("TIMESTAMP_FIX_BATCH_SIZE", "100000"))
+        self.strict_timestamp_mode = os.environ.get("STRICT_TIMESTAMP_MODE", "false").lower() == "true"
         
         # Logging
         self.log_level = os.environ.get("LOG_LEVEL", "INFO")

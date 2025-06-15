@@ -183,7 +183,13 @@ class ClickHouseManager:
         try:
             # For each unique block number, get the timestamp
             unique_blocks = df['block_number'].dropna().unique()
+            
+            if len(unique_blocks) == 0:
+                logger.warning(f"No valid block numbers found in {table_name} data")
+                return
+                
             block_timestamps = {}
+            missing_blocks = []
             
             # Batch query for better performance
             if len(unique_blocks) > 0:
@@ -193,18 +199,72 @@ class ClickHouseManager:
                 SELECT block_number, timestamp 
                 FROM {self.database}.blocks 
                 WHERE block_number IN ({blocks_str})
+                  AND timestamp IS NOT NULL
+                  AND timestamp > 0
                 """
                 result = client.query(query)
                 
                 for row in result.result_rows:
                     block_timestamps[row[0]] = row[1]
+                
+                # Find missing blocks
+                missing_blocks = [b for b in unique_blocks if b not in block_timestamps]
+                
+                if missing_blocks:
+                    logger.warning(
+                        f"Missing timestamp data for {len(missing_blocks)} blocks "
+                        f"in {table_name}. Examples: {missing_blocks[:5]}"
+                    )
+                    
+                    # In strict mode, raise an error
+                    if hasattr(settings, 'strict_timestamp_mode') and settings.strict_timestamp_mode:
+                        raise ValueError(
+                            f"Cannot add timestamps for {table_name}: "
+                            f"{len(missing_blocks)} blocks missing. "
+                            f"First missing: {missing_blocks[0]}"
+                        )
+                    
+                    # Record for later fixing
+                    self._record_timestamp_issues(table_name, missing_blocks)
             
             # Map block numbers to timestamps
+            # IMPORTANT: Use None for missing blocks, not timestamp 0
             df['block_timestamp'] = df['block_number'].map(
-                lambda x: pd.Timestamp.fromtimestamp(block_timestamps.get(x, 0)) if pd.notna(x) else None
+                lambda x: pd.Timestamp.fromtimestamp(block_timestamps.get(x, 0)) 
+                if pd.notna(x) and x in block_timestamps else None
             )
+            
+            # Log statistics
+            null_timestamps = df['block_timestamp'].isna().sum()
+            if null_timestamps > 0:
+                logger.warning(
+                    f"{table_name}: {null_timestamps} rows will have NULL timestamps "
+                    f"due to missing block data"
+                )
+                
         except Exception as e:
-            logger.warning(f"Error adding timestamp columns: {e}")
+            logger.error(f"Error adding timestamp columns: {e}")
+            # Don't fail the entire import, but log the issue
+            if hasattr(settings, 'strict_timestamp_mode') and settings.strict_timestamp_mode:
+                raise
+    
+    def _record_timestamp_issues(self, table_name: str, missing_blocks: List[int]):
+        """Record blocks with missing timestamp data for later fixing."""
+        try:
+            # Only record a sample to avoid flooding the table
+            sample_size = min(len(missing_blocks), 100)
+            sample_blocks = missing_blocks[:sample_size]
+            
+            logger.debug(
+                f"Recording {sample_size} missing blocks for {table_name} "
+                f"(total: {len(missing_blocks)})"
+            )
+            
+            # This is informational logging for now
+            # Could be extended to write to a tracking table if needed
+            
+        except Exception as e:
+            logger.error(f"Error recording timestamp issues: {e}")
         
     def _convert_binary_columns(self, df):
         """Convert binary columns to hex strings for ClickHouse."""

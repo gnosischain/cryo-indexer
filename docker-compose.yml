@@ -20,7 +20,7 @@ services:
       - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE:-true}
       
       # Operation settings
-      - OPERATION=${OPERATION:-continuous}  # continuous, historical, fill_gaps, validate, backfill
+      - OPERATION=${OPERATION:-continuous}  # continuous, historical, fill_gaps, validate, backfill, fix_timestamps
       - MODE=${MODE:-default}               # default, minimal, full, custom
       
       # Block range (for historical/fill_gaps/backfill)
@@ -53,6 +53,10 @@ services:
       - GAP_DETECTION_STATE_CHUNK_SIZE=${GAP_DETECTION_STATE_CHUNK_SIZE:-100000}
       - GAP_DETECTION_TABLE_CHUNK_SIZE=${GAP_DETECTION_TABLE_CHUNK_SIZE:-10000}
       - GAP_DETECTION_THRESHOLD=${GAP_DETECTION_THRESHOLD:-0.8}
+      
+      # Timestamp fix settings
+      - TIMESTAMP_FIX_BATCH_SIZE=${TIMESTAMP_FIX_BATCH_SIZE:-100000}
+      - STRICT_TIMESTAMP_MODE=${STRICT_TIMESTAMP_MODE:-false}
       
       # Custom datasets (optional)
       - DATASETS=${DATASETS:-}

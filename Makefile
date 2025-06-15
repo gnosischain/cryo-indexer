@@ -1,6 +1,7 @@
 # Cryo Indexer - Simplified Makefile
 .PHONY: help build start stop logs clean continuous historical fill-gaps validate backfill \
-	run-migrations status ps restart shell validate-dataset
+	run-migrations status ps restart shell validate-dataset fix-timestamps fix-timestamps-verbose \
+	verify-timestamps strict-historical fix-workflow
 
 # Default target
 .DEFAULT_GOAL := help
@@ -19,6 +20,7 @@ help:
 	@echo "  fill-gaps            Find and fill gaps in indexed data"
 	@echo "  validate             Check data completeness"
 	@echo "  backfill             Populate indexing_state from existing data"
+	@echo "  fix-timestamps       Fix incorrect timestamps in tables"
 	@echo ""
 	@echo "Management:"
 	@echo "  start                Start the indexer (continuous mode by default)"
@@ -32,6 +34,7 @@ help:
 	@echo "Utilities:"
 	@echo "  shell                Open shell in container"
 	@echo "  validate-dataset     Validate specific dataset"
+	@echo "  verify-timestamps    Check for timestamp issues"
 	@echo ""
 	@echo "Examples:"
 	@echo "  # Index specific range with 8 workers:"
@@ -57,6 +60,9 @@ help:
 	@echo ""
 	@echo "  # Force backfill (recreate existing entries):"
 	@echo "  make backfill BACKFILL_FORCE=true"
+	@echo ""
+	@echo "  # Fix timestamps:"
+	@echo "  make fix-timestamps"
 	@echo ""
 	@echo "Migration Workflow (for existing data):"
 	@echo "  1. make backfill     # Populate indexing_state from existing data"
@@ -171,6 +177,36 @@ validate-dataset:
 		exit 1; \
 	fi
 	OPERATION=validate DATASETS=$(DATASET) RESTART_POLICY=no docker-compose up
+
+# Timestamp fix operations
+fix-timestamps:
+	OPERATION=fix_timestamps docker-compose up cryo-indexer
+
+fix-timestamps-verbose:
+	OPERATION=fix_timestamps LOG_LEVEL=DEBUG docker-compose up cryo-indexer
+
+verify-timestamps:
+	OPERATION=fix_timestamps docker-compose run --rm cryo-indexer python -c \
+		"from src.timestamp_fixer import TimestampFixer; \
+		from src.db.clickhouse_manager import ClickHouseManager; \
+		from src.config import settings; \
+		ch = ClickHouseManager(settings.clickhouse_host, settings.clickhouse_user, \
+			settings.clickhouse_password, settings.clickhouse_database, \
+			settings.clickhouse_port, settings.clickhouse_secure); \
+		fixer = TimestampFixer(ch, None); \
+		import json; \
+		print(json.dumps(fixer.verify_fixes(), indent=2))"
+
+# Run with strict timestamp mode
+strict-historical:
+	OPERATION=historical STRICT_TIMESTAMP_MODE=true docker-compose up cryo-indexer
+
+# Complete timestamp fix workflow
+fix-workflow:
+	@echo "Running complete timestamp fix workflow..."
+	@$(MAKE) fix-timestamps
+	@echo "Verifying fixes..."
+	@$(MAKE) verify-timestamps
 
 # Quick shortcuts for common workflows
 .PHONY: backfill-all quick-backfill migration-workflow
