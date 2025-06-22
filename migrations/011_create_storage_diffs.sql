@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS {{database}}.storage_diffs
 )
 ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(block_timestamp)
-ORDER BY (block_number, transaction_index)
+ORDER BY (block_number, transaction_index, address, slot)
 SETTINGS allow_nullable_key = 1;
 
 
