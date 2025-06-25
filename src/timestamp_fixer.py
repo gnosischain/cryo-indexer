@@ -235,77 +235,139 @@ class TimestampFixer:
         try:
             client = self.clickhouse._connect()
             
-            # Process in smaller chunks to avoid memory issues
-            fixed_count = 0
-            current_block = start_block
+            # Since we cannot UPDATE key columns in ClickHouse, we need to:
+            # 1. Delete the affected rows
+            # 2. Re-insert them with correct timestamps
             
-            while current_block <= end_block:
-                chunk_end = min(current_block + self.fix_batch_size, end_block + 1)
-                
-                # First, verify we have the block data
-                verify_query = f"""
-                SELECT COUNT(DISTINCT block_number) as cnt
-                FROM {self.database}.blocks
-                WHERE block_number >= {current_block}
-                  AND block_number < {chunk_end}
-                  AND timestamp IS NOT NULL
-                  AND timestamp > 0
+            logger.debug(f"Fixing timestamps for {dataset} range {start_block}-{end_block}")
+            
+            # First, count affected rows
+            count_query = f"""
+            SELECT COUNT(*) 
+            FROM {self.database}.{dataset}
+            WHERE block_number >= {start_block}
+              AND block_number <= {end_block}
+              AND block_timestamp = '1970-01-01 00:00:00'
+            """
+            result = client.query(count_query)
+            affected_count = result.result_rows[0][0] if result.result_rows else 0
+            
+            if affected_count == 0:
+                return 0
+            
+            # Get the columns of the table (excluding MATERIALIZED columns)
+            columns_query = f"""
+            SELECT name 
+            FROM system.columns 
+            WHERE database = '{self.database}' 
+              AND table = '{dataset}'
+              AND default_kind NOT IN ('MATERIALIZED', 'ALIAS')
+            ORDER BY position
+            """
+            result = client.query(columns_query)
+            columns = [row[0] for row in result.result_rows]
+            
+            # Build the SELECT part for re-insertion
+            select_parts = []
+            for col in columns:
+                if col == 'block_timestamp':
+                    # Use timestamp from blocks table
+                    select_parts.append("toDateTime(b.timestamp) as block_timestamp")
+                else:
+                    select_parts.append(f"t.{col}")
+            
+            # Store the data to be fixed in memory (for small batches)
+            # This approach works well for the small number of affected rows
+            if affected_count <= 10000:  # Small enough to handle in memory
+                # Get the data with corrected timestamps
+                select_query = f"""
+                SELECT {', '.join(select_parts)}
+                FROM {self.database}.{dataset} t
+                INNER JOIN {self.database}.blocks b ON t.block_number = b.block_number
+                WHERE t.block_number >= {start_block}
+                  AND t.block_number <= {end_block}
+                  AND t.block_timestamp = '1970-01-01 00:00:00'
+                  AND b.timestamp IS NOT NULL
+                  AND b.timestamp > 0
                 """
                 
-                result = client.query(verify_query)
-                available_blocks = result.result_rows[0][0] if result.result_rows else 0
-                expected_blocks = chunk_end - current_block
+                result = client.query(select_query)
+                rows_to_insert = result.result_rows
                 
-                if available_blocks < expected_blocks:
-                    logger.warning(
-                        f"Only {available_blocks}/{expected_blocks} blocks available "
-                        f"for range {current_block}-{chunk_end}"
-                    )
+                if rows_to_insert:
+                    # Delete the bad rows
+                    delete_query = f"""
+                    ALTER TABLE {self.database}.{dataset}
+                    DELETE WHERE block_number >= {start_block}
+                      AND block_number <= {end_block}
+                      AND block_timestamp = '1970-01-01 00:00:00'
+                    """
+                    client.command(delete_query)
+                    
+                    # Wait for deletion to propagate
+                    time.sleep(1)
+                    
+                    # Convert rows to DataFrame for easier insertion
+                    import pandas as pd
+                    df = pd.DataFrame(rows_to_insert, columns=columns)
+                    
+                    # Insert the corrected data
+                    client.insert_df(f"{self.database}.{dataset}", df)
+                    
+                    logger.debug(f"Fixed {len(rows_to_insert)} timestamps in {dataset}")
+                    return len(rows_to_insert)
+            else:
+                # For larger datasets, process in chunks
+                fixed_count = 0
+                chunk_size = 5000
                 
-                # Perform the update using ALTER TABLE UPDATE
-                update_query = f"""
-                ALTER TABLE {self.database}.{dataset}
-                UPDATE block_timestamp = (
-                    SELECT toDateTime(timestamp)
-                    FROM {self.database}.blocks b
-                    WHERE b.block_number = {dataset}.block_number
-                    LIMIT 1
-                )
-                WHERE block_number >= {current_block}
-                  AND block_number < {chunk_end}
-                  AND block_timestamp = '1970-01-01 00:00:00'
-                  AND EXISTS (
-                    SELECT 1 
-                    FROM {self.database}.blocks b 
-                    WHERE b.block_number = {dataset}.block_number
+                for offset in range(0, affected_count, chunk_size):
+                    # Get chunk of data with corrected timestamps
+                    select_query = f"""
+                    SELECT {', '.join(select_parts)}
+                    FROM {self.database}.{dataset} t
+                    INNER JOIN {self.database}.blocks b ON t.block_number = b.block_number
+                    WHERE t.block_number >= {start_block}
+                      AND t.block_number <= {end_block}
+                      AND t.block_timestamp = '1970-01-01 00:00:00'
                       AND b.timestamp IS NOT NULL
                       AND b.timestamp > 0
-                  )
-                """
+                    ORDER BY t.block_number, t.transaction_index
+                    LIMIT {chunk_size} OFFSET {offset}
+                    """
+                    
+                    result = client.query(select_query)
+                    rows_to_insert = result.result_rows
+                    
+                    if rows_to_insert:
+                        # Get the block range for this chunk
+                        chunk_blocks = [row[columns.index('block_number')] for row in rows_to_insert]
+                        chunk_min_block = min(chunk_blocks)
+                        chunk_max_block = max(chunk_blocks)
+                        
+                        # Delete this chunk's bad rows
+                        delete_query = f"""
+                        ALTER TABLE {self.database}.{dataset}
+                        DELETE WHERE block_number >= {chunk_min_block}
+                          AND block_number <= {chunk_max_block}
+                          AND block_timestamp = '1970-01-01 00:00:00'
+                        """
+                        client.command(delete_query)
+                        
+                        # Wait briefly
+                        time.sleep(0.5)
+                        
+                        # Convert to DataFrame and insert
+                        import pandas as pd
+                        df = pd.DataFrame(rows_to_insert, columns=columns)
+                        client.insert_df(f"{self.database}.{dataset}", df)
+                        
+                        fixed_count += len(rows_to_insert)
+                        logger.debug(f"Fixed chunk {offset//chunk_size + 1}: {len(rows_to_insert)} rows")
                 
-                client.command(update_query)
-                
-                # Wait for mutation to complete
-                time.sleep(0.5)
-                
-                # Count how many were actually fixed
-                count_query = f"""
-                SELECT COUNT(*) 
-                FROM {self.database}.{dataset}
-                WHERE block_number >= {current_block}
-                  AND block_number < {chunk_end}
-                  AND block_timestamp != '1970-01-01 00:00:00'
-                """
-                
-                result = client.query(count_query)
-                chunk_fixed = result.result_rows[0][0] if result.result_rows else 0
-                fixed_count += chunk_fixed
-                
-                logger.debug(f"Fixed {chunk_fixed} timestamps in chunk {current_block}-{chunk_end}")
-                
-                current_block = chunk_end
-                
-            return fixed_count
+                return fixed_count
+            
+            return 0
             
         except Exception as e:
             logger.error(f"Error fixing timestamps: {e}")

@@ -6,9 +6,16 @@ echo "Cryo Indexer Configuration:"
 echo "=========================="
 echo "Network: ${NETWORK_NAME:-gnosis}"
 echo "Operation: ${OPERATION:-continuous}"
-echo "Mode: ${MODE:-default}"
+echo "Mode: ${MODE:-minimal}"
 echo "Workers: ${WORKERS:-1}"
 echo "Batch Size: ${BATCH_SIZE:-1000}"
+
+# Validate MODE parameter
+if [[ "${MODE}" != "minimal" && "${MODE}" != "extra" && "${MODE}" != "diffs" && "${MODE}" != "full" && "${MODE}" != "custom" ]]; then
+    echo "WARNING: Invalid MODE '${MODE}'. Valid options are: minimal, extra, diffs, full, custom"
+    echo "Setting MODE to 'minimal'"
+    export MODE="minimal"
+fi
 
 if [ "${OPERATION}" = "historical" ]; then
     echo "Start Block: ${START_BLOCK}"

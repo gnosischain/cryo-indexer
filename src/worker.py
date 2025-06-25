@@ -39,6 +39,20 @@ class IndexerWorker:
         self.mode = mode
         self.batch_id = batch_id
         
+        # Define priority order for datasets
+        self.dataset_priority = {
+            'blocks': 0,
+            'transactions': 1,
+            'logs': 2,
+            'contracts': 3,
+            'native_transfers': 4,
+            'traces': 5,
+            'balance_diffs': 6,
+            'code_diffs': 7,
+            'nonce_diffs': 8,
+            'storage_diffs': 9
+        }
+        
         # Create worker-specific data directory
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(os.path.join(self.data_dir, ".cryo", "reports"), exist_ok=True)
@@ -46,10 +60,29 @@ class IndexerWorker:
         logger.info(f"Worker {worker_id} initialized for mode {mode}")
     
     def _verify_blocks_exist(self, start_block: int, end_block: int) -> bool:
-        """Check if all blocks in range exist in database with valid timestamps."""
+        """
+        Check if all blocks in range exist in database with valid timestamps.
+        Looks for blocks indexed by ANY mode, not just the current mode.
+        """
         try:
             client = self.clickhouse._connect()
-            query = f"""
+            
+            # First check if the range is marked as completed in indexing_state for ANY mode
+            state_query = f"""
+            SELECT COUNT(*) 
+            FROM {self.clickhouse.database}.indexing_state
+            WHERE dataset = 'blocks'
+              AND start_block = {start_block}
+              AND end_block = {end_block}
+              AND status = 'completed'
+            """
+            state_result = client.query(state_query)
+            if state_result.result_rows[0][0] > 0:
+                logger.debug(f"Blocks {start_block}-{end_block} marked as completed in indexing_state")
+                return True
+            
+            # Otherwise check the blocks table directly
+            blocks_query = f"""
             SELECT COUNT(DISTINCT block_number) as count
             FROM {self.clickhouse.database}.blocks
             WHERE block_number >= {start_block} 
@@ -57,19 +90,40 @@ class IndexerWorker:
               AND timestamp IS NOT NULL
               AND timestamp > 0
             """
-            result = client.query(query)
+            blocks_result = client.query(blocks_query)
             expected_blocks = end_block - start_block
-            actual_blocks = result.result_rows[0][0] if result.result_rows else 0
+            actual_blocks = blocks_result.result_rows[0][0] if blocks_result.result_rows else 0
             
-            if actual_blocks < expected_blocks:
-                logger.warning(
-                    f"Missing blocks: found {actual_blocks}/{expected_blocks} blocks "
-                    f"in range {start_block}-{end_block}"
-                )
-                
-            return actual_blocks == expected_blocks
+            # Return true only if all blocks are present
+            if actual_blocks == expected_blocks:
+                logger.debug(f"All {expected_blocks} blocks found in database for range {start_block}-{end_block}")
+                return True
+            
+            logger.warning(
+                f"Missing blocks: found {actual_blocks}/{expected_blocks} blocks "
+                f"in range {start_block}-{end_block}"
+            )
+            return False
         except Exception as e:
             logger.error(f"Error verifying blocks: {e}")
+            return False
+    
+    def _check_if_blocks_being_processed(self, start_block: int, end_block: int) -> bool:
+        """Check if blocks are currently being processed by another worker."""
+        try:
+            client = self.clickhouse._connect()
+            query = f"""
+            SELECT COUNT(*) 
+            FROM {self.clickhouse.database}.indexing_state
+            WHERE dataset = 'blocks'
+              AND start_block = {start_block}
+              AND end_block = {end_block}
+              AND status = 'processing'
+            """
+            result = client.query(query)
+            return result.result_rows[0][0] > 0
+        except Exception as e:
+            logger.error(f"Error checking if blocks are being processed: {e}")
             return False
     
     def process_range(
@@ -80,7 +134,7 @@ class IndexerWorker:
         force: bool = False
     ) -> bool:
         """
-        Process a block range for the given datasets.
+        Process a block range for the given datasets, ensuring blocks are available for timestamps.
         
         Args:
             start_block: Starting block number
@@ -95,46 +149,62 @@ class IndexerWorker:
             # Define diff datasets that need special handling
             diff_datasets = ['balance_diffs', 'code_diffs', 'nonce_diffs', 'storage_diffs']
             
-            # Check if we need blocks first (unless we're processing blocks)
-            if 'blocks' not in datasets and not self._verify_blocks_exist(start_block, end_block):
-                if settings.strict_timestamp_mode:
-                    logger.error(
-                        f"Cannot process {datasets} without blocks {start_block}-{end_block}. "
-                        f"Blocks must be indexed first in strict mode."
-                    )
-                    return False
-                else:
-                    logger.warning(
-                        f"Blocks {start_block}-{end_block} not fully available. "
-                        f"Processing anyway, but timestamps may be incorrect."
-                    )
+            # Sort datasets by priority
+            sorted_datasets = sorted(datasets, key=lambda d: self.dataset_priority.get(d, 999))
             
-            # In force mode, process blocks first if not already done
-            if force and 'blocks' not in datasets and not self._verify_blocks_exist(start_block, end_block):
-                logger.info(f"Force mode: Processing blocks first for range {start_block}-{end_block}")
+            # Skip blocks check if already processing blocks
+            if 'blocks' not in sorted_datasets:
+                # Check if blocks are already indexed for this range
+                blocks_exist = self._verify_blocks_exist(start_block, end_block)
                 
-                # Process blocks first
-                if not self._process_dataset_range(start_block, end_block, ['blocks']):
-                    logger.error(f"Failed to process blocks {start_block}-{end_block}")
-                    if settings.strict_timestamp_mode:
-                        return False
+                if not blocks_exist:
+                    logger.info(f"Worker {self.worker_id}: Blocks {start_block}-{end_block} not found in database, indexing blocks first")
+                    
+                    # Check if blocks are already being processed by another worker
+                    if self._check_if_blocks_being_processed(start_block, end_block):
+                        logger.info(f"Worker {self.worker_id}: Blocks {start_block}-{end_block} are being processed by another worker, waiting...")
+                        
+                        # Wait for blocks to be processed (with timeout)
+                        max_wait_seconds = 300  # 5 minutes
+                        wait_interval = 10  # 10 seconds
+                        waited_time = 0
+                        
+                        while waited_time < max_wait_seconds:
+                            time.sleep(wait_interval)
+                            waited_time += wait_interval
+                            
+                            # Check if blocks are now available
+                            if self._verify_blocks_exist(start_block, end_block):
+                                logger.info(f"Worker {self.worker_id}: Blocks {start_block}-{end_block} now available, continuing with processing")
+                                break
+                        
+                        # If we waited the maximum time and blocks are still not available, process them ourselves
+                        if not self._verify_blocks_exist(start_block, end_block):
+                            logger.warning(f"Worker {self.worker_id}: Timeout waiting for blocks {start_block}-{end_block}, processing them now")
+                            if not self._process_blocks_only(start_block, end_block):
+                                return False
+                    else:
+                        # Claim and process blocks ourselves
+                        if not self._process_blocks_only(start_block, end_block):
+                            logger.error(f"Worker {self.worker_id}: Failed to process blocks {start_block}-{end_block}")
+                            return False
             
             # In force mode, just process everything without checking
             if force:
-                logger.info(f"Worker {self.worker_id}: Force processing {start_block}-{end_block} for datasets: {datasets}")
+                logger.info(f"Worker {self.worker_id}: Force processing {start_block}-{end_block} for datasets: {sorted_datasets}")
                 
                 # Clean data directory
                 self._clean_data_directory()
                 
                 # Extract all datasets at once
                 logger.info(f"Worker {self.worker_id}: Extracting all datasets for blocks {start_block}-{end_block}")
-                self._run_cryo(start_block, end_block, datasets)
+                self._run_cryo(start_block, end_block, sorted_datasets)
                 
                 # Load data to ClickHouse
-                total_rows = self._load_to_clickhouse(datasets)
+                total_rows = self._load_to_clickhouse(sorted_datasets)
                 
                 # Mark as completed in the state
-                for dataset in datasets:
+                for dataset in sorted_datasets:
                     # Adjust start block for diff datasets when recording in state
                     dataset_start = start_block
                     if dataset in diff_datasets and start_block == 0:
@@ -148,32 +218,8 @@ class IndexerWorker:
                 return True
             
             # Non-force mode: check and claim ranges
-            # Split datasets into blocks and others
-            blocks_dataset = ['blocks'] if 'blocks' in datasets else []
-            other_datasets = [d for d in datasets if d != 'blocks']
-            
-            # Always process blocks first if included
-            if blocks_dataset:
-                # Check if blocks are already processed
-                if not self.state_manager.should_process_range(
-                    self.mode, 'blocks', start_block, end_block
-                ):
-                    logger.info(f"Worker {self.worker_id}: Blocks {start_block}-{end_block} already completed")
-                else:
-                    # Claim and process blocks
-                    if self.state_manager.claim_range(
-                        self.mode, 'blocks', start_block, end_block, 
-                        self.worker_id, self.batch_id
-                    ):
-                        logger.info(f"Worker {self.worker_id}: Processing blocks {start_block}-{end_block}")
-                        if not self._process_dataset_range(start_block, end_block, blocks_dataset):
-                            return False
-                    else:
-                        logger.warning(f"Worker {self.worker_id}: Could not claim blocks range {start_block}-{end_block}")
-                        return True  # Someone else is processing it
-            
-            # Now process other datasets
-            for dataset in other_datasets:
+            # Process datasets in priority order
+            for dataset in sorted_datasets:
                 # Adjust start block for diff datasets
                 dataset_start = start_block
                 if dataset in diff_datasets and start_block == 0:
@@ -229,6 +275,55 @@ class IndexerWorker:
             
             return False
     
+    def _process_blocks_only(self, start_block: int, end_block: int) -> bool:
+        """Process only the blocks dataset for a range."""
+        # Check if blocks exist in ANY mode first (global check)
+        if self._verify_blocks_exist(start_block, end_block):
+            # Blocks exist in another mode, just mark them as completed for this mode too
+            logger.info(f"Worker {self.worker_id}: Blocks {start_block}-{end_block} found in database, marking as completed for mode {self.mode}")
+            self.state_manager.complete_range(
+                self.mode, 'blocks', start_block, end_block, 0  # 0 rows as we didn't process any
+            )
+            return True
+        
+        # Try to claim the range for blocks
+        if not self.state_manager.claim_range(
+            self.mode, 'blocks', start_block, end_block, self.worker_id, self.batch_id
+        ):
+            logger.warning(f"Worker {self.worker_id}: Could not claim blocks range {start_block}-{end_block}")
+            # Someone else might be processing it, wait and check
+            time.sleep(5)
+            return self._verify_blocks_exist(start_block, end_block)
+        
+        logger.info(f"Worker {self.worker_id}: Processing blocks {start_block}-{end_block} for timestamp data")
+        
+        try:
+            # Clean data directory
+            self._clean_data_directory()
+            
+            # Extract only blocks data
+            logger.info(f"Worker {self.worker_id}: Extracting blocks for range {start_block}-{end_block}")
+            self._run_cryo(start_block, end_block, ['blocks'])
+            
+            # Load data to ClickHouse
+            total_rows = self._load_to_clickhouse(['blocks'])
+            
+            # Mark as completed
+            self.state_manager.complete_range(
+                self.mode, 'blocks', start_block, end_block, total_rows
+            )
+            
+            logger.info(f"Worker {self.worker_id}: Successfully processed blocks {start_block}-{end_block} ({total_rows} rows)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Worker {self.worker_id}: Error processing blocks {start_block}-{end_block}: {e}", exc_info=True)
+            self.state_manager.fail_range(
+                self.mode, 'blocks', start_block, end_block, 
+                f"Error processing blocks: {str(e)[:500]}"
+            )
+            return False
+    
     def _process_dataset_range(
         self,
         start_block: int,
@@ -237,6 +332,14 @@ class IndexerWorker:
     ) -> bool:
         """Process a specific dataset range."""
         try:
+            # For blocks dataset, check if already indexed by any mode
+            if 'blocks' in datasets and self._verify_blocks_exist(start_block, end_block):
+                logger.info(f"Worker {self.worker_id}: Blocks {start_block}-{end_block} already exist, marking as completed")
+                self.state_manager.complete_range(
+                    self.mode, 'blocks', start_block, end_block, 0
+                )
+                return True
+            
             # Clean data directory
             self._clean_data_directory()
             

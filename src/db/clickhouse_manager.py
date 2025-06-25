@@ -199,8 +199,8 @@ class ClickHouseManager:
                 SELECT block_number, timestamp 
                 FROM {self.database}.blocks 
                 WHERE block_number IN ({blocks_str})
-                  AND timestamp IS NOT NULL
-                  AND timestamp > 0
+                AND timestamp IS NOT NULL
+                AND timestamp > 0
                 """
                 result = client.query(query)
                 
@@ -228,24 +228,30 @@ class ClickHouseManager:
                     self._record_timestamp_issues(table_name, missing_blocks)
             
             # Map block numbers to timestamps
-            # IMPORTANT: Use None for missing blocks, not timestamp 0
-            df['block_timestamp'] = df['block_number'].map(
+            # Use an epoch timestamp if the block timestamp is missing
+            default_timestamp = pd.Timestamp.fromtimestamp(0)  # 1970-01-01 00:00:00
+            
+            df['block_timestamp'] = df['block_number'].apply(
                 lambda x: pd.Timestamp.fromtimestamp(block_timestamps.get(x, 0)) 
-                if pd.notna(x) and x in block_timestamps else None
+                if pd.notna(x) and x in block_timestamps else default_timestamp
             )
             
             # Log statistics
-            null_timestamps = df['block_timestamp'].isna().sum()
-            if null_timestamps > 0:
+            default_timestamps = (df['block_timestamp'] == default_timestamp).sum()
+            if default_timestamps > 0:
                 logger.warning(
-                    f"{table_name}: {null_timestamps} rows will have NULL timestamps "
+                    f"{table_name}: {default_timestamps} rows will have default timestamps "
                     f"due to missing block data"
                 )
                 
         except Exception as e:
             logger.error(f"Error adding timestamp columns: {e}")
-            # Don't fail the entire import, but log the issue
-            if hasattr(settings, 'strict_timestamp_mode') and settings.strict_timestamp_mode:
+            # In non-strict mode, use default timestamp for all rows
+            if not (hasattr(settings, 'strict_timestamp_mode') and settings.strict_timestamp_mode):
+                default_timestamp = pd.Timestamp.fromtimestamp(0)
+                df['block_timestamp'] = default_timestamp
+                logger.warning(f"Using default timestamp for all rows in {table_name} due to error")
+            else:
                 raise
     
     def _record_timestamp_issues(self, table_name: str, missing_blocks: List[int]):

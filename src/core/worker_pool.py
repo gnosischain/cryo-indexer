@@ -151,7 +151,7 @@ class WorkerThread(threading.Thread):
                 work_item.start_block,
                 work_item.end_block,
                 work_item.datasets,
-                force=True  # Force processing in historical mode
+                force=False
             )
             
             duration = time.time() - start_time

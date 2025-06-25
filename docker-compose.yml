@@ -1,102 +1,153 @@
-services:
-  cryo-indexer:
-    image: cryo-indexer:latest
-    container_name: cryo-indexer-${OPERATION:-continuous}
-    volumes:
-      - indexer_data:/app/data
-      - indexer_logs:/app/logs
-      - ./migrations:/app/migrations
-    environment:
-      # Core settings
-      - ETH_RPC_URL=${ETH_RPC_URL}
-      - NETWORK_NAME=${NETWORK_NAME:-ethereum}
-      
-      # ClickHouse settings
-      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
-      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
-      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
-      - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE:-blockchain}
-      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8443}
-      - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE:-true}
-      
-      # Operation settings
-      - OPERATION=${OPERATION:-continuous}  # continuous, historical, fill_gaps, validate, backfill, fix_timestamps
-      - MODE=${MODE:-default}               # default, minimal, full, custom
-      
-      # Block range (for historical/fill_gaps/backfill)
-      - START_BLOCK=${START_BLOCK:-0}
-      - END_BLOCK=${END_BLOCK:-0}
-      
-      # Performance settings
-      - WORKERS=${WORKERS:-1}
-      - BATCH_SIZE=${BATCH_SIZE:-1000}
-      - MAX_RETRIES=${MAX_RETRIES:-3}
-      
-      # Fixed range size for indexing (NEW!)
-      - INDEXING_RANGE_SIZE=${INDEXING_RANGE_SIZE:-1000}
-      
-      # Cryo performance settings
-      - REQUESTS_PER_SECOND=${REQUESTS_PER_SECOND:-50}
-      - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-5}
-      - CRYO_TIMEOUT=${CRYO_TIMEOUT:-300}
-      
-      # Continuous mode settings
-      - CONFIRMATION_BLOCKS=${CONFIRMATION_BLOCKS:-12}
-      - POLL_INTERVAL=${POLL_INTERVAL:-10}
-      
-      # Backfill settings
-      - BACKFILL_BATCH_SIZE=${BACKFILL_BATCH_SIZE:-1000}
-      - BACKFILL_CHUNK_SIZE=${BACKFILL_CHUNK_SIZE:-100000}
-      - BACKFILL_FORCE=${BACKFILL_FORCE:-false}
-      
-      # Gap detection settings
-      - GAP_DETECTION_STATE_CHUNK_SIZE=${GAP_DETECTION_STATE_CHUNK_SIZE:-100000}
-      - GAP_DETECTION_TABLE_CHUNK_SIZE=${GAP_DETECTION_TABLE_CHUNK_SIZE:-10000}
-      - GAP_DETECTION_THRESHOLD=${GAP_DETECTION_THRESHOLD:-0.8}
-      
-      # Timestamp fix settings
-      - TIMESTAMP_FIX_BATCH_SIZE=${TIMESTAMP_FIX_BATCH_SIZE:-100000}
-      - STRICT_TIMESTAMP_MODE=${STRICT_TIMESTAMP_MODE:-false}
-      
-      # Custom datasets (optional)
-      - DATASETS=${DATASETS:-}
-      
-      # Logging
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      
-    restart: ${RESTART_POLICY:-unless-stopped}
-    
-    deploy:
-      resources:
-        limits:
-          memory: ${MEMORY_LIMIT:-4G}
-          cpus: ${CPU_LIMIT:-2}
-        reservations:
-          memory: ${MEMORY_RESERVATION:-2G}
-          cpus: ${CPU_RESERVATION:-1}
+# --------------------------------------------------------------------------
+# 0. Anchors / extension fields
+# --------------------------------------------------------------------------
+x-indexer-env: &indexer-env
+  ETH_RPC_URL:  ${ETH_RPC_URL}
+  NETWORK_NAME: ${NETWORK_NAME:-ethereum}
 
-  # Migration service - runs once and exits
+  CLICKHOUSE_HOST:     ${CLICKHOUSE_HOST}
+  CLICKHOUSE_USER:     ${CLICKHOUSE_USER}
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+  CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-blockchain}
+  CLICKHOUSE_PORT:     ${CLICKHOUSE_PORT:-8443}
+  CLICKHOUSE_SECURE:   ${CLICKHOUSE_SECURE:-true}
+
+  WORKERS:                 ${WORKERS:-1}
+  BATCH_SIZE:              ${BATCH_SIZE:-1000}
+  MAX_RETRIES:             ${MAX_RETRIES:-3}
+  INDEXING_RANGE_SIZE:     ${INDEXING_RANGE_SIZE:-1000}
+  REQUESTS_PER_SECOND:     ${REQUESTS_PER_SECOND:-50}
+  MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-5}
+  CRYO_TIMEOUT:            ${CRYO_TIMEOUT:-300}
+
+  START_BLOCK:             ${START_BLOCK:-0}
+  END_BLOCK:               ${END_BLOCK:-0}
+  CONFIRMATION_BLOCKS: ${CONFIRMATION_BLOCKS:-12}
+  POLL_INTERVAL:       ${POLL_INTERVAL:-10}
+
+  BACKFILL_CHUNK_SIZE:    ${BACKFILL_CHUNK_SIZE:-100000}
+  BACKFILL_FORCE:         ${BACKFILL_FORCE:-false}
+  GAP_DETECTION_STATE_CHUNK_SIZE:  ${GAP_DETECTION_STATE_CHUNK_SIZE:-100000}
+  GAP_DETECTION_TABLE_CHUNK_SIZE:  ${GAP_DETECTION_TABLE_CHUNK_SIZE:-10000}
+  GAP_DETECTION_THRESHOLD:         ${GAP_DETECTION_THRESHOLD:-0.8}
+  TIMESTAMP_FIX_BATCH_SIZE:        ${TIMESTAMP_FIX_BATCH_SIZE:-100000}
+  STRICT_TIMESTAMP_MODE:           ${STRICT_TIMESTAMP_MODE:-false}
+
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-indexer-resources: &resources
+  deploy:
+    resources:
+      limits:
+        memory: ${MEMORY_LIMIT:-4G}
+        cpus:   ${CPU_LIMIT:-2}
+      reservations:
+        memory: ${MEMORY_RESERVATION:-2G}
+        cpus:   ${CPU_RESERVATION:-1}
+
+# --------------------------------------------------------------------------
+# 1. Volumes
+# --------------------------------------------------------------------------
+volumes:
+  indexer_data_minimal:
+  indexer_logs_minimal:
+  indexer_data_extra:
+  indexer_logs_extra:
+  indexer_data_diffs:
+  indexer_logs_diffs:
+  indexer_data_full:
+  indexer_logs_full:
+  indexer_data_custom:
+  indexer_logs_custom:
+
+# --------------------------------------------------------------------------
+# 2. Services
+# --------------------------------------------------------------------------
+services:
+  cryo-indexer-minimal:
+    image: cryo-indexer:latest
+    container_name: cryo-indexer-minimal
+    restart: ${RESTART_POLICY:-unless-stopped}
+    environment:
+      <<: *indexer-env
+      MODE: minimal
+      OPERATION: ${OPERATION:-continuous}
+    volumes:
+      - indexer_data_minimal:/app/data
+      - indexer_logs_minimal:/app/logs
+      - ./migrations:/app/migrations
+    <<: *resources
+
+  cryo-indexer-extra:
+    image: cryo-indexer:latest
+    container_name: cryo-indexer-extra
+    restart: ${RESTART_POLICY:-unless-stopped}
+    environment:
+      <<: *indexer-env
+      MODE: extra
+      OPERATION: ${OPERATION:-continuous}
+    volumes:
+      - indexer_data_extra:/app/data
+      - indexer_logs_extra:/app/logs
+      - ./migrations:/app/migrations
+    <<: *resources
+
+  cryo-indexer-diffs:
+    image: cryo-indexer:latest
+    container_name: cryo-indexer-diffs
+    restart: ${RESTART_POLICY:-unless-stopped}
+    environment:
+      <<: *indexer-env
+      MODE: diffs
+      OPERATION: ${OPERATION:-continuous}
+    volumes:
+      - indexer_data_diffs:/app/data
+      - indexer_logs_diffs:/app/logs
+      - ./migrations:/app/migrations
+    <<: *resources
+
+  cryo-indexer-full:
+    image: cryo-indexer:latest
+    container_name: cryo-indexer-full
+    restart: ${RESTART_POLICY:-unless-stopped}
+    environment:
+      <<: *indexer-env
+      MODE: full
+      OPERATION: ${OPERATION:-continuous}
+    volumes:
+      - indexer_data_full:/app/data
+      - indexer_logs_full:/app/logs
+      - ./migrations:/app/migrations
+    <<: *resources
+
+  cryo-indexer-custom:
+    image: cryo-indexer:latest
+    container_name: cryo-indexer-custom
+    restart: ${RESTART_POLICY:-unless-stopped}
+    environment:
+      <<: *indexer-env
+      MODE: custom            # let your Settings class look at DATASETS
+      DATASETS: ${DATASETS:-blocks,transactions,logs,traces}
+      OPERATION: ${OPERATION:-continuous}
+    volumes:
+      - indexer_data_custom:/app/data
+      - indexer_logs_custom:/app/logs
+      - ./migrations:/app/migrations
+    <<: *resources
+
+  # Optional one-shot migration job
   migrations:
     image: cryo-indexer:latest
     container_name: cryo-migrations-${TIMESTAMP:-default}
+    profiles: ["migrations"]        # only runs when requested
+    entrypoint: ["python", "-m", "src", "migrations"]
+    environment:
+      CLICKHOUSE_HOST:     ${CLICKHOUSE_HOST}
+      CLICKHOUSE_USER:     ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-blockchain}
+      CLICKHOUSE_PORT:     ${CLICKHOUSE_PORT:-8443}
+      CLICKHOUSE_SECURE:   ${CLICKHOUSE_SECURE:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ./migrations:/app/migrations
-    environment:
-      # ClickHouse settings (same as above)
-      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
-      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
-      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
-      - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE:-blockchain}
-      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-8443}
-      - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE:-true}
-      
-      # Logging
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    
-    entrypoint: ["python", "-m", "src", "migrations"]
-    restart: "no"
-    profiles: ["migrations"]  # Only runs when explicitly requested
-
-volumes:
-  indexer_data:
-  indexer_logs:

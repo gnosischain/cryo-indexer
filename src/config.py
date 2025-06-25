@@ -6,8 +6,9 @@ from enum import Enum
 
 class IndexMode(Enum):
     """Simplified indexing modes."""
-    DEFAULT = "default"      # blocks, transactions, logs
-    MINIMAL = "minimal"      # blocks only
+    MINIMAL = "minimal"     # "blocks", "transactions", "logs"
+    EXTRA = "extra"         # "contracts", "native_transfers", "traces"
+    DIFFS = "diffs"         # "balance_diffs", "code_diffs", "nonce_diffs", "storage_diffs"
     FULL = "full"           # all datasets
     CUSTOM = "custom"       # user-defined datasets
     
@@ -40,7 +41,13 @@ class IndexerSettings:
         
         # Operation settings
         self.operation = OperationType(os.environ.get("OPERATION", "continuous").lower())
-        self.mode = IndexMode(os.environ.get("MODE", "default").lower())
+        mode_str = os.environ.get("MODE", "minimal").lower()
+        # Ensure mode is a valid enum value
+        try:
+            self.mode = IndexMode(mode_str)
+        except ValueError:
+            logger.warning(f"Invalid mode: {mode_str}, defaulting to 'minimal'")
+            self.mode = IndexMode.MINIMAL
         
         # Block range settings
         self.start_block = int(os.environ.get("START_BLOCK", "0"))
@@ -92,19 +99,19 @@ class IndexerSettings:
         """Get datasets based on mode."""
         # Check for custom datasets first
         custom_datasets = os.environ.get("DATASETS", "")
-        if custom_datasets:
+        if custom_datasets and self.mode == IndexMode.CUSTOM:
             return [d.strip() for d in custom_datasets.split(",")]
             
         # Otherwise use mode defaults
         mode_datasets = {
-            IndexMode.DEFAULT: ["blocks", "transactions", "logs"],
-            IndexMode.MINIMAL: ["blocks"],
+            IndexMode.MINIMAL: ["blocks", "transactions", "logs"],
+            IndexMode.EXTRA: ["contracts", "native_transfers", "traces"],
+            IndexMode.DIFFS: ["balance_diffs", "code_diffs", "nonce_diffs", "storage_diffs"],
             IndexMode.FULL: [
                 "blocks", "transactions", "logs", "contracts", 
                 "native_transfers", "traces", "balance_diffs", 
                 "code_diffs", "nonce_diffs", "storage_diffs"
-            ],
-            IndexMode.CUSTOM: ["blocks", "transactions", "logs"]
+            ]
         }
         
         return mode_datasets.get(self.mode, ["blocks", "transactions", "logs"])
