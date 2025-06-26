@@ -54,6 +54,7 @@ Understanding when to use each operation is crucial for efficient blockchain dat
 | **`fill-gaps`** | Fix missing data | Smart gap detection in your database | After crashes, network issues, maintenance |
 | **`validate`** | Check data integrity | Analyzes completeness and reports issues | Health checks, troubleshooting |
 | **`backfill`** | Create state tracking | Scans existing data tables | Migrating from other indexers, corrupted state |
+| **`fix-timestamps`** | Fix incorrect timestamps | Finds and fixes '1970-01-01' timestamps | After importing data with missing block timestamps |
 
 ### Operation Decision Tree
 
@@ -77,6 +78,9 @@ What do you need to do?
 │   └─ Use: backfill (creates state tracking)
 └─ Data has gaps/holes?
     └─ Use: fill-gaps (finds and fills missing data)
+
+🕐 Have incorrect timestamps?
+└─ Use: fix-timestamps (corrects '1970-01-01' timestamps)
 ```
 
 ### Key Differences: Fill-Gaps vs Historical vs Backfill
@@ -117,7 +121,8 @@ cryo-indexer/
 │   ├── 009_create_code_diffs.sql
 │   ├── 010_create_nonce_diffs.sql
 │   ├── 011_create_storage_diffs.sql
-│   └── 012_create_indexing_state.sql
+│   ├── 012_create_indexing_state.sql
+│   └── 013_create_timestamp_fixes.sql
 ├── requirements.txt               # Python dependencies
 ├── scripts/
 │   └── entrypoint.sh             # Container entrypoint script
@@ -128,6 +133,7 @@ cryo-indexer/
 │   ├── indexer.py                # Main indexer orchestrator
 │   ├── worker.py                 # Individual worker implementation
 │   ├── backfill_worker.py        # Backfill operation worker
+│   ├── timestamp_fixer.py        # Timestamp fixing functionality
 │   ├── core/                     # Core functionality
 │   │   ├── __init__.py
 │   │   ├── blockchain.py         # Blockchain client for RPC calls
@@ -144,13 +150,15 @@ cryo-indexer/
 ## Key Features
 
 - **Stateless**: All state stored in ClickHouse, no local state files
-- **Simple**: Just 5 operation modes, 4 indexing modes
+- **Simple**: Just 6 operation modes, 5 indexing modes
 - **Scalable**: Built-in parallel processing support
 - **Robust**: Automatic retry and gap detection
+- **Self-Healing**: Automatic recovery from stuck 'processing' jobs
 - **Cloud-Ready**: Optimized for ClickHouse Cloud with minimal RAM usage
 - **Configurable**: Extensive environment variable configuration
 - **Resume-Safe**: Can safely restart and resume indexing from any point
 - **Migration-Friendly**: Backfill operation for existing data
+- **Deduplication**: Delete-before-insert strategy prevents duplicates
 
 ## Architecture
 
@@ -172,13 +180,14 @@ cryo-indexer/
 1. **Main Indexer** (`indexer.py`) orchestrates the entire process
 2. **Workers** (`worker.py`) process individual block ranges using Cryo
 3. **Backfill Worker** (`backfill_worker.py`) analyzes existing data and creates state entries
-4. **State Manager** (`state_manager.py`) tracks progress in ClickHouse with hybrid gap detection
+4. **State Manager** (`state_manager.py`) tracks progress in ClickHouse using indexing_state as single source of truth
 5. **Worker Pool** (`worker_pool.py`) manages parallel execution
-6. **ClickHouse Manager** handles all database operations
+6. **ClickHouse Manager** handles all database operations with delete-before-insert deduplication
+7. **Timestamp Fixer** (`timestamp_fixer.py`) corrects incorrect timestamps in data
 
 ## Operation Modes
 
-The indexer supports 5 distinct operation modes, each designed for specific use cases:
+The indexer supports 6 distinct operation modes, each designed for specific use cases:
 
 ### 1. Continuous (Default)
 **Real-time blockchain following and indexing**
@@ -189,6 +198,7 @@ The indexer supports 5 distinct operation modes, each designed for specific use 
 - Waits `CONFIRMATION_BLOCKS` (default: 12) before indexing to avoid reorgs
 - Automatically resumes from last indexed block on restart
 - Handles chain reorganizations gracefully
+- Periodically resets stale 'processing' jobs
 
 **When to Use**:
 - ✅ Production systems requiring up-to-date blockchain data
@@ -221,7 +231,7 @@ make continuous START_BLOCK=18000000
 - Supports parallel processing with multiple workers
 - Automatically divides work into optimal batch sizes
 - Provides progress tracking and ETA calculations
-- May overwrite existing data in the specified range
+- Uses delete-before-insert strategy to prevent duplicates
 
 **When to Use**:
 - ✅ Initial sync of blockchain data
@@ -254,10 +264,10 @@ make historical START_BLOCK=1000000 END_BLOCK=1100000 \
 **Use Case**: Data integrity maintenance and recovery  
 **Behavior**:
 - Analyzes `indexing_state` to identify missing block ranges automatically
-- Uses hybrid detection: checks database state first, falls back to actual table data
+- Finds ranges not marked as 'completed' in indexing_state
 - Only processes actually missing data (no unnecessary re-indexing)
 - Supports parallel gap filling
-- Skips already-indexed ranges automatically
+- Can also handle failed ranges with HANDLE_FAILED_RANGES=true
 
 **When to Use**:
 - ✅ After system failures or crashes
@@ -267,11 +277,10 @@ make historical START_BLOCK=1000000 END_BLOCK=1100000 \
 - ✅ You have partial data with scattered missing pieces
 - ✅ Don't know exactly which ranges are missing
 
-**Smart Detection**:
-The system uses intelligent gap detection:
-1. **Primary**: Checks `indexing_state` table (fast)
-2. **Fallback**: If 80%+ appears missing, checks actual table data
-3. **Hybrid**: Combines both methods for accuracy
+**Gap Detection**:
+The system uses the indexing_state table as the single source of truth:
+- Any range not marked as 'completed' is considered a gap
+- Failed, pending, or missing ranges are all treated as gaps to fill
 
 ```bash
 # Check and fill all gaps automatically
@@ -282,6 +291,9 @@ make fill-gaps START_BLOCK=1000000 END_BLOCK=2000000
 
 # Parallel gap filling
 make fill-gaps WORKERS=4
+
+# Also handle failed ranges
+make fill-gaps HANDLE_FAILED_RANGES=true
 ```
 
 ### 4. Validate
@@ -428,6 +440,34 @@ make backfill BACKFILL_FORCE=true START_BLOCK=40374070 END_BLOCK=40374470
 # 4. Now fill-gaps will correctly detect the missing range
 ```
 
+### 6. Fix Timestamps
+**Correct incorrect timestamps in blockchain data**
+
+**Use Case**: Fixing data with '1970-01-01 00:00:00' timestamps  
+**Behavior**:
+- Scans all tables for rows with incorrect timestamps
+- Joins with blocks table to get correct timestamps
+- Updates affected rows using delete-and-reinsert approach
+- Works in batches for memory efficiency
+- Reports detailed statistics
+
+**When to Use**:
+- ✅ After importing data without proper timestamps
+- ✅ When blocks were indexed separately from other data
+- ✅ Fixing legacy data issues
+- ✅ After partial imports that missed timestamp data
+
+```bash
+# Fix all affected datasets
+make fix-timestamps
+
+# The operation will:
+# 1. Find all datasets with bad timestamps
+# 2. Fix them by joining with blocks table
+# 3. Verify the fixes
+# 4. Report results
+```
+
 ## Indexing Modes
 
 Choose what blockchain data to extract and index:
@@ -436,12 +476,13 @@ Choose what blockchain data to extract and index:
 
 | Mode | Datasets | Use Case | Performance | Storage (per 1M blocks) |
 |------|----------|-----------|-------------|-------------------------|
-| **Minimal** | `blocks` | Block-level analysis, lightweight | Fastest | ~5GB |
-| **Default** | `blocks`, `transactions`, `logs` | Standard DeFi/DApp analysis | Fast | ~50GB |
-| **Full** | All 10 datasets including traces & state diffs | Complete research & analysis | Slowest | ~500GB |
+| **Minimal** | `blocks`, `transactions`, `logs` | Standard DeFi/DApp analysis | Fast | ~50GB |
+| **Extra** | `contracts`, `native_transfers`, `traces` | Additional contract & trace data | Moderate | ~100GB |
+| **Diffs** | `balance_diffs`, `code_diffs`, `nonce_diffs`, `storage_diffs` | State change analysis | Slow | ~200GB |
+| **Full** | All 10 datasets | Complete blockchain analysis | Slowest | ~500GB |
 | **Custom** | User-defined | Tailored to specific needs | Variable | Variable |
 
-### Default Mode
+### Minimal Mode (Default)
 **Standard DeFi/DApp analysis setup**
 
 **Datasets**: `blocks`, `transactions`, `logs`  
@@ -452,33 +493,46 @@ Choose what blockchain data to extract and index:
 - Token transfer tracking
 
 ```bash
-make continuous MODE=default
+make continuous MODE=minimal
 ```
 
-### Minimal Mode
-**Block-level analysis only**
+### Extra Mode
+**Additional blockchain data**
 
-**Datasets**: `blocks`  
+**Datasets**: `contracts`, `native_transfers`, `traces`  
 **Perfect for**:
-- Block time analysis
-- Mining/validator monitoring
-- Network health metrics
-- Lightweight deployment
+- Contract deployment tracking
+- Native ETH transfers
+- Internal transaction analysis
+- MEV research
 
 ```bash
-make continuous MODE=minimal
+make continuous MODE=extra
+```
+
+### Diffs Mode
+**State change tracking**
+
+**Datasets**: `balance_diffs`, `code_diffs`, `nonce_diffs`, `storage_diffs`  
+**Perfect for**:
+- State analysis
+- Account balance tracking
+- Storage slot monitoring
+- Contract code changes
+
+```bash
+make continuous MODE=diffs
 ```
 
 ### Full Mode
 **Complete blockchain analysis**
 
-**Datasets**: `blocks`, `transactions`, `logs`, `contracts`, `native_transfers`, `traces`, `balance_diffs`, `code_diffs`, `nonce_diffs`, `storage_diffs`  
+**Datasets**: All 10 datasets  
 **Perfect for**:
-- MEV research
-- State analysis
 - Complete audit trails
 - Academic research
 - Forensic analysis
+- Comprehensive blockchain indexing
 
 ```bash
 make continuous MODE=full
@@ -489,13 +543,13 @@ make continuous MODE=full
 
 ```bash
 # MEV analysis
-make continuous DATASETS=blocks,transactions,logs,traces,native_transfers
+make continuous MODE=custom DATASETS=blocks,transactions,logs,traces,native_transfers
 
 # Contract focus
-make continuous DATASETS=blocks,transactions,contracts
+make continuous MODE=custom DATASETS=blocks,transactions,contracts
 
 # State tracking
-make continuous DATASETS=blocks,balance_diffs,storage_diffs
+make continuous MODE=custom DATASETS=blocks,balance_diffs,storage_diffs
 ```
 
 ## Configuration
@@ -517,8 +571,8 @@ All configuration is done through environment variables. Create a `.env` file or
 ### Operation Settings
 | Variable | Description | Default | Options |
 |----------|-------------|---------|---------|
-| `OPERATION` | Operation mode | continuous | continuous, historical, fill_gaps, validate, backfill |
-| `MODE` | Indexing mode | default | default, minimal, full, custom |
+| `OPERATION` | Operation mode | continuous | continuous, historical, fill_gaps, validate, backfill, fix_timestamps |
+| `MODE` | Indexing mode | minimal | minimal, extra, diffs, full, custom |
 | `START_BLOCK` | Starting block number | 0 | Any integer |
 | `END_BLOCK` | Ending block number | 0 | Any integer |
 
@@ -528,6 +582,7 @@ All configuration is done through environment variables. Create a `.env` file or
 | `WORKERS` | Number of parallel workers | 1 | Use 4-16 for historical |
 | `BATCH_SIZE` | Blocks per batch | 1000 | Reduce if memory issues |
 | `MAX_RETRIES` | Max retry attempts | 3 | Increase for unreliable RPCs |
+| `INDEXING_RANGE_SIZE` | Fixed range size for state tracking | 1000 | Ensures consistent state management |
 
 ### Cryo Performance Settings
 | Variable | Description | Default | Notes |
@@ -542,10 +597,20 @@ All configuration is done through environment variables. Create a `.env` file or
 | `CONFIRMATION_BLOCKS` | Blocks to wait for confirmation | 12 | Reorg protection |
 | `POLL_INTERVAL` | Polling interval (seconds) | 10 | How often to check for new blocks |
 
+### Stale Job Detection
+| Variable | Description | Default | Notes |
+|----------|-------------|---------|-------|
+| `STALE_JOB_TIMEOUT_MINUTES` | Minutes before 'processing' job is stale | 30 | Prevents stuck ranges |
+
+### Deduplication Settings
+| Variable | Description | Default | Notes |
+|----------|-------------|---------|-------|
+| `DELETE_BEFORE_REPROCESS` | Delete existing data before reprocessing | true | Prevents duplicates |
+| `DELETION_WAIT_TIME` | Seconds to wait after deletion | 1.0 | Ensures propagation |
+
 ### Backfill Settings
 | Variable | Description | Default | Notes |
 |----------|-------------|---------|-------|
-| `BACKFILL_BATCH_SIZE` | Size of indexing_state ranges to create | 1000 | Smaller = more granular tracking |
 | `BACKFILL_CHUNK_SIZE` | Size of chunks for scanning tables | 100000 | Larger = faster but more RAM |
 | `BACKFILL_FORCE` | Force recreation of existing entries | false | Deletes existing state before scanning |
 
@@ -555,6 +620,19 @@ All configuration is done through environment variables. Create a `.env` file or
 | `GAP_DETECTION_STATE_CHUNK_SIZE` | Chunk size for state-based gap detection | 100000 | Larger = faster but more memory |
 | `GAP_DETECTION_TABLE_CHUNK_SIZE` | Chunk size for table-based gap detection | 10000 | Smaller chunks for actual data scanning |
 | `GAP_DETECTION_THRESHOLD` | Threshold for switching to table-based detection | 0.8 | 0.8 = switch if 80%+ appears as gaps |
+
+### Enhanced Gap Filling
+| Variable | Description | Default | Notes |
+|----------|-------------|---------|-------|
+| `HANDLE_FAILED_RANGES` | Also reprocess failed ranges | false | Retry failed work |
+| `DELETE_FAILED_BEFORE_RETRY` | Delete failed entries before retry | false | Clean slate for retries |
+| `MAX_RETRIES_OVERRIDE` | Override MAX_RETRIES for gap filling | 0 | 0 = use MAX_RETRIES |
+
+### Timestamp Fix Settings
+| Variable | Description | Default | Notes |
+|----------|-------------|---------|-------|
+| `TIMESTAMP_FIX_BATCH_SIZE` | Batch size for fixing timestamps | 100000 | Memory vs speed tradeoff |
+| `STRICT_TIMESTAMP_MODE` | Fail if blocks aren't available | false | Ensures all timestamps fixed |
 
 ### Custom Dataset Settings
 | Variable | Description | Default | Example |
@@ -585,10 +663,11 @@ The indexer automatically creates these tables in ClickHouse:
 - **`storage_diffs`** - Contract storage changes
 
 ### Management Tables
-- **`indexing_state`** - Tracks what ranges have been indexed
+- **`indexing_state`** - Tracks what ranges have been indexed (single source of truth)
 - **`sync_position`** - Current sync position for continuous mode
 - **`indexing_progress`** - Aggregated progress view (materialized view)
 - **`migrations`** - Database migration tracking
+- **`timestamp_fixes`** - Tracks timestamp fix operations
 
 ## Running with Docker
 
@@ -611,7 +690,9 @@ NETWORK_NAME=ethereum
 CLICKHOUSE_DATABASE=blockchain
 WORKERS=4
 BATCH_SIZE=1000
-MODE=default
+MODE=minimal
+DELETE_BEFORE_REPROCESS=true
+STALE_JOB_TIMEOUT_MINUTES=30
 ```
 
 ### Build and Run
@@ -624,20 +705,42 @@ docker-compose build
 docker-compose --profile migrations up migrations
 
 # Start continuous indexing
-docker-compose up cryo-indexer
+docker-compose up cryo-indexer-minimal
 
-# Historical indexing
+# Historical indexing (one-shot job)
 OPERATION=historical START_BLOCK=18000000 END_BLOCK=18100000 \
-docker-compose up cryo-indexer
+docker-compose --profile historical up historical-job
 
 # Backfill existing data
-OPERATION=backfill docker-compose up cryo-indexer
+docker-compose --profile backfill up backfill-job
 
 # Fill gaps
-OPERATION=fill_gaps docker-compose up cryo-indexer
+docker-compose --profile fill-gaps up fill-gaps-job
 
 # Validate data
-OPERATION=validate docker-compose up cryo-indexer
+docker-compose --profile validate up validate-job
+
+# Fix timestamps
+docker-compose --profile fix-timestamps up fix-timestamps-job
+```
+
+### Running Different Modes
+```bash
+# Minimal mode (default)
+docker-compose up cryo-indexer-minimal
+
+# Extra mode (contracts, transfers, traces)
+docker-compose up cryo-indexer-extra
+
+# Diffs mode (state changes)
+docker-compose up cryo-indexer-diffs
+
+# Full mode (everything)
+docker-compose up cryo-indexer-full
+
+# Custom mode
+DATASETS=blocks,transactions,logs,traces \
+docker-compose up cryo-indexer-custom
 ```
 
 ## Running with Makefile
@@ -664,6 +767,7 @@ make historical START_BLOCK=1000000 END_BLOCK=2000000 WORKERS=8
 make fill-gaps      # Find and fill missing data
 make validate       # Check data completeness
 make backfill       # Populate state from existing data
+make fix-timestamps # Fix incorrect timestamps
 ```
 
 ### Quick Operations
@@ -695,21 +799,26 @@ make shell          # Open container shell
 All indexing state is stored in ClickHouse, making the indexer completely stateless:
 
 ### Indexing State Tracking
+- **Single Source of Truth**: The `indexing_state` table is the authoritative record
 - **Range Claiming**: Workers atomically claim block ranges to avoid duplicates
 - **Progress Tracking**: Real-time tracking of completed, processing, and failed ranges
 - **Retry Logic**: Failed ranges are automatically retried with backoff
-- **Stale Job Recovery**: Detects and recovers from crashed workers
+- **Stale Job Recovery**: Automatically recovers 'processing' jobs that are stuck
+
+### Stale Job Handling
+- **On Startup**: All 'processing' jobs are reset to 'pending'
+- **During Operation**: Jobs processing longer than `STALE_JOB_TIMEOUT_MINUTES` are reclaimed
+- **Self-Healing**: System automatically recovers from crashes and restarts
 
 ### Continuous Mode State
 - **Sync Position**: Tracks the last processed block for each dataset
 - **Reorg Detection**: Compares block hashes to detect chain reorganizations
 - **Safe Indexing**: Waits for confirmation blocks before processing
 
-### Hybrid Gap Detection
-- **Primary Method**: Checks `indexing_state` table (fast)
-- **Fallback Method**: Scans actual table data if most ranges appear missing
-- **Smart Logic**: Automatically chooses best method based on data completeness
-- **Memory Efficient**: Processes in chunks to handle large ranges
+### Gap Detection
+- **Simple Logic**: Any range not marked as 'completed' in `indexing_state` is a gap
+- **No Complex Verification**: Trusts the state table completely
+- **Efficient Processing**: Only processes what's actually missing
 
 ## Monitoring & Validation
 
@@ -753,6 +862,11 @@ blocks: No gaps found ✓
 transactions: 2 gaps found
   Gap 1: blocks 18124000-18125000 (1000 blocks)
   Gap 2: blocks 18120000-18121000 (1000 blocks)
+
+=== STALE JOBS ===
+
+Found 1 stale jobs:
+  logs: 18123000-18124000 (worker: thread_2)
 ```
 
 ### Real-time Monitoring
@@ -782,6 +896,7 @@ BATCH_SIZE=100              # Small batches for low latency
 REQUESTS_PER_SECOND=30      # Conservative for stability
 CONFIRMATION_BLOCKS=12      # Standard for most networks
 POLL_INTERVAL=10           # Check every 10 seconds
+STALE_JOB_TIMEOUT_MINUTES=30 # Reasonable timeout
 ```
 
 #### Historical Mode
@@ -801,11 +916,9 @@ REQUESTS_PER_SECOND=10     # Respect limits
 ```bash
 # Fast backfill
 BACKFILL_CHUNK_SIZE=200000  # Large chunks for speed
-BACKFILL_BATCH_SIZE=2000   # Large state ranges
 
 # Memory-conscious backfill
 BACKFILL_CHUNK_SIZE=50000   # Smaller chunks
-BACKFILL_BATCH_SIZE=500    # Smaller state ranges
 ```
 
 ## Troubleshooting
@@ -831,6 +944,19 @@ CRYO_TIMEOUT=600 make historical
 make backfill
 make validate
 make fill-gaps
+```
+
+#### Stuck Processing Jobs
+**Symptoms**: Ranges stuck in 'processing' state  
+**Solutions**:
+```bash
+# Wait for automatic recovery (happens on startup)
+# Or adjust timeout:
+STALE_JOB_TIMEOUT_MINUTES=15 make continuous
+
+# Force reset by restarting
+make stop
+make start
 ```
 
 #### Backfill Issues
@@ -880,6 +1006,14 @@ BATCH_SIZE=100 WORKERS=2 MEMORY_LIMIT=2G make continuous
 CRYO_TIMEOUT=600 MAX_CONCURRENT_REQUESTS=3 make historical
 ```
 
+#### Duplicate Data
+**Symptoms**: Duplicate rows in tables  
+**Solution**: Ensure DELETE_BEFORE_REPROCESS is enabled
+
+```bash
+DELETE_BEFORE_REPROCESS=true make historical
+```
+
 ## Use Case Examples
 
 ### Complete Deployment Scenarios
@@ -926,16 +1060,16 @@ make validate
 
 # Analyze specific events
 make historical START_BLOCK=12500000 END_BLOCK=12600000 \
-  DATASETS=blocks,transactions,logs
+  MODE=custom DATASETS=blocks,transactions,logs
 ```
 
 #### 4. Production DeFi Monitoring
 ```bash
 # Real-time transaction and event monitoring
-make continuous MODE=default BATCH_SIZE=50
+make continuous MODE=minimal BATCH_SIZE=50
 
 # Or custom datasets for specific needs
-make continuous DATASETS=blocks,transactions,logs,native_transfers
+make continuous MODE=custom DATASETS=blocks,transactions,logs,native_transfers
 ```
 
 #### 5. MEV Research Setup
@@ -944,7 +1078,7 @@ make continuous DATASETS=blocks,transactions,logs,native_transfers
 make historical START_BLOCK=15000000 END_BLOCK=16000000 MODE=full
 
 # Focus on MEV-relevant data
-make continuous DATASETS=blocks,transactions,logs,traces,native_transfers
+make continuous MODE=custom DATASETS=blocks,transactions,logs,traces,native_transfers
 ```
 
 #### 6. Maintenance and Recovery
@@ -958,6 +1092,9 @@ make fill-gaps START_BLOCK=17000000 END_BLOCK=18000000
 # After system issues
 make fill-gaps  # Find and fix gaps
 make validate   # Verify integrity
+
+# Fix any timestamp issues
+make fix-timestamps
 ```
 
 #### 7. Fixing Deleted Data

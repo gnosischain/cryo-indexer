@@ -3,7 +3,7 @@ import time
 import glob
 import shutil
 import subprocess
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -15,7 +15,7 @@ from .config import settings
 
 
 class IndexerWorker:
-    """Stateless worker that processes block ranges."""
+    """Stateless worker that processes block ranges with deduplication support."""
     
     def __init__(
         self, 
@@ -53,22 +53,38 @@ class IndexerWorker:
             'storage_diffs': 9
         }
         
+        # Table mappings
+        self.table_mappings = {
+            'blocks': 'blocks',
+            'transactions': 'transactions',
+            'logs': 'logs',
+            'contracts': 'contracts',
+            'native_transfers': 'native_transfers',
+            'traces': 'traces',
+            'balance_diffs': 'balance_diffs',
+            'code_diffs': 'code_diffs',
+            'nonce_diffs': 'nonce_diffs',
+            'storage_diffs': 'storage_diffs',
+            'events': 'logs',  # alias
+            'txs': 'transactions',  # alias
+        }
+        
         # Create worker-specific data directory
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(os.path.join(self.data_dir, ".cryo", "reports"), exist_ok=True)
         
         logger.info(f"Worker {worker_id} initialized for mode {mode}")
+        logger.info(f"Delete before reprocess: {settings.delete_before_reprocess}")
     
-    def _verify_blocks_exist(self, start_block: int, end_block: int) -> bool:
+    def _check_blocks_completed(self, start_block: int, end_block: int) -> bool:
         """
-        Check if all blocks in range exist in database with valid timestamps.
-        Looks for blocks indexed by ANY mode, not just the current mode.
+        Check if blocks are marked as completed in indexing_state (any mode).
         """
         try:
             client = self.clickhouse._connect()
             
-            # First check if the range is marked as completed in indexing_state for ANY mode
-            state_query = f"""
+            # Check if ANY mode has completed these blocks
+            query = f"""
             SELECT COUNT(*) 
             FROM {self.clickhouse.database}.indexing_state
             WHERE dataset = 'blocks'
@@ -76,55 +92,77 @@ class IndexerWorker:
               AND end_block = {end_block}
               AND status = 'completed'
             """
-            state_result = client.query(state_query)
-            if state_result.result_rows[0][0] > 0:
-                logger.debug(f"Blocks {start_block}-{end_block} marked as completed in indexing_state")
-                return True
-            
-            # Otherwise check the blocks table directly
-            blocks_query = f"""
-            SELECT COUNT(DISTINCT block_number) as count
-            FROM {self.clickhouse.database}.blocks
-            WHERE block_number >= {start_block} 
-              AND block_number < {end_block}
-              AND timestamp IS NOT NULL
-              AND timestamp > 0
-            """
-            blocks_result = client.query(blocks_query)
-            expected_blocks = end_block - start_block
-            actual_blocks = blocks_result.result_rows[0][0] if blocks_result.result_rows else 0
-            
-            # Return true only if all blocks are present
-            if actual_blocks == expected_blocks:
-                logger.debug(f"All {expected_blocks} blocks found in database for range {start_block}-{end_block}")
-                return True
-            
-            logger.warning(
-                f"Missing blocks: found {actual_blocks}/{expected_blocks} blocks "
-                f"in range {start_block}-{end_block}"
-            )
-            return False
-        except Exception as e:
-            logger.error(f"Error verifying blocks: {e}")
-            return False
-    
-    def _check_if_blocks_being_processed(self, start_block: int, end_block: int) -> bool:
-        """Check if blocks are currently being processed by another worker."""
-        try:
-            client = self.clickhouse._connect()
-            query = f"""
-            SELECT COUNT(*) 
-            FROM {self.clickhouse.database}.indexing_state
-            WHERE dataset = 'blocks'
-              AND start_block = {start_block}
-              AND end_block = {end_block}
-              AND status = 'processing'
-            """
             result = client.query(query)
             return result.result_rows[0][0] > 0
+            
         except Exception as e:
-            logger.error(f"Error checking if blocks are being processed: {e}")
+            logger.error(f"Error checking blocks completion: {e}")
             return False
+    
+    def _delete_existing_data(self, start_block: int, end_block: int, datasets: List[str]) -> Dict[str, int]:
+        """
+        Delete existing data in the range before reprocessing.
+        Returns dict of dataset -> deleted_rows
+        """
+        deleted_stats = {}
+        
+        if not settings.delete_before_reprocess:
+            return deleted_stats
+            
+        try:
+            client = self.clickhouse._connect()
+            
+            for dataset in datasets:
+                table_name = self.table_mappings.get(dataset, dataset)
+                
+                # Check if table exists
+                check_query = f"""
+                SELECT COUNT(*) FROM system.tables 
+                WHERE database = '{self.clickhouse.database}' 
+                AND name = '{table_name}'
+                """
+                result = client.query(check_query)
+                
+                if result.result_rows[0][0] == 0:
+                    logger.debug(f"Table {table_name} doesn't exist, skipping deletion")
+                    deleted_stats[dataset] = 0
+                    continue
+                
+                # Count existing rows
+                count_query = f"""
+                SELECT COUNT(*) 
+                FROM {self.clickhouse.database}.{table_name}
+                WHERE block_number >= {start_block} 
+                  AND block_number < {end_block}
+                """
+                result = client.query(count_query)
+                existing_rows = result.result_rows[0][0]
+                deleted_stats[dataset] = existing_rows
+                
+                if existing_rows > 0:
+                    logger.info(
+                        f"Worker {self.worker_id}: Deleting {existing_rows} existing rows "
+                        f"from {table_name} for range {start_block}-{end_block}"
+                    )
+                    
+                    # Delete existing data
+                    delete_query = f"""
+                    ALTER TABLE {self.clickhouse.database}.{table_name}
+                    DELETE WHERE block_number >= {start_block} 
+                      AND block_number < {end_block}
+                    """
+                    client.command(delete_query)
+                    
+                    # Wait for deletion to propagate
+                    time.sleep(settings.deletion_wait_time)
+                else:
+                    logger.debug(f"No existing data in {table_name} for range {start_block}-{end_block}")
+                    
+        except Exception as e:
+            logger.error(f"Worker {self.worker_id}: Error deleting existing data: {e}")
+            # Continue anyway - ReplacingMergeTree will handle duplicates eventually
+            
+        return deleted_stats
     
     def process_range(
         self, 
@@ -134,7 +172,7 @@ class IndexerWorker:
         force: bool = False
     ) -> bool:
         """
-        Process a block range for the given datasets, ensuring blocks are available for timestamps.
+        Process a block range for the given datasets.
         
         Args:
             start_block: Starting block number
@@ -152,73 +190,13 @@ class IndexerWorker:
             # Sort datasets by priority
             sorted_datasets = sorted(datasets, key=lambda d: self.dataset_priority.get(d, 999))
             
-            # Skip blocks check if already processing blocks
+            # If we need blocks but they're not in our dataset list, check if they're completed
             if 'blocks' not in sorted_datasets:
-                # Check if blocks are already indexed for this range
-                blocks_exist = self._verify_blocks_exist(start_block, end_block)
-                
-                if not blocks_exist:
-                    logger.info(f"Worker {self.worker_id}: Blocks {start_block}-{end_block} not found in database, indexing blocks first")
-                    
-                    # Check if blocks are already being processed by another worker
-                    if self._check_if_blocks_being_processed(start_block, end_block):
-                        logger.info(f"Worker {self.worker_id}: Blocks {start_block}-{end_block} are being processed by another worker, waiting...")
-                        
-                        # Wait for blocks to be processed (with timeout)
-                        max_wait_seconds = 300  # 5 minutes
-                        wait_interval = 10  # 10 seconds
-                        waited_time = 0
-                        
-                        while waited_time < max_wait_seconds:
-                            time.sleep(wait_interval)
-                            waited_time += wait_interval
-                            
-                            # Check if blocks are now available
-                            if self._verify_blocks_exist(start_block, end_block):
-                                logger.info(f"Worker {self.worker_id}: Blocks {start_block}-{end_block} now available, continuing with processing")
-                                break
-                        
-                        # If we waited the maximum time and blocks are still not available, process them ourselves
-                        if not self._verify_blocks_exist(start_block, end_block):
-                            logger.warning(f"Worker {self.worker_id}: Timeout waiting for blocks {start_block}-{end_block}, processing them now")
-                            if not self._process_blocks_only(start_block, end_block):
-                                return False
-                    else:
-                        # Claim and process blocks ourselves
-                        if not self._process_blocks_only(start_block, end_block):
-                            logger.error(f"Worker {self.worker_id}: Failed to process blocks {start_block}-{end_block}")
-                            return False
+                if not self._check_blocks_completed(start_block, end_block):
+                    logger.info(f"Worker {self.worker_id}: Blocks {start_block}-{end_block} not completed, adding to datasets")
+                    sorted_datasets.insert(0, 'blocks')
             
-            # In force mode, just process everything without checking
-            if force:
-                logger.info(f"Worker {self.worker_id}: Force processing {start_block}-{end_block} for datasets: {sorted_datasets}")
-                
-                # Clean data directory
-                self._clean_data_directory()
-                
-                # Extract all datasets at once
-                logger.info(f"Worker {self.worker_id}: Extracting all datasets for blocks {start_block}-{end_block}")
-                self._run_cryo(start_block, end_block, sorted_datasets)
-                
-                # Load data to ClickHouse
-                total_rows = self._load_to_clickhouse(sorted_datasets)
-                
-                # Mark as completed in the state
-                for dataset in sorted_datasets:
-                    # Adjust start block for diff datasets when recording in state
-                    dataset_start = start_block
-                    if dataset in diff_datasets and start_block == 0:
-                        dataset_start = 1
-                    
-                    self.state_manager.complete_range(
-                        self.mode, dataset, dataset_start, end_block, total_rows
-                    )
-                
-                logger.info(f"Worker {self.worker_id}: Successfully force-processed {start_block}-{end_block} ({total_rows} rows)")
-                return True
-            
-            # Non-force mode: check and claim ranges
-            # Process datasets in priority order
+            # Process each dataset
             for dataset in sorted_datasets:
                 # Adjust start block for diff datasets
                 dataset_start = start_block
@@ -226,102 +204,50 @@ class IndexerWorker:
                     dataset_start = 1
                     logger.info(f"Worker {self.worker_id}: Adjusted start block for {dataset} from 0 to 1")
                 
-                # Check if we should process this dataset
-                if not self.state_manager.should_process_range(
+                # Check current state
+                status = self.state_manager.get_range_status(
                     self.mode, dataset, dataset_start, end_block
-                ):
+                )
+                
+                # Skip if already completed (unless force mode)
+                if status == 'completed' and not force:
                     logger.info(f"Worker {self.worker_id}: {dataset} range {dataset_start}-{end_block} already completed")
                     continue
                 
+                # Skip if being processed by another worker (and not stale)
+                if status == 'processing':
+                    logger.info(f"Worker {self.worker_id}: {dataset} range {dataset_start}-{end_block} being processed by another worker")
+                    continue
+                
+                # If status is 'stale', we can claim it
+                if status == 'stale':
+                    logger.info(f"Worker {self.worker_id}: {dataset} range {dataset_start}-{end_block} has stale processing status, reclaiming")
+                
                 # Claim the range
-                if self.state_manager.claim_range(
+                if not self.state_manager.claim_range(
                     self.mode, dataset, dataset_start, end_block, 
                     self.worker_id, self.batch_id
                 ):
-                    logger.info(f"Worker {self.worker_id}: Processing {dataset} {dataset_start}-{end_block}")
-                    if not self._process_dataset_range(dataset_start, end_block, [dataset]):
-                        # Mark as failed but continue with other datasets
-                        self.state_manager.fail_range(
-                            self.mode, dataset, dataset_start, end_block, 
-                            "Processing failed"
-                        )
-                else:
                     logger.warning(f"Worker {self.worker_id}: Could not claim {dataset} range {dataset_start}-{end_block}")
-                    continue  # Someone else is processing it
+                    continue
+                
+                # Process the dataset
+                logger.info(f"Worker {self.worker_id}: Processing {dataset} {dataset_start}-{end_block}")
+                success = self._process_dataset_range(dataset_start, end_block, [dataset])
+                
+                if not success:
+                    # Mark as failed but continue with other datasets
+                    self.state_manager.fail_range(
+                        self.mode, dataset, dataset_start, end_block, 
+                        "Processing failed"
+                    )
+                    logger.error(f"Worker {self.worker_id}: Failed to process {dataset} {dataset_start}-{end_block}")
             
-            logger.info(f"Worker {self.worker_id}: Successfully completed all datasets for {start_block}-{end_block}")
+            logger.info(f"Worker {self.worker_id}: Completed processing all datasets for {start_block}-{end_block}")
             return True
             
         except Exception as e:
             logger.error(f"Worker {self.worker_id}: Error processing {start_block}-{end_block}: {e}", exc_info=True)
-            
-            # Define diff datasets here too for error handling
-            diff_datasets = ['balance_diffs', 'code_diffs', 'nonce_diffs', 'storage_diffs']
-            
-            # Mark all datasets as failed if in force mode
-            if force:
-                for dataset in datasets:
-                    try:
-                        # Adjust start block for diff datasets
-                        dataset_start = start_block
-                        if dataset in diff_datasets and start_block == 0:
-                            dataset_start = 1
-                        
-                        self.state_manager.fail_range(
-                            self.mode, dataset, dataset_start, end_block, str(e)[:500]
-                        )
-                    except:
-                        pass
-            
-            return False
-    
-    def _process_blocks_only(self, start_block: int, end_block: int) -> bool:
-        """Process only the blocks dataset for a range."""
-        # Check if blocks exist in ANY mode first (global check)
-        if self._verify_blocks_exist(start_block, end_block):
-            # Blocks exist in another mode, just mark them as completed for this mode too
-            logger.info(f"Worker {self.worker_id}: Blocks {start_block}-{end_block} found in database, marking as completed for mode {self.mode}")
-            self.state_manager.complete_range(
-                self.mode, 'blocks', start_block, end_block, 0  # 0 rows as we didn't process any
-            )
-            return True
-        
-        # Try to claim the range for blocks
-        if not self.state_manager.claim_range(
-            self.mode, 'blocks', start_block, end_block, self.worker_id, self.batch_id
-        ):
-            logger.warning(f"Worker {self.worker_id}: Could not claim blocks range {start_block}-{end_block}")
-            # Someone else might be processing it, wait and check
-            time.sleep(5)
-            return self._verify_blocks_exist(start_block, end_block)
-        
-        logger.info(f"Worker {self.worker_id}: Processing blocks {start_block}-{end_block} for timestamp data")
-        
-        try:
-            # Clean data directory
-            self._clean_data_directory()
-            
-            # Extract only blocks data
-            logger.info(f"Worker {self.worker_id}: Extracting blocks for range {start_block}-{end_block}")
-            self._run_cryo(start_block, end_block, ['blocks'])
-            
-            # Load data to ClickHouse
-            total_rows = self._load_to_clickhouse(['blocks'])
-            
-            # Mark as completed
-            self.state_manager.complete_range(
-                self.mode, 'blocks', start_block, end_block, total_rows
-            )
-            
-            logger.info(f"Worker {self.worker_id}: Successfully processed blocks {start_block}-{end_block} ({total_rows} rows)")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Worker {self.worker_id}: Error processing blocks {start_block}-{end_block}: {e}", exc_info=True)
-            self.state_manager.fail_range(
-                self.mode, 'blocks', start_block, end_block, 
-                f"Error processing blocks: {str(e)[:500]}"
-            )
             return False
     
     def _process_dataset_range(
@@ -330,15 +256,13 @@ class IndexerWorker:
         end_block: int,
         datasets: List[str]
     ) -> bool:
-        """Process a specific dataset range."""
+        """Process a specific dataset range with deduplication."""
         try:
-            # For blocks dataset, check if already indexed by any mode
-            if 'blocks' in datasets and self._verify_blocks_exist(start_block, end_block):
-                logger.info(f"Worker {self.worker_id}: Blocks {start_block}-{end_block} already exist, marking as completed")
-                self.state_manager.complete_range(
-                    self.mode, 'blocks', start_block, end_block, 0
-                )
-                return True
+            # Delete existing data if configured
+            deleted_stats = self._delete_existing_data(start_block, end_block, datasets)
+            for dataset, count in deleted_stats.items():
+                if count > 0:
+                    logger.info(f"Worker {self.worker_id}: Deleted {count} rows from {dataset}")
             
             # Clean data directory
             self._clean_data_directory()

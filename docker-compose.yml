@@ -22,16 +22,27 @@ x-indexer-env: &indexer-env
 
   START_BLOCK:             ${START_BLOCK:-0}
   END_BLOCK:               ${END_BLOCK:-0}
-  CONFIRMATION_BLOCKS: ${CONFIRMATION_BLOCKS:-12}
-  POLL_INTERVAL:       ${POLL_INTERVAL:-10}
+  CONFIRMATION_BLOCKS:     ${CONFIRMATION_BLOCKS:-12}
+  POLL_INTERVAL:           ${POLL_INTERVAL:-10}
 
-  BACKFILL_CHUNK_SIZE:    ${BACKFILL_CHUNK_SIZE:-100000}
-  BACKFILL_FORCE:         ${BACKFILL_FORCE:-false}
+  BACKFILL_CHUNK_SIZE:     ${BACKFILL_CHUNK_SIZE:-100000}
+  BACKFILL_FORCE:          ${BACKFILL_FORCE:-false}
   GAP_DETECTION_STATE_CHUNK_SIZE:  ${GAP_DETECTION_STATE_CHUNK_SIZE:-100000}
   GAP_DETECTION_TABLE_CHUNK_SIZE:  ${GAP_DETECTION_TABLE_CHUNK_SIZE:-10000}
   GAP_DETECTION_THRESHOLD:         ${GAP_DETECTION_THRESHOLD:-0.8}
   TIMESTAMP_FIX_BATCH_SIZE:        ${TIMESTAMP_FIX_BATCH_SIZE:-100000}
   STRICT_TIMESTAMP_MODE:           ${STRICT_TIMESTAMP_MODE:-false}
+  STALE_JOB_TIMEOUT_MINUTES:       ${STALE_JOB_TIMEOUT_MINUTES:-30}
+
+  # Enhanced gap filling settings
+  HANDLE_FAILED_RANGES:           ${HANDLE_FAILED_RANGES:-false}
+  DELETE_FAILED_BEFORE_RETRY:     ${DELETE_FAILED_BEFORE_RETRY:-false}
+  MAX_RETRIES_OVERRIDE:           ${MAX_RETRIES_OVERRIDE:-0}
+
+  # Deduplication settings (Delete Before Insert strategy) - SIMPLIFIED
+  DELETE_BEFORE_REPROCESS:        ${DELETE_BEFORE_REPROCESS:-true}
+  DELETION_WAIT_TIME:             ${DELETION_WAIT_TIME:-1.0}
+  # REMOVED: VERIFY_COMPLETION_THRESHOLD and TRUST_INDEXING_STATE
 
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
@@ -126,8 +137,8 @@ services:
     restart: ${RESTART_POLICY:-unless-stopped}
     environment:
       <<: *indexer-env
-      MODE: custom            # let your Settings class look at DATASETS
-      DATASETS: ${DATASETS:-blocks,transactions,logs,traces}
+      MODE: custom
+      DATASETS: ${DATASETS:-blocks,transactions,logs}
       OPERATION: ${OPERATION:-continuous}
     volumes:
       - indexer_data_custom:/app/data
@@ -139,7 +150,7 @@ services:
   migrations:
     image: cryo-indexer:latest
     container_name: cryo-migrations-${TIMESTAMP:-default}
-    profiles: ["migrations"]        # only runs when requested
+    profiles: ["migrations"]
     entrypoint: ["python", "-m", "src", "migrations"]
     environment:
       CLICKHOUSE_HOST:     ${CLICKHOUSE_HOST}
@@ -151,3 +162,82 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ./migrations:/app/migrations
+
+  # Optional one-shot historical indexing job
+  historical-job:
+    image: cryo-indexer:latest
+    container_name: cryo-historical-${TIMESTAMP:-default}
+    profiles: ["historical"]
+    restart: "no"
+    environment:
+      <<: *indexer-env
+      MODE: ${MODE:-minimal}
+      OPERATION: historical
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./migrations:/app/migrations
+    <<: *resources
+
+  # Optional one-shot backfill job
+  backfill-job:
+    image: cryo-indexer:latest
+    container_name: cryo-backfill-${TIMESTAMP:-default}
+    profiles: ["backfill"]
+    restart: "no"
+    environment:
+      <<: *indexer-env
+      MODE: ${MODE:-minimal}
+      OPERATION: backfill
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./migrations:/app/migrations
+    <<: *resources
+
+  # Optional one-shot fill-gaps job
+  fill-gaps-job:
+    image: cryo-indexer:latest
+    container_name: cryo-fill-gaps-${TIMESTAMP:-default}
+    profiles: ["fill-gaps"]
+    restart: "no"
+    environment:
+      <<: *indexer-env
+      MODE: ${MODE:-minimal}
+      OPERATION: fill_gaps
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./migrations:/app/migrations
+    <<: *resources
+
+  # Optional one-shot validate job
+  validate-job:
+    image: cryo-indexer:latest
+    container_name: cryo-validate-${TIMESTAMP:-default}
+    profiles: ["validate"]
+    restart: "no"
+    environment:
+      <<: *indexer-env
+      MODE: ${MODE:-minimal}
+      OPERATION: validate
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./migrations:/app/migrations
+    <<: *resources
+
+  # Optional one-shot timestamp fix job
+  fix-timestamps-job:
+    image: cryo-indexer:latest
+    container_name: cryo-fix-timestamps-${TIMESTAMP:-default}
+    profiles: ["fix-timestamps"]
+    restart: "no"
+    environment:
+      <<: *indexer-env
+      OPERATION: fix_timestamps
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./migrations:/app/migrations
+    <<: *resources

@@ -1,6 +1,6 @@
 """
 Database-based state management for the indexer.
-Includes fixed-range gap detection for efficient processing.
+Simplified version that trusts indexing_state table completely.
 """
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
@@ -29,7 +29,7 @@ class IndexingRange:
 
 
 class StateManager:
-    """Manages indexing state in ClickHouse instead of files."""
+    """Manages indexing state in ClickHouse - simplified to trust state completely."""
     
     def __init__(self, clickhouse_manager):
         self.db = clickhouse_manager
@@ -37,30 +37,91 @@ class StateManager:
         
         # Get range size from settings
         self.range_size = getattr(settings, 'indexing_range_size', 1000)
-        
-    def claim_range(self, mode: str, dataset: str, start_block: int, end_block: int, 
-                   worker_id: str, batch_id: str = "", force: bool = False) -> bool:
+    
+    def get_range_status(self, mode: str, dataset: str, start_block: int, end_block: int) -> Optional[str]:
         """
-        Atomically claim a block range for processing.
-        Returns True if successfully claimed, False if already claimed.
+        Get the current status of a range from indexing_state.
+        Returns: 'completed', 'processing', 'failed', 'pending', or None if not found
+        
+        Also checks if 'processing' ranges are stale and should be considered available.
         """
         try:
-            # If force mode, don't check existing data
-            if not force:
-                # Check if range is already being processed or completed
-                client = self.db._connect()
-                check_query = f"""
-                SELECT COUNT(*) 
+            client = self.db._connect()
+            
+            # Get the latest status with timing info
+            query = f"""
+            SELECT status, started_at, worker_id
+            FROM {self.database}.indexing_state
+            WHERE mode = '{mode}'
+              AND dataset = '{dataset}'
+              AND start_block = {start_block}
+              AND end_block = {end_block}
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+            result = client.query(query)
+            
+            if not result.result_rows:
+                return None
+                
+            status = result.result_rows[0][0]
+            started_at = result.result_rows[0][1]
+            worker_id = result.result_rows[0][2] if len(result.result_rows[0]) > 2 else None
+            
+            # If status is 'processing', check if it's stale
+            if status == 'processing' and started_at:
+                stale_timeout = getattr(settings, 'stale_job_timeout_minutes', 30)
+                stale_check_query = f"""
+                SELECT 
+                    CASE 
+                        WHEN started_at < now() - INTERVAL {stale_timeout} MINUTE 
+                        THEN 1 
+                        ELSE 0 
+                    END as is_stale
                 FROM {self.database}.indexing_state
                 WHERE mode = '{mode}'
                   AND dataset = '{dataset}'
                   AND start_block = {start_block}
                   AND end_block = {end_block}
-                  AND status IN ('processing', 'completed')
+                  AND status = 'processing'
+                  AND started_at = '{started_at}'
                 """
-                result = client.query(check_query)
+                stale_result = client.query(stale_check_query)
                 
-                if result.result_rows[0][0] > 0:
+                if stale_result.result_rows and stale_result.result_rows[0][0] == 1:
+                    logger.warning(
+                        f"Range {dataset} {start_block}-{end_block} has stale 'processing' status "
+                        f"(worker: {worker_id}, started: {started_at})"
+                    )
+                    # Consider it as available for claiming
+                    return 'stale'
+            
+            return status
+            
+        except Exception as e:
+            logger.error(f"Error getting range status: {e}")
+            return None
+    
+    def claim_range(self, mode: str, dataset: str, start_block: int, end_block: int, 
+                   worker_id: str, batch_id: str = "", force: bool = False) -> bool:
+        """
+        Atomically claim a block range for processing.
+        Returns True if successfully claimed, False if already being processed.
+        """
+        try:
+            # Get current status
+            status = self.get_range_status(mode, dataset, start_block, end_block)
+            
+            # If force mode, always claim
+            if force:
+                logger.debug(f"Force claiming range {dataset} {start_block}-{end_block}")
+            else:
+                # Check if we can claim this range
+                if status == 'completed':
+                    logger.debug(f"Range {dataset} {start_block}-{end_block} already completed")
+                    return False
+                elif status == 'processing':
+                    logger.debug(f"Range {dataset} {start_block}-{end_block} already being processed")
                     return False
             
             # Claim the range
@@ -195,9 +256,8 @@ class StateManager:
     def find_gaps(self, mode: str, dataset: str, start_block: int, 
                   end_block: int, min_gap_size: int = 1) -> List[Tuple[int, int]]:
         """
-        Find gaps in indexed data for fixed-range approach.
-        For blocks dataset: returns incomplete ranges
-        For other datasets: returns missing ranges
+        Find gaps in indexed data based on indexing_state.
+        A gap is any range that isn't marked as 'completed'.
         """
         gaps = []
         
@@ -208,46 +268,51 @@ class StateManager:
             aligned_start = (start_block // self.range_size) * self.range_size
             aligned_end = ((end_block // self.range_size) + 1) * self.range_size
             
-            # For blocks dataset, find incomplete ranges
-            if dataset == 'blocks':
-                incomplete_query = f"""
-                SELECT start_block, end_block
-                FROM {self.database}.indexing_state
-                WHERE mode = '{mode}'
-                  AND dataset = '{dataset}'
-                  AND status = 'incomplete'
-                  AND start_block >= {aligned_start}
-                  AND end_block <= {aligned_end}
-                ORDER BY start_block
-                """
-                result = client.query(incomplete_query)
-                
-                for row in result.result_rows:
-                    gaps.append((row[0], row[1]))
-                    logger.debug(f"Found incomplete range for {dataset}: {row[0]}-{row[1]}")
+            # Find all completed ranges
+            query = f"""
+            SELECT start_block, end_block
+            FROM {self.database}.indexing_state
+            WHERE mode = '{mode}'
+              AND dataset = '{dataset}'
+              AND status = 'completed'
+              AND start_block >= {aligned_start}
+              AND end_block <= {aligned_end}
+            ORDER BY start_block
+            """
+            result = client.query(query)
             
-            # Find completely missing ranges for all datasets
+            completed_ranges = [(row[0], row[1]) for row in result.result_rows]
+            
+            # Find gaps
             current = aligned_start
-            while current < aligned_end:
-                range_end = min(current + self.range_size, aligned_end)
-                
-                # Check if this range exists
-                check_query = f"""
-                SELECT COUNT(*)
-                FROM {self.database}.indexing_state
-                WHERE mode = '{mode}'
-                  AND dataset = '{dataset}'
-                  AND start_block = {current}
-                  AND end_block = {range_end}
-                """
-                result = client.query(check_query)
-                
-                if result.result_rows[0][0] == 0:
-                    # Range doesn't exist at all
-                    gaps.append((current, range_end))
-                    logger.debug(f"Found missing range for {dataset}: {current}-{range_end}")
-                
-                current = range_end
+            for comp_start, comp_end in completed_ranges:
+                if current < comp_start:
+                    gaps.append((current, comp_start))
+                current = max(current, comp_end)
+            
+            # Check for gap at the end
+            if current < aligned_end:
+                gaps.append((current, aligned_end))
+            
+            # Also find non-completed ranges (failed, pending, etc)
+            non_completed_query = f"""
+            SELECT start_block, end_block
+            FROM {self.database}.indexing_state
+            WHERE mode = '{mode}'
+              AND dataset = '{dataset}'
+              AND status != 'completed'
+              AND status != 'processing'
+              AND start_block >= {aligned_start}
+              AND end_block <= {aligned_end}
+            ORDER BY start_block
+            """
+            result = client.query(non_completed_query)
+            
+            for row in result.result_rows:
+                gaps.append((row[0], row[1]))
+            
+            # Remove duplicates and sort
+            gaps = sorted(list(set(gaps)))
             
             logger.info(f"Found {len(gaps)} gaps for {dataset} in range {start_block}-{end_block}")
             return gaps
@@ -256,40 +321,73 @@ class StateManager:
             logger.error(f"Error finding gaps: {e}")
             return []
     
-    def should_process_range(self, mode: str, dataset: str, 
-                           start_block: int, end_block: int) -> bool:
+    def get_failed_ranges(self, mode: str, dataset: str, start_block: int, 
+                         end_block: int, max_attempts: Optional[int] = None) -> List[Tuple[int, int, int, str]]:
         """
-        Check if a range should be processed.
-        For fixed ranges: only process if status is 'incomplete' or doesn't exist
+        Get failed ranges within the specified block range.
+        Returns list of tuples: (start_block, end_block, attempt_count, error_message)
         """
         try:
             client = self.db._connect()
             
-            # Check if range exists and its status
+            # Build query
             query = f"""
-            SELECT status
+            SELECT start_block, end_block, attempt_count, error_message
             FROM {self.database}.indexing_state
             WHERE mode = '{mode}'
               AND dataset = '{dataset}'
-              AND start_block = {start_block}
-              AND end_block = {end_block}
-            ORDER BY created_at DESC
-            LIMIT 1
+              AND status = 'failed'
+              AND start_block >= {start_block}
+              AND end_block <= {end_block}
             """
+            
+            # Add max attempts filter if specified
+            if max_attempts is not None:
+                query += f" AND attempt_count < {max_attempts}"
+            
+            query += " ORDER BY start_block"
+            
             result = client.query(query)
             
-            if not result.result_rows:
-                # Range doesn't exist, should process
-                return True
-                
-            status = result.result_rows[0][0]
+            failed_ranges = []
+            for row in result.result_rows:
+                failed_ranges.append((row[0], row[1], row[2], row[3] or ""))
+                logger.debug(f"Found failed range for {dataset}: {row[0]}-{row[1]} (attempts: {row[2]})")
             
-            # Only process if incomplete (for blocks) or doesn't exist
-            return status == 'incomplete'
+            logger.info(f"Found {len(failed_ranges)} failed ranges for {dataset}")
+            return failed_ranges
             
         except Exception as e:
-            logger.error(f"Error checking if range should be processed: {e}")
-            return True  # Process on error
+            logger.error(f"Error getting failed ranges: {e}")
+            return []
+    
+    def delete_range_entries(self, mode: str, dataset: str, ranges: List[Tuple[int, int]]) -> int:
+        """
+        Delete indexing_state entries for specified ranges.
+        Returns number of ranges deleted.
+        """
+        try:
+            client = self.db._connect()
+            deleted_count = 0
+            
+            for start_block, end_block in ranges:
+                delete_query = f"""
+                ALTER TABLE {self.database}.indexing_state
+                DELETE WHERE mode = '{mode}'
+                  AND dataset = '{dataset}'
+                  AND start_block = {start_block}
+                  AND end_block = {end_block}
+                """
+                client.command(delete_query)
+                deleted_count += 1
+                logger.debug(f"Deleted entry for {dataset} range {start_block}-{end_block}")
+            
+            logger.info(f"Deleted {deleted_count} range entries for {dataset}")
+            return deleted_count
+            
+        except Exception as e:
+            logger.error(f"Error deleting range entries: {e}")
+            return 0
     
     def get_stale_jobs(self, timeout_minutes: int = 30) -> List[IndexingRange]:
         """Find jobs that have been processing for too long."""
@@ -336,15 +434,12 @@ class StateManager:
             for job in stale_jobs:
                 next_attempt = job.attempt_count + 1
                 
-                # For fixed ranges, keep the status as incomplete if it was processing
-                status = 'incomplete' if job.dataset == 'blocks' else 'pending'
-                
                 reset_query = f"""
                 INSERT INTO {self.database}.indexing_state
                 (mode, dataset, start_block, end_block, status, attempt_count)
                 VALUES
                 ('{job.mode}', '{job.dataset}', {job.start_block}, {job.end_block}, 
-                 '{status}', {next_attempt})
+                 'pending', {next_attempt})
                 """
                 client.command(reset_query)
                 reset_count += 1
@@ -358,18 +453,64 @@ class StateManager:
             logger.error(f"Error resetting stale jobs: {e}")
             return 0
     
-    def get_progress_summary(self, mode: str) -> Dict[str, Dict]:
-        """Get indexing progress summary for fixed ranges."""
+    def reset_all_processing_jobs(self) -> int:
+        """
+        Reset ALL 'processing' jobs to 'pending' status.
+        Called on startup to clean up from previous crashes.
+        """
         try:
             client = self.db._connect()
             
-            # Modified query to handle fixed ranges
+            # Get all processing jobs
+            query = f"""
+            SELECT mode, dataset, start_block, end_block, worker_id, attempt_count
+            FROM {self.database}.indexing_state
+            WHERE status = 'processing'
+            """
+            result = client.query(query)
+            
+            reset_count = 0
+            for row in result.result_rows:
+                mode, dataset, start_block, end_block, worker_id, attempt_count = row[:6]
+                next_attempt = (attempt_count or 0) + 1
+                
+                # Insert a new 'pending' entry
+                reset_query = f"""
+                INSERT INTO {self.database}.indexing_state
+                (mode, dataset, start_block, end_block, status, attempt_count, error_message)
+                VALUES
+                ('{mode}', '{dataset}', {start_block}, {end_block}, 
+                 'pending', {next_attempt}, 'Reset from processing on startup')
+                """
+                client.command(reset_query)
+                reset_count += 1
+                
+                logger.info(
+                    f"Reset {dataset} {start_block}-{end_block} from 'processing' to 'pending' "
+                    f"(was worker: {worker_id})"
+                )
+            
+            if reset_count > 0:
+                logger.info(f"Reset {reset_count} processing jobs on startup")
+            else:
+                logger.info("No processing jobs found to reset")
+                
+            return reset_count
+            
+        except Exception as e:
+            logger.error(f"Error resetting processing jobs: {e}")
+            return 0
+    
+    def get_progress_summary(self, mode: str) -> Dict[str, Dict]:
+        """Get indexing progress summary."""
+        try:
+            client = self.db._connect()
+            
             query = f"""
             SELECT 
                 dataset,
                 COUNT(*) as total_ranges,
                 countIf(status = 'completed') as completed_ranges,
-                countIf(status = 'incomplete') as incomplete_ranges,
                 countIf(status = 'processing') as processing_ranges,
                 countIf(status = 'failed') as failed_ranges,
                 countIf(status = 'pending') as pending_ranges,
@@ -387,12 +528,11 @@ class StateManager:
                 summary[dataset] = {
                     'total_ranges': row[1],
                     'completed_ranges': row[2],
-                    'incomplete_ranges': row[3],
-                    'processing_ranges': row[4],
-                    'failed_ranges': row[5],
-                    'pending_ranges': row[6],
-                    'highest_block': row[7],
-                    'total_rows_indexed': row[8] or 0,
+                    'processing_ranges': row[3],
+                    'failed_ranges': row[4],
+                    'pending_ranges': row[5],
+                    'highest_block': row[6],
+                    'total_rows_indexed': row[7] or 0,
                     'range_size': self.range_size
                 }
                 

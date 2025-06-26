@@ -50,6 +50,9 @@ class CryoIndexer:
         )
         self.state_manager = StateManager(self.clickhouse)
         
+        # Clean up stale processing jobs on startup
+        self._cleanup_on_startup()
+        
         # Create directories
         os.makedirs(settings.data_dir, exist_ok=True)
         
@@ -71,6 +74,26 @@ class CryoIndexer:
         self.failed_ranges = []
         self.progress_lock = threading.Lock()
         self.last_progress_report = time.time()
+        
+        # Enhanced gap filling settings
+        self.handle_failed_ranges = os.environ.get("HANDLE_FAILED_RANGES", "false").lower() == "true"
+        self.delete_failed_before_retry = os.environ.get("DELETE_FAILED_BEFORE_RETRY", "false").lower() == "true"
+        self.max_retries_override = int(os.environ.get("MAX_RETRIES_OVERRIDE", "0")) or settings.max_retries
+    
+    def _cleanup_on_startup(self):
+        """Clean up any stale processing jobs from previous runs."""
+        logger.info("Checking for stale processing jobs from previous runs...")
+        
+        # Reset all processing jobs to pending
+        reset_count = self.state_manager.reset_all_processing_jobs()
+        
+        if reset_count > 0:
+            logger.warning(
+                f"Found and reset {reset_count} 'processing' jobs from previous run. "
+                f"These will be retried."
+            )
+        else:
+            logger.info("No stale processing jobs found.")
     
     def _handle_exit(self, sig, frame):
         """Handle shutdown gracefully."""
@@ -104,8 +127,9 @@ class CryoIndexer:
         """Run continuous indexing, following the chain tip."""
         logger.info("Starting continuous indexing")
         
-        # Reset any stale jobs
-        self.state_manager.reset_stale_jobs(timeout_minutes=30)
+        # Reset any stale jobs periodically
+        last_stale_check = time.time()
+        stale_check_interval = 300  # Check every 5 minutes
         
         # Get starting point from database
         last_block = self.state_manager.get_last_synced_block(
@@ -132,6 +156,11 @@ class CryoIndexer:
         
         while self.running:
             try:
+                # Periodically check for stale jobs
+                if time.time() - last_stale_check > stale_check_interval:
+                    self.state_manager.reset_stale_jobs(timeout_minutes=settings.stale_job_timeout_minutes)
+                    last_stale_check = time.time()
+                
                 # Get latest block
                 latest_block = self.blockchain.get_latest_block_number()
                 safe_block = latest_block - settings.confirmation_blocks
@@ -167,8 +196,8 @@ class CryoIndexer:
             logger.error("END_BLOCK must be greater than START_BLOCK")
             sys.exit(1)
         
-        # Reset any stale jobs
-        self.state_manager.reset_stale_jobs(timeout_minutes=30)
+        # Reset any stale jobs first
+        self.state_manager.reset_stale_jobs(timeout_minutes=settings.stale_job_timeout_minutes)
         
         if settings.workers == 1:
             # Single worker mode
@@ -350,8 +379,11 @@ class CryoIndexer:
         )
     
     def _run_fill_gaps(self):
-        """Find and fill gaps in the indexed data."""
+        """Find and fill gaps in the indexed data, including failed ranges."""
         logger.info("Starting gap fill operation")
+        
+        # Reset any stale jobs first
+        self.state_manager.reset_stale_jobs(timeout_minutes=settings.stale_job_timeout_minutes)
         
         # Determine range
         start = settings.start_block or 0
@@ -359,13 +391,37 @@ class CryoIndexer:
         
         logger.info(f"Searching for gaps between blocks {start} and {end}")
         
-        # Find gaps for each dataset
+        # Find all types of gaps for each dataset
         all_gaps = []
+        
         for dataset in settings.datasets:
+            # 1. Find missing ranges (standard gaps)
             gaps = self.state_manager.find_gaps(
                 settings.mode.value, dataset, start, end, min_gap_size=1
             )
-            logger.info(f"Found {len(gaps)} gaps in {dataset}")
+            logger.info(f"Found {len(gaps)} missing ranges in {dataset}")
+            
+            # 2. Find failed ranges if enabled
+            failed_ranges = []
+            if self.handle_failed_ranges:
+                failed_ranges = self.state_manager.get_failed_ranges(
+                    settings.mode.value, dataset, start, end, max_attempts=self.max_retries_override
+                )
+                logger.info(f"Found {len(failed_ranges)} failed ranges in {dataset}")
+                
+                # Delete failed entries if requested
+                if self.delete_failed_before_retry and failed_ranges:
+                    ranges_to_delete = [(r[0], r[1]) for r in failed_ranges]
+                    deleted = self.state_manager.delete_range_entries(
+                        settings.mode.value, dataset, ranges_to_delete
+                    )
+                    logger.info(f"Deleted {deleted} failed entries for {dataset}")
+                
+                # Add failed ranges to gaps (just start and end blocks)
+                for start_block, end_block, attempts, error in failed_ranges:
+                    gaps.append((start_block, end_block))
+            
+            # Add all gaps for this dataset
             all_gaps.extend([(gap[0], gap[1], dataset) for gap in gaps])
         
         if not all_gaps:
@@ -520,7 +576,7 @@ class CryoIndexer:
             print(f"  Processing ranges: {stats.get('processing_ranges', 0)}")
             print(f"  Failed ranges: {stats.get('failed_ranges', 0)}")
             print(f"  Pending ranges: {stats.get('pending_ranges', 0)}")
-            print(f"  Highest block: {stats.get('highest_completed_block', 0)}")
+            print(f"  Highest block: {stats.get('highest_block', 0)}")
             print(f"  Total rows: {stats.get('total_rows_indexed', 0):,}")
             print()
         
@@ -531,18 +587,39 @@ class CryoIndexer:
         print(f"\n=== CHECKING FOR GAPS ({start} to {end}) ===\n")
         
         has_gaps = False
+        has_failed = False
         for dataset in settings.datasets:
+            # Check for missing ranges
             gaps = self.state_manager.find_gaps(
                 settings.mode.value, dataset, start, end
             )
             
-            if gaps:
-                has_gaps = True
-                print(f"{dataset}: {len(gaps)} gaps found")
-                for i, (gap_start, gap_end) in enumerate(gaps[:10]):
-                    print(f"  Gap {i+1}: blocks {gap_start}-{gap_end} ({gap_end - gap_start} blocks)")
-                if len(gaps) > 10:
-                    print(f"  ... and {len(gaps) - 10} more gaps")
+            # Check for failed ranges
+            failed_ranges = self.state_manager.get_failed_ranges(
+                settings.mode.value, dataset, start, end
+            )
+            
+            if gaps or failed_ranges:
+                has_gaps = True if gaps else has_gaps
+                has_failed = True if failed_ranges else has_failed
+                
+                print(f"{dataset}:")
+                
+                if gaps:
+                    print(f"  {len(gaps)} missing ranges")
+                    for i, (gap_start, gap_end) in enumerate(gaps[:5]):
+                        print(f"    Missing {i+1}: blocks {gap_start}-{gap_end} ({gap_end - gap_start} blocks)")
+                    if len(gaps) > 5:
+                        print(f"    ... and {len(gaps) - 5} more")
+                
+                if failed_ranges:
+                    print(f"  {len(failed_ranges)} failed ranges")
+                    for i, (start_block, end_block, attempts, error) in enumerate(failed_ranges[:5]):
+                        print(f"    Failed {i+1}: blocks {start_block}-{end_block} (attempts: {attempts})")
+                        if error:
+                            print(f"      Error: {error[:100]}...")
+                    if len(failed_ranges) > 5:
+                        print(f"    ... and {len(failed_ranges) - 5} more")
             else:
                 print(f"{dataset}: No gaps found ✓")
         
@@ -555,7 +632,7 @@ class CryoIndexer:
                 print(f"  {job.dataset}: {job.start_block}-{job.end_block} (worker: {job.worker_id})")
         
         # Exit code based on validation results
-        if has_gaps or stale_jobs:
+        if has_gaps or has_failed or stale_jobs:
             sys.exit(1)
         else:
             print("\n✓ Validation passed!")

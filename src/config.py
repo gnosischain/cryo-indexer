@@ -89,6 +89,18 @@ class IndexerSettings:
         self.timestamp_fix_batch_size = int(os.environ.get("TIMESTAMP_FIX_BATCH_SIZE", "100000"))
         self.strict_timestamp_mode = os.environ.get("STRICT_TIMESTAMP_MODE", "false").lower() == "true"
         
+        # Stale job detection
+        self.stale_job_timeout_minutes = int(os.environ.get("STALE_JOB_TIMEOUT_MINUTES", "30"))
+        
+        # Deduplication settings - SIMPLIFIED
+        self.delete_before_reprocess = os.environ.get("DELETE_BEFORE_REPROCESS", "true").lower() == "true"
+        self.deletion_wait_time = float(os.environ.get("DELETION_WAIT_TIME", "1.0"))  # seconds to wait after deletion
+        
+        # Enhanced gap filling settings
+        self.handle_failed_ranges = os.environ.get("HANDLE_FAILED_RANGES", "false").lower() == "true"
+        self.delete_failed_before_retry = os.environ.get("DELETE_FAILED_BEFORE_RETRY", "false").lower() == "true"
+        self.max_retries_override = int(os.environ.get("MAX_RETRIES_OVERRIDE", "0")) or self.max_retries
+        
         # Logging
         self.log_level = os.environ.get("LOG_LEVEL", "INFO")
         
@@ -155,6 +167,9 @@ class IndexerSettings:
             
         if not 0.0 <= self.gap_detection_threshold <= 1.0:
             raise ValueError("GAP_DETECTION_THRESHOLD must be between 0.0 and 1.0")
+            
+        if self.deletion_wait_time < 0:
+            raise ValueError("DELETION_WAIT_TIME must be non-negative")
 
 
 # Create global settings instance
