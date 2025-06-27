@@ -70,6 +70,8 @@ volumes:
   indexer_logs_full:
   indexer_data_custom:
   indexer_logs_custom:
+  consolidate_data:      
+  consolidate_logs:
 
 # --------------------------------------------------------------------------
 # 2. Services
@@ -249,11 +251,11 @@ services:
     restart: "no"
     environment:
       <<: *indexer-env
-      MODE: ${MODE:-minimal}
-      OPERATION: consolidate
+      MODE: ${MODE:-full}
+      OPERATION: consolidate  # Make sure this is set
       ETH_RPC_URL: "not-needed-for-consolidate"
     volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
+      - consolidate_data:/app/data
+      - consolidate_logs:/app/logs
       - ./migrations:/app/migrations
     <<: *resources

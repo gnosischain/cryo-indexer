@@ -1,5 +1,6 @@
 """
 Range Consolidator - Merges small adjacent completed ranges in indexing_state table.
+Maintains fixed-size ranges as defined by INDEXING_RANGE_SIZE.
 """
 from typing import List, Dict, Tuple
 from dataclasses import dataclass
@@ -25,8 +26,10 @@ class RangeConsolidator:
     """
     Consolidates fragmented ranges in indexing_state table.
     
-    IMPORTANT: Only merges adjacent ranges with status='completed'.
-    Ranges with other statuses (processing, failed, pending) are preserved as-is.
+    IMPORTANT: 
+    - Only merges adjacent ranges with status='completed'
+    - Maintains fixed-size ranges as defined by INDEXING_RANGE_SIZE
+    - Sums up rows_indexed when merging
     """
     
     def __init__(
@@ -39,14 +42,16 @@ class RangeConsolidator:
         self.state_manager = state_manager
         self.mode = mode
         self.database = clickhouse.database
+        self.range_size = settings.indexing_range_size
         
-        logger.info(f"RangeConsolidator initialized for mode {mode}")
+        logger.info(f"RangeConsolidator initialized for mode {mode} with range size {self.range_size}")
     
     def consolidate_all_datasets(self, datasets: List[str]) -> Dict[str, ConsolidateResult]:
         """Consolidate ranges for all specified datasets."""
         results = {}
         
         logger.info(f"Starting consolidation for {len(datasets)} datasets")
+        logger.info(f"Fixed range size: {self.range_size} blocks")
         
         for dataset in datasets:
             start_time = time.time()
@@ -63,7 +68,7 @@ class RangeConsolidator:
                         f"(merged {result.ranges_merged} ranges)"
                     )
                 else:
-                    logger.info(f"✓ {dataset}: No adjacent ranges to merge")
+                    logger.info(f"✓ {dataset}: No consolidation needed - ranges already optimal")
                 
             except Exception as e:
                 logger.error(f"Error consolidating {dataset}: {e}")
@@ -79,7 +84,7 @@ class RangeConsolidator:
         return results
     
     def _consolidate_dataset(self, dataset: str) -> ConsolidateResult:
-        """Consolidate ranges for a single dataset."""
+        """Consolidate ranges for a single dataset maintaining fixed-size ranges."""
         # Get all completed ranges for this dataset
         ranges = self._get_completed_ranges(dataset)
         
@@ -97,47 +102,121 @@ class RangeConsolidator:
         # Sort by start_block
         ranges.sort(key=lambda r: r['start_block'])
         
-        # Find adjacent ranges to merge
-        consolidated = []
-        current = ranges[0]
+        # Group ranges by their aligned range boundaries
+        range_groups = {}
+        for r in ranges:
+            # Calculate which fixed-size range this belongs to
+            aligned_start = (r['start_block'] // self.range_size) * self.range_size
+            aligned_end = aligned_start + self.range_size
+            
+            key = (aligned_start, aligned_end)
+            if key not in range_groups:
+                range_groups[key] = []
+            range_groups[key].append(r)
+        
+        # Process each group that has multiple entries
         ranges_merged = 0
+        for (aligned_start, aligned_end), group in range_groups.items():
+            if len(group) > 1:
+                # Verify all ranges in the group are adjacent and complete the fixed range
+                if self._can_consolidate_group(group, aligned_start, aligned_end):
+                    self._consolidate_group(dataset, group, aligned_start, aligned_end)
+                    ranges_merged += len(group) - 1
+                else:
+                    logger.debug(
+                        f"Cannot consolidate group for {dataset} "
+                        f"({aligned_start}-{aligned_end}): gaps exist"
+                    )
         
-        for next_range in ranges[1:]:
-            # Check if ranges are adjacent (no gap)
-            if current['end_block'] == next_range['start_block']:
-                # Merge ranges
-                current = {
-                    'start_block': current['start_block'],
-                    'end_block': next_range['end_block'],
-                    'rows_indexed': current['rows_indexed'] + next_range['rows_indexed']
-                }
-                ranges_merged += 1
-            else:
-                # Not adjacent, save current and start new
-                consolidated.append(current)
-                current = next_range
-        
-        # Don't forget the last range
-        consolidated.append(current)
-        
-        # Only update if we actually consolidated something
-        if len(consolidated) < original_count:
-            logger.info(f"Replacing {original_count} ranges with {len(consolidated)} consolidated ranges for {dataset}")
-            self._replace_ranges(dataset, ranges, consolidated)
+        consolidated_count = original_count - ranges_merged
         
         return ConsolidateResult(
             dataset=dataset,
             original_count=original_count,
-            consolidated_count=len(consolidated),
+            consolidated_count=consolidated_count,
             ranges_merged=ranges_merged,
             duration=0.0
         )
     
+    def _can_consolidate_group(self, group: List[Dict], aligned_start: int, aligned_end: int) -> bool:
+        """Check if a group of ranges can be consolidated into a single fixed-size range."""
+        # Sort by start block
+        group.sort(key=lambda r: r['start_block'])
+        
+        # Check if ranges are contiguous and cover the entire fixed range
+        expected_start = aligned_start
+        for r in group:
+            if r['start_block'] != expected_start:
+                return False
+            expected_start = r['end_block']
+        
+        # Check if we cover the entire range
+        return group[0]['start_block'] == aligned_start and group[-1]['end_block'] == aligned_end
+    
+    def _consolidate_group(self, dataset: str, group: List[Dict], aligned_start: int, aligned_end: int):
+        """Consolidate a group of adjacent ranges into a single fixed-size range."""
+        if len(group) < 2:
+            return
+        
+        try:
+            client = self.clickhouse._connect()
+            
+            # Sum up all rows indexed
+            total_rows = sum(r['rows_indexed'] for r in group)
+            
+            logger.debug(
+                f"Consolidating {len(group)} ranges for {dataset}: "
+                f"{aligned_start}-{aligned_end} ({total_rows} total rows)"
+            )
+            
+            # Sort to ensure we keep the first entry
+            group.sort(key=lambda r: r['start_block'])
+            
+            # Update the first entry to cover the entire fixed range
+            update_query = f"""
+            ALTER TABLE {self.database}.indexing_state
+            UPDATE 
+                start_block = {aligned_start},
+                end_block = {aligned_end},
+                rows_indexed = {total_rows},
+                batch_id = 'consolidated',
+                version = now()
+            WHERE mode = '{self.mode}'
+              AND dataset = '{dataset}'
+              AND start_block = {group[0]['start_block']}
+              AND end_block = {group[0]['end_block']}
+              AND status = 'completed'
+            """
+            client.command(update_query)
+            
+            # Delete the other entries in the group
+            if len(group) > 1:
+                # Batch delete for efficiency
+                conditions = []
+                for entry in group[1:]:
+                    conditions.append(
+                        f"(start_block = {entry['start_block']} AND end_block = {entry['end_block']})"
+                    )
+                
+                delete_query = f"""
+                ALTER TABLE {self.database}.indexing_state
+                DELETE WHERE mode = '{self.mode}'
+                  AND dataset = '{dataset}'
+                  AND status = 'completed'
+                  AND ({' OR '.join(conditions)})
+                """
+                client.command(delete_query)
+            
+            logger.debug(f"Successfully consolidated group for {dataset}")
+            
+        except Exception as e:
+            logger.error(f"Error consolidating group: {e}")
+            raise
+    
     def _get_completed_ranges(self, dataset: str) -> List[Dict]:
         """
         Get all completed ranges for a dataset.
-        Only completed ranges are safe to merge - other statuses indicate
-        ranges that still need processing or have issues.
+        Only completed ranges are safe to merge.
         """
         try:
             client = self.clickhouse._connect()
@@ -159,15 +238,12 @@ class RangeConsolidator:
             
             ranges = []
             for row in result.result_rows:
-                # Double-check status for safety
                 if row[3] == 'completed':
                     ranges.append({
                         'start_block': row[0],
                         'end_block': row[1],
                         'rows_indexed': row[2] or 0
                     })
-                else:
-                    logger.warning(f"Unexpected non-completed range found: {row}")
             
             logger.debug(f"Found {len(ranges)} completed ranges for {dataset}")
             return ranges
@@ -176,52 +252,12 @@ class RangeConsolidator:
             logger.error(f"Error getting completed ranges: {e}")
             return []
     
-    def _replace_ranges(self, dataset: str, old_ranges: List[Dict], new_ranges: List[Dict]):
-        """Replace old ranges with consolidated ones."""
-        try:
-            client = self.clickhouse._connect()
-            
-            # Delete all old ranges
-            logger.debug(f"Deleting {len(old_ranges)} old ranges for {dataset}")
-            
-            for old_range in old_ranges:
-                delete_query = f"""
-                ALTER TABLE {self.database}.indexing_state
-                DELETE WHERE mode = '{self.mode}'
-                  AND dataset = '{dataset}'
-                  AND start_block = {old_range['start_block']}
-                  AND end_block = {old_range['end_block']}
-                  AND status = 'completed'
-                """
-                client.command(delete_query)
-            
-            # Wait for deletions to propagate
-            time.sleep(1)
-            
-            # Insert consolidated ranges
-            logger.debug(f"Inserting {len(new_ranges)} consolidated ranges for {dataset}")
-            
-            for new_range in new_ranges:
-                insert_query = f"""
-                INSERT INTO {self.database}.indexing_state
-                (mode, dataset, start_block, end_block, status, completed_at, rows_indexed, batch_id)
-                VALUES
-                ('{self.mode}', '{dataset}', {new_range['start_block']}, 
-                 {new_range['end_block']}, 'completed', now(), {new_range['rows_indexed']}, 'consolidated')
-                """
-                client.command(insert_query)
-            
-            logger.info(f"Successfully replaced {len(old_ranges)} ranges with {len(new_ranges)} for {dataset}")
-            
-        except Exception as e:
-            logger.error(f"Error replacing ranges: {e}")
-            raise
-    
     def _print_summary(self, results: Dict[str, ConsolidateResult]):
         """Print consolidation summary."""
         print("\n" + "=" * 80)
         print("RANGE CONSOLIDATION SUMMARY")
         print("=" * 80)
+        print(f"Fixed range size: {self.range_size} blocks")
         
         total_original = 0
         total_consolidated = 0
