@@ -241,3 +241,19 @@ services:
       - ./logs:/app/logs
       - ./migrations:/app/migrations
     <<: *resources
+
+  consolidate-job:
+    image: cryo-indexer:latest
+    container_name: cryo-consolidate-${TIMESTAMP:-default}
+    profiles: ["consolidate"]
+    restart: "no"
+    environment:
+      <<: *indexer-env
+      MODE: ${MODE:-minimal}
+      OPERATION: consolidate
+      ETH_RPC_URL: "not-needed-for-consolidate"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./migrations:/app/migrations
+    <<: *resources

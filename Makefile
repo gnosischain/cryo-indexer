@@ -97,6 +97,13 @@ fix-timestamps:
 	@echo "Starting timestamp fix operation..."
 	docker-compose --profile fix-timestamps up fix-timestamps-job
 
+consolidate:
+	@echo "Consolidating fragmented ranges..."
+	OPERATION=consolidate \
+	MODE=$(MODE) \
+	DELETE_BEFORE_REPROCESS=false \
+	$(DOCKER_RUN_CMD) $(IMAGE_NAME)
+
 # Stop all containers
 stop:
 	docker-compose down

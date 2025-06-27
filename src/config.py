@@ -20,7 +20,8 @@ class OperationType(Enum):
     FILL_GAPS = "fill_gaps"     # Find and fill gaps
     VALIDATE = "validate"        # Check data integrity
     BACKFILL = "backfill"       # Backfill indexing_state from existing data
-    FIX_TIMESTAMPS = "fix_timestamps"  # Fix incorrect timestamps 
+    FIX_TIMESTAMPS = "fix_timestamps"  # Fix incorrect timestamps
+    CONSOLIDATE = "consolidate"  # Consolidate fragmented ranges
 
 
 class IndexerSettings:
@@ -130,9 +131,9 @@ class IndexerSettings:
     
     def validate(self) -> None:
         """Validate required settings."""
-        # RPC not required for backfill operation
-        if self.operation != OperationType.BACKFILL and not self.eth_rpc_url:
-            raise ValueError("ETH_RPC_URL is required for non-backfill operations")
+        # RPC not required for backfill or consolidate operations
+        if self.operation not in [OperationType.BACKFILL, OperationType.CONSOLIDATE] and not self.eth_rpc_url:
+            raise ValueError("ETH_RPC_URL is required for non-backfill/consolidate operations")
             
         if not self.clickhouse_host:
             raise ValueError("CLICKHOUSE_HOST is required")

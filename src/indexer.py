@@ -118,7 +118,9 @@ class CryoIndexer:
         elif settings.operation == OperationType.BACKFILL:
             self._run_backfill()
         elif settings.operation == OperationType.FIX_TIMESTAMPS: 
-            self._run_fix_timestamps() 
+            self._run_fix_timestamps()
+        elif settings.operation == OperationType.CONSOLIDATE:
+            self._run_consolidate()
         else:
             logger.error(f"Unknown operation: {settings.operation}")
             sys.exit(1)
@@ -692,6 +694,33 @@ class CryoIndexer:
         else:
             print("\n✗ Some timestamps could not be fixed")
             sys.exit(1)
+
+    def _run_consolidate(self):
+        """Consolidate fragmented ranges in indexing_state table."""
+        logger.info("Starting range consolidation operation")
+        
+        # Import here to avoid circular imports
+        from .consolidate_ranges import RangeConsolidator
+        
+        # Create consolidator
+        consolidator = RangeConsolidator(
+            clickhouse=self.clickhouse,
+            state_manager=self.state_manager,
+            mode=settings.mode.value
+        )
+        
+        # Run consolidation
+        results = consolidator.consolidate_all_datasets(settings.datasets)
+        
+        # Check if any consolidation happened
+        total_merged = sum(r.ranges_merged for r in results.values())
+        
+        if total_merged > 0:
+            logger.info(f"✓ Consolidation completed successfully. Merged {total_merged} ranges.")
+            sys.exit(0)
+        else:
+            logger.info("✓ No adjacent ranges found to consolidate.")
+            sys.exit(0)
 
 
 if __name__ == "__main__":
