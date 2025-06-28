@@ -121,6 +121,8 @@ class CryoIndexer:
             self._run_fix_timestamps()
         elif settings.operation == OperationType.CONSOLIDATE:
             self._run_consolidate()
+        elif settings.operation == OperationType.PROCESS_FAILED:
+            self._run_process_failed()
         else:
             logger.error(f"Unknown operation: {settings.operation}")
             sys.exit(1)
@@ -721,6 +723,181 @@ class CryoIndexer:
         else:
             logger.info("✓ No adjacent ranges found to consolidate.")
             sys.exit(0)
+
+    def _run_process_failed(self):
+        """Process ONLY failed ranges within safe boundaries, no gap detection."""
+        logger.info("Starting failed range processing (no gap detection)")
+        
+        # Reset any stale jobs first
+        self.state_manager.reset_stale_jobs(timeout_minutes=settings.stale_job_timeout_minutes)
+        
+        # Determine safe range based on what's been indexed
+        start = settings.start_block or 0
+        
+        # If no end block specified, find the safe maximum
+        if not settings.end_block:
+            # Get the minimum of maximum completed blocks across all datasets
+            safe_max_blocks = []
+            for dataset in settings.datasets:
+                max_block = self.state_manager.get_max_completed_block(
+                    settings.mode.value, dataset
+                )
+                if max_block > 0:
+                    safe_max_blocks.append(max_block)
+            
+            if safe_max_blocks:
+                end = min(safe_max_blocks)
+                logger.info(f"Using safe max block: {end}")
+            else:
+                logger.warning("No completed blocks found, nothing to process")
+                return
+        else:
+            end = settings.end_block
+        
+        logger.info(f"Processing failed ranges between blocks {start} and {end}")
+        
+        # Collect all failed ranges
+        all_failed_ranges = []
+        
+        for dataset in settings.datasets:
+            # Get failed ranges ONLY (not gaps)
+            failed_ranges = self.state_manager.get_failed_ranges(
+                settings.mode.value, 
+                dataset, 
+                start, 
+                end,
+                max_attempts=settings.max_retries
+            )
+            
+            if failed_ranges:
+                logger.info(f"Found {len(failed_ranges)} failed ranges in {dataset}")
+                for start_block, end_block, attempts, error in failed_ranges:
+                    all_failed_ranges.append((start_block, end_block, dataset, attempts))
+            else:
+                logger.info(f"No failed ranges found in {dataset}")
+        
+        if not all_failed_ranges:
+            logger.info("No failed ranges to process!")
+            return
+        
+        # Sort by block range for better locality
+        all_failed_ranges.sort(key=lambda x: (x[0], x[1]))
+        
+        logger.info(f"Total failed ranges to process: {len(all_failed_ranges)}")
+        
+        # Process failed ranges
+        if settings.workers == 1:
+            self._process_failed_single(all_failed_ranges)
+        else:
+            self._process_failed_parallel(all_failed_ranges)
+
+    def _process_failed_single(self, failed_ranges: List[Tuple[int, int, str, int]]):
+        """Process failed ranges with a single worker."""
+        worker = IndexerWorker(
+            worker_id="failed_processor",
+            blockchain=self.blockchain,
+            clickhouse=self.clickhouse,
+            state_manager=self.state_manager,
+            data_dir=settings.data_dir,
+            network_name=settings.network_name,
+            rpc_url=settings.eth_rpc_url,
+            mode=settings.mode.value,
+            batch_id=self.batch_id
+        )
+        
+        processed = 0
+        success_count = 0
+        
+        for start_block, end_block, dataset, attempts in failed_ranges:
+            logger.info(
+                f"Processing failed range {dataset} {start_block}-{end_block} "
+                f"(attempt {attempts + 1})"
+            )
+            
+            # Process with force=True to override status checks
+            success = worker.process_range(
+                start_block, 
+                end_block, 
+                [dataset], 
+                force=True
+            )
+            
+            if success:
+                success_count += 1
+                logger.info(f"✓ Successfully processed {dataset} {start_block}-{end_block}")
+            else:
+                logger.error(f"✗ Failed to process {dataset} {start_block}-{end_block}")
+            
+            processed += 1
+            
+            # Progress report
+            if processed % 10 == 0:
+                logger.info(
+                    f"Progress: {processed}/{len(failed_ranges)} "
+                    f"({success_count} successful)"
+                )
+        
+        logger.info(
+            f"Failed range processing complete. "
+            f"Processed: {processed}, Successful: {success_count}"
+        )
+
+    def _process_failed_parallel(self, failed_ranges: List[Tuple[int, int, str, int]]):
+        """Process failed ranges with multiple workers."""
+        # Group by (start_block, end_block) to process all datasets for a range together
+        range_map = {}
+        for start_block, end_block, dataset, attempts in failed_ranges:
+            key = (start_block, end_block)
+            if key not in range_map:
+                range_map[key] = []
+            range_map[key].append(dataset)
+        
+        logger.info(f"Processing {len(range_map)} unique ranges with {settings.workers} workers")
+        
+        # Create worker pool configuration
+        pool_config = {
+            'eth_rpc_url': settings.eth_rpc_url,
+            'network_name': settings.network_name,
+            'data_dir': settings.data_dir,
+            'clickhouse_host': settings.clickhouse_host,
+            'clickhouse_user': settings.clickhouse_user,
+            'clickhouse_password': settings.clickhouse_password,
+            'clickhouse_database': settings.clickhouse_database,
+            'clickhouse_port': settings.clickhouse_port,
+            'clickhouse_secure': settings.clickhouse_secure,
+            'mode': settings.mode.value,
+            'batch_id': self.batch_id
+        }
+        
+        # Create and start worker pool
+        self.worker_pool = WorkerPool(settings.workers, pool_config)
+        self.worker_pool.start(result_callback=self._handle_work_result)
+        
+        # Progress monitoring thread
+        progress_thread = threading.Thread(
+            target=self._monitor_progress, 
+            args=(len(range_map),)
+        )
+        progress_thread.daemon = True
+        progress_thread.start()
+        
+        # Submit work
+        for (start_block, end_block), datasets in range_map.items():
+            self.worker_pool.submit(start_block, end_block, datasets)
+        
+        # Wait for completion
+        self.worker_pool.wait_for_completion()
+        
+        # Stop the pool
+        self.worker_pool.stop()
+        
+        # Report results
+        with self.progress_lock:
+            logger.info(
+                f"Failed range processing complete. "
+                f"✓ Successful: {len(self.completed_ranges)}, "
+                f"✗ Failed: {len(self.failed_ranges)}"
+            )
 
 
 if __name__ == "__main__":

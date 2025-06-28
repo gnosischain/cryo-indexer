@@ -541,3 +541,19 @@ class StateManager:
         except Exception as e:
             logger.error(f"Error getting progress summary: {e}")
             return {}
+        
+    def get_max_completed_block(self, mode: str, dataset: str) -> int:
+        """Get the maximum completed block for a dataset."""
+        try:
+            client = self.db._connect()
+            result = client.query(f"""
+                SELECT MAX(end_block) 
+                FROM {self.database}.indexing_state
+                WHERE mode = '{mode}'
+                AND dataset = '{dataset}'
+                AND status = 'completed'
+            """)
+            return result.result_rows[0][0] if result.result_rows and result.result_rows[0][0] else 0
+        except Exception as e:
+            logger.error(f"Error getting max completed block: {e}")
+            return 0
