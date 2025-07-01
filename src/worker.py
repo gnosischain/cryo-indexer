@@ -359,12 +359,14 @@ class IndexerWorker:
             "--rpc", self.rpc_url,
             "--overwrite",
             "--requests-per-second", str(settings.requests_per_second),
-            "--max-concurrent-requests", str(settings.max_concurrent_requests)
+            "--max-concurrent-requests", str(settings.max_concurrent_requests),
+            "--columns", "all"  
         ]
         
         if self.network_name:
             cmd.extend(["--network-name", self.network_name])
         
+        logger.info(f"Worker {self.worker_id}: Using --columns all to ensure all required columns are included")
         logger.debug(f"Worker {self.worker_id}: Running {' '.join(cmd)}")
         
         process = subprocess.run(

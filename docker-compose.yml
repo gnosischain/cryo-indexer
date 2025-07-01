@@ -238,6 +238,7 @@ services:
     environment:
       <<: *indexer-env
       OPERATION: fix_timestamps
+      MODE: full
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
