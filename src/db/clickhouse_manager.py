@@ -78,6 +78,24 @@ class ClickHouseManager:
             logger.error(f"Error ensuring database exists: {e}")
             raise
     
+    def _normalize_dataframe_nulls(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalize all empty values to NULL for consistency.
+        This ensures that empty strings, None, NaN all become NULL in ClickHouse.
+        """
+        # Replace empty strings with None (which becomes NULL in ClickHouse)
+        for col in df.columns:
+            if df[col].dtype == 'object':  # String columns
+                # Replace empty strings with None
+                df[col] = df[col].replace('', None)
+                # Also handle whitespace-only strings
+                df[col] = df[col].apply(lambda x: None if isinstance(x, str) and x.strip() == '' else x)
+        
+        # Ensure NaN values are converted to None
+        df = df.where(pd.notnull(df), None)
+        
+        return df
+    
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
     def insert_parquet_file(self, file_path: str) -> int:
         """
@@ -145,6 +163,17 @@ class ClickHouseManager:
                 logger.warning(f"Empty DataFrame from {file_path}")
                 return 0
             
+            # Special handling for blocks table - drop problematic columns
+            if table_name == 'blocks':
+                columns_to_drop = ['total_difficulty_f64', 'total_difficulty_binary', 'total_difficulty_string', 'difficulty']
+                existing_columns_to_drop = [col for col in columns_to_drop if col in df.columns]
+                if existing_columns_to_drop:
+                    logger.info(f"Dropping columns from blocks data: {existing_columns_to_drop}")
+                    df = df.drop(columns=existing_columns_to_drop)
+            
+            # Normalize NULL values for consistency
+            df = self._normalize_dataframe_nulls(df)
+            
             # Get table schema to ensure column compatibility
             table_exists = self._check_table_exists(table_name)
             if table_exists:
@@ -157,6 +186,9 @@ class ClickHouseManager:
             
             # Convert binary columns to hex strings for ClickHouse
             self._convert_binary_columns(df)
+            
+            # Final normalization after all transformations
+            df = self._normalize_dataframe_nulls(df)
             
             # IMPORTANT: Do not include insert_version in the DataFrame
             # It's a MATERIALIZED column that ClickHouse will populate automatically
@@ -228,29 +260,27 @@ class ClickHouseManager:
                     self._record_timestamp_issues(table_name, missing_blocks)
             
             # Map block numbers to timestamps
-            # Use an epoch timestamp if the block timestamp is missing
-            default_timestamp = pd.Timestamp.fromtimestamp(0)  # 1970-01-01 00:00:00
-            
+            # Use None for missing timestamps (will become NULL in ClickHouse)
             df['block_timestamp'] = df['block_number'].apply(
                 lambda x: pd.Timestamp.fromtimestamp(block_timestamps.get(x, 0)) 
-                if pd.notna(x) and x in block_timestamps else default_timestamp
+                if pd.notna(x) and x in block_timestamps and block_timestamps.get(x, 0) > 0
+                else None  # Use None instead of a default timestamp
             )
             
             # Log statistics
-            default_timestamps = (df['block_timestamp'] == default_timestamp).sum()
-            if default_timestamps > 0:
+            null_timestamps = df['block_timestamp'].isna().sum()
+            if null_timestamps > 0:
                 logger.warning(
-                    f"{table_name}: {default_timestamps} rows will have default timestamps "
+                    f"{table_name}: {null_timestamps} rows will have NULL timestamps "
                     f"due to missing block data"
                 )
                 
         except Exception as e:
             logger.error(f"Error adding timestamp columns: {e}")
-            # In non-strict mode, use default timestamp for all rows
+            # In non-strict mode, use NULL for all timestamps
             if not (hasattr(settings, 'strict_timestamp_mode') and settings.strict_timestamp_mode):
-                default_timestamp = pd.Timestamp.fromtimestamp(0)
-                df['block_timestamp'] = default_timestamp
-                logger.warning(f"Using default timestamp for all rows in {table_name} due to error")
+                df['block_timestamp'] = None
+                logger.warning(f"Using NULL timestamp for all rows in {table_name} due to error")
             else:
                 raise
     
@@ -280,7 +310,10 @@ class ClickHouseManager:
                 first_non_null = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
                 if isinstance(first_non_null, bytes):
                     logger.debug(f"Converting binary column {col} to hex strings")
-                    df[col] = df[col].apply(lambda x: x.hex() if isinstance(x, bytes) else None)
+                    # Use None for empty/null values consistently
+                    df[col] = df[col].apply(
+                        lambda x: x.hex() if isinstance(x, bytes) and len(x) > 0 else None
+                    )
                     
     
     def _check_table_exists(self, table_name: str) -> bool:
@@ -316,11 +349,11 @@ class ClickHouseManager:
         materialized_columns = ['block_timestamp', 'month', 'insert_version']
         existing_columns = [col for col in df.columns if col in table_columns and col not in materialized_columns]
         
-        # Fill missing columns with None/NULL (excluding MATERIALIZED columns)
+        # Fill missing columns with None (NULL) - not empty strings
         missing_columns = [col for col in table_columns if col not in df.columns and col not in materialized_columns]
         for col in missing_columns:
             logger.debug(f"Adding missing column: {col}")
-            df[col] = None
+            df[col] = None  # Consistently use None for NULL
         
         # Ensure columns are in the correct order (excluding MATERIALIZED columns)
         columns_to_select = [col for col in table_columns if col in df.columns and col not in materialized_columns]
