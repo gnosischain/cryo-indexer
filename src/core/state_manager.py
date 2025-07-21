@@ -31,7 +31,6 @@ class StateManager:
     def __init__(self, clickhouse_manager):
         self.db = clickhouse_manager
         self.database = clickhouse_manager.database
-        self.range_size = 1000  # Fixed range size
         
         # Datasets that cannot start from block 0
         self.diff_datasets = {'balance_diffs', 'code_diffs', 'nonce_diffs', 'storage_diffs'}

@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS {{database}}.logs
 (
     `block_number` Nullable(UInt32),
+    `block_hash` Nullable(String),
     `transaction_index` Nullable(UInt32),
     `log_index` Nullable(UInt32),
     `transaction_hash` Nullable(String),

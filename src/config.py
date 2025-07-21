@@ -54,11 +54,8 @@ class IndexerSettings:
         
         # Essential performance settings
         self.workers = int(os.environ.get("WORKERS", "1"))
-        self.batch_size = int(os.environ.get("BATCH_SIZE", "100"))  # Smaller default for reliability
+        self.batch_size = int(os.environ.get("BATCH_SIZE", "100"))
         self.max_retries = int(os.environ.get("MAX_RETRIES", "3"))
-        
-        # Fixed range size (not configurable for simplicity)
-        self.range_size = 1000
         
         # Continuous mode settings
         self.confirmation_blocks = int(os.environ.get("CONFIRMATION_BLOCKS", "12"))

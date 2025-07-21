@@ -50,6 +50,56 @@ class IndexerWorker:
             'nonce_diffs': 'nonce_diffs',
             'storage_diffs': 'storage_diffs'
         }
+
+        # Define columns for each dataset
+        # For blocks, we explicitly exclude total_difficulty columns to avoid overflow
+        self.dataset_columns = {
+            'blocks': [
+                'block_hash',
+                'parent_hash',
+                'uncles_hash',
+                'author',
+                'state_root',
+                'transactions_root',
+                'receipts_root',
+                'block_number',
+                'gas_used',
+                'gas_limit',
+                'extra_data',
+                'logs_bloom',
+                'timestamp',
+                'size',
+                'mix_hash',
+                'nonce',
+                'base_fee_per_gas',
+                'withdrawals_root',
+                'chain_id'
+            ],
+            # For other datasets, we can use 'all' or specify columns as needed
+            'transactions': 'all',
+            'logs': [
+                'block_number',
+                'block_hash',
+                'transaction_index',
+                'log_index',
+                'transaction_hash',
+                'address',
+                'topic0',
+                'topic1',
+                'topic2',
+                'topic3',
+                'data',
+                'n_data_bytes',
+                'chain_id'
+            ],
+            'contracts': 'all',
+            'native_transfers': 'all',
+            'traces': 'all',
+            'balance_diffs': 'all',
+            'code_diffs': 'all',
+            'nonce_diffs': 'all',
+            'storage_diffs': 'all'
+        }
         
         # Create worker-specific data directory
         os.makedirs(self.data_dir, exist_ok=True)
@@ -249,6 +299,15 @@ class IndexerWorker:
             "--max-concurrent-requests", str(settings.max_concurrent_requests)
         ]
         
+        # Add column specification based on datasets
+        columns_to_use = self._determine_columns(datasets)
+        if columns_to_use and columns_to_use != 'all':
+            # Split the space-separated string and add each column as a separate argument
+            cmd.extend(["--columns"] + columns_to_use.split())
+            logger.info(f"Worker {self.worker_id}: Using columns specification: {columns_to_use}")
+        elif columns_to_use == 'all':
+            cmd.extend(["--columns", "all"])
+
         if self.network_name:
             cmd.extend(["--network-name", self.network_name])
         
@@ -286,6 +345,41 @@ class IndexerWorker:
                 f"Consider reducing batch size or increasing CRYO_TIMEOUT."
             )
             raise
+
+    def _determine_columns(self, datasets: List[str]) -> Optional[str]:
+        """
+        Determine the columns specification for the given datasets.
+        Returns None if no specification needed, or a space-separated string of columns.
+        """
+        # If we have multiple datasets with different column specs, we can't specify columns
+        # because cryo processes all datasets with the same column specification
+        if len(datasets) > 1:
+            # Check if all datasets have the same column specification
+            first_spec = self.dataset_columns.get(datasets[0], 'all')
+            for dataset in datasets[1:]:
+                if self.dataset_columns.get(dataset, 'all') != first_spec:
+                    # Different specs, can't use column specification
+                    logger.debug(f"Worker {self.worker_id}: Mixed column specifications, using default columns")
+                    return None
+            
+            # All datasets have the same spec
+            if isinstance(first_spec, list):
+                return " ".join(first_spec)  # SPACE-SEPARATED, not comma-separated!
+            elif first_spec == 'all':
+                return 'all'
+            else:
+                return first_spec
+        
+        # Single dataset
+        dataset = datasets[0]
+        columns = self.dataset_columns.get(dataset, 'all')
+        
+        if isinstance(columns, list):
+            return " ".join(columns)  # SPACE-SEPARATED, not comma-separated!
+        elif columns == 'all':
+            return 'all'
+        else:
+            return columns
     
     def _load_to_clickhouse(self, datasets: List[str]) -> int:
         """Load extracted data to ClickHouse."""
