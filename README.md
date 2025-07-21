@@ -51,7 +51,7 @@ The simplified indexer has **3 core operations** designed for clarity and reliab
 |-----------|---------|-------------|--------------|
 | **`continuous`** | Real-time blockchain following | Production systems, live data | Polls chain tip, handles reorgs, automatic recovery |
 | **`historical`** | Fast bulk indexing of specific ranges | Initial sync, catching up, research | Parallel processing, progress tracking, efficient batching |
-| **`maintain`** | Fix all data integrity issues | After failures, periodic health checks | Gap detection, timestamp fixing, failed range retry |
+| **`maintain`** | Process failed/pending ranges | After failures, fixing incomplete data | Retry failed ranges, process pending work |
 
 ### Operation Decision Tree
 
@@ -67,25 +67,22 @@ What do you need to do?
 └─ Know exact range needed?
     └─ Use: historical
 
-🔧 Fix any data problems?
-├─ Missing data/gaps?
-├─ Failed ranges?
-├─ Timestamp issues?
-└─ Use: maintain (fixes everything)
+🔧 Fix failed or incomplete data?
+├─ Ranges marked as 'failed'?
+├─ Ranges stuck as 'pending'?
+└─ Use: maintain
 ```
 
-### Simplified vs Legacy Operations
+### Current Implementation vs Roadmap
 
-| Legacy Operation | Simplified Equivalent | Notes |
-|------------------|----------------------|-------|
-| `continuous` | `continuous` | Same functionality, cleaner code |
-| `historical` | `historical` | Same functionality, better performance |
-| `fill-gaps` | `maintain` | Automatic gap detection and filling |
-| `validate` | `maintain` with validation | Reports issues and can fix them |
-| `backfill` | `maintain` | Automatic state reconstruction |
-| `fix-timestamps` | `maintain` | Automatic timestamp correction |
-| `consolidate` | *Removed* | Automatic range optimization |
-| `process-failed` | `maintain` | Handles failed ranges automatically |
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `continuous` operation | ✅ Implemented | Real-time blockchain following |
+| `historical` operation | ✅ Implemented | Parallel bulk indexing |
+| `maintain` operation | ✅ Implemented | Processes failed/pending ranges from state table |
+| Automatic gap detection | ❌ Not implemented | Roadmap feature |
+| Automatic timestamp fixing | ❌ Not implemented | Roadmap feature |
+| Data validation | ✅ Basic validation | Checks for valid timestamps during processing |
 
 ## Repository Structure
 
@@ -133,26 +130,18 @@ cryo-indexer/
         └── migrations.py         # Migration runner
 ```
 
-### Removed Files (Simplified Away)
-- `src/backfill_worker.py` - Functionality moved to `maintain` operation
-- `src/consolidate_ranges.py` - Automatic optimization, no manual operation needed
-- `src/timestamp_fixer.py` - Functionality moved to `maintain` operation  
-- `src/core/worker_pool.py` - Built-in parallelism in main indexer
-- `migrations/013_create_timestamp_fixes.sql` - Simplified state tracking
-
 ## Key Features
 
 ### Simplified Design
-- **3 Operations**: Down from 8 complex operations
+- **3 Operations**: Down from 8+ complex operations
 - **15 Settings**: Down from 40+ configuration options
 - **Single State Table**: Simplified from multiple state tracking tables
 - **Fail-Fast**: Clear error messages, immediate failure on issues
 
-### Maintained Reliability
+### Reliability Features
 - **Strict Timestamps**: Blocks must have valid timestamps before processing other datasets
 - **Atomic Processing**: Complete ranges or fail entirely
 - **Automatic Recovery**: Self-healing from crashes and network issues
-- **Gap Detection**: Automatic identification and fixing of missing data
 - **Parallel Processing**: Efficient multi-worker historical indexing
 
 ### Performance Improvements
@@ -176,7 +165,7 @@ cryo-indexer/
                     └─────────────┘
 ```
 
-### Simplified Architecture Principles
+### Architecture Principles
 
 1. **Blocks First**: Always process blocks before other datasets
 2. **Strict Validation**: Fail immediately if timestamps are missing
@@ -265,54 +254,62 @@ make historical START_BLOCK=1000000 END_BLOCK=1100000 \
 ```
 
 ### 3. Maintain
-**Comprehensive data integrity maintenance**
+**Process failed and pending ranges from state table**
 
-**Use Case**: Fix any and all data integrity issues  
+**Use Case**: Fix incomplete or failed indexing work  
 **Behavior**:
-- **Gap Detection**: Finds missing block ranges automatically
-- **Failed Range Retry**: Reprocesses failed ranges with backoff
-- **Timestamp Fixing**: Corrects invalid timestamps by joining with blocks table
-- **State Reconstruction**: Rebuilds state tracking from existing data
-- **Validation**: Reports on data completeness and issues
-- **Smart Processing**: Only processes what actually needs fixing
+- **Scans State Table**: Looks for ranges marked as 'failed' or 'pending'
+- **Retry Processing**: Re-attempts failed ranges with proper error handling
+- **Clear Pending**: Processes ranges that were never attempted
+- **Progress Reporting**: Shows what was fixed and any remaining issues
+- **State-Driven**: Only processes what the state table indicates needs work
 
 **When to Use**:
 - ✅ After system failures or crashes
 - ✅ Network interruptions during indexing
-- ✅ RPC failures that left gaps
-- ✅ Periodic data integrity checks  
-- ✅ Migrating from other indexing systems
-- ✅ Fixing timestamp issues
-- ✅ **Any time you have data problems**
+- ✅ RPC failures that left work incomplete
+- ✅ Ranges stuck in 'pending' state
+- ✅ Periodic maintenance to clear failed work
 
 **What It Fixes**:
-- Missing block ranges (gaps)
-- Failed processing attempts
-- Invalid '1970-01-01' timestamps
-- Corrupted state tracking
-- Orphaned data without state entries
+- Ranges marked as 'failed' in indexing_state
+- Ranges stuck as 'pending' that were never processed
+- Worker crashes that left ranges incomplete
+
+**What It Does NOT Do** (Roadmap Features):
+- Automatic gap detection between completed ranges
+- Timestamp correction from invalid dates
+- Data validation across all tables
+- State reconstruction from existing data
 
 ```bash
-# Fix all issues automatically
+# Process all failed/pending ranges
 make maintain
 
-# Fix issues in specific range  
+# Process issues for specific range
 make maintain START_BLOCK=1000000 END_BLOCK=2000000
 
 # Parallel maintenance
 make maintain WORKERS=4
-
-# Validate only (no fixes)
-make maintain START_BLOCK=0 END_BLOCK=0
 ```
 
 #### Maintain Operation Flow
 
-1. **Scan Phase**: Analyzes `indexing_state` and data tables
-2. **Detection Phase**: Identifies gaps, failed ranges, timestamp issues
-3. **Reconstruction Phase**: Rebuilds state tracking from actual data
-4. **Repair Phase**: Downloads missing data, fixes timestamps
-5. **Validation Phase**: Verifies all issues are resolved
+1. **Scan Phase**: Queries `indexing_state` table for failed/pending ranges
+2. **Report Phase**: Shows what issues were found
+3. **Retry Phase**: Re-processes each failed/pending range individually
+4. **Complete Phase**: Marks successfully processed ranges as completed
+
+### 4. Validate (Read-Only)
+**Check indexing progress and data integrity**
+
+```bash
+# Check overall progress
+make status
+
+# Validate specific range
+make status START_BLOCK=1000000 END_BLOCK=2000000
+```
 
 ## Indexing Modes
 
@@ -419,12 +416,12 @@ make continuous MODE=custom DATASETS=blocks,balance_diffs,storage_diffs
 ### Operation Settings
 | Variable | Description | Default | Options |
 |----------|-------------|---------|---------|
-| `OPERATION` | Operation mode | continuous | continuous, historical, maintain |
+| `OPERATION` | Operation mode | continuous | continuous, historical, maintain, validate |
 | `MODE` | Indexing mode | minimal | minimal, extra, diffs, full, custom |
 | `START_BLOCK` | Starting block number | 0 | For historical/maintain |
 | `END_BLOCK` | Ending block number | 0 | For historical/maintain |
 
-### Performance Settings (Simplified)
+### Performance Settings
 | Variable | Description | Default | Notes |
 |----------|-------------|---------|-------|
 | `WORKERS` | Number of parallel workers | 1 | Use 4-16 for historical |
@@ -434,9 +431,9 @@ make continuous MODE=custom DATASETS=blocks,balance_diffs,storage_diffs
 ### RPC Settings
 | Variable | Description | Default | Notes |
 |----------|-------------|---------|-------|
-| `REQUESTS_PER_SECOND` | RPC requests per second | 30 | Conservative default |
-| `MAX_CONCURRENT_REQUESTS` | Concurrent RPC requests | 3 | Prevent overload |
-| `CRYO_TIMEOUT` | Cryo command timeout (seconds) | 300 | Increase for slow networks |
+| `REQUESTS_PER_SECOND` | RPC requests per second | 20 | Conservative default |
+| `MAX_CONCURRENT_REQUESTS` | Concurrent RPC requests | 2 | Prevent overload |
+| `CRYO_TIMEOUT` | Cryo command timeout (seconds) | 600 | Increase for slow networks |
 
 ### Continuous Mode Settings
 | Variable | Description | Default | Notes |
@@ -466,7 +463,6 @@ The indexer automatically creates these tables in ClickHouse:
 - **`indexing_state`** - Single source of truth for all indexing state
 - **`indexing_progress`** - Real-time progress view (materialized view)
 - **`migrations`** - Database migration tracking
-
 
 ## Running with Docker
 
@@ -508,7 +504,7 @@ docker-compose up cryo-indexer-minimal
 OPERATION=historical START_BLOCK=18000000 END_BLOCK=18100000 \
 docker-compose --profile historical up historical-job
 
-# Maintenance (fix all issues)
+# Maintenance (fix failed/pending ranges)
 docker-compose --profile maintain up maintain-job
 ```
 
@@ -549,8 +545,8 @@ make start          # Alias for continuous
 make historical START_BLOCK=1000000 END_BLOCK=2000000
 make historical START_BLOCK=1000000 END_BLOCK=2000000 WORKERS=8
 
-# Maintenance (replaces fill-gaps, validate, backfill, fix-timestamps)
-make maintain       # Fix all data integrity issues
+# Maintenance (process failed/pending ranges)
+make maintain       # Fix failed/pending ranges from state table
 ```
 
 ### Quick Operations
@@ -567,7 +563,7 @@ make test-range START_BLOCK=18000000  # Test with 1000 blocks
 ### Monitoring
 ```bash
 make logs           # View logs
-make status         # Check indexing status (uses maintain operation)
+make status         # Check indexing status (uses validate operation)
 make ps            # Container status
 ```
 
@@ -597,19 +593,15 @@ indexing_state table:
 ```
 
 ### Stale Job Handling
-- **On Startup**: All 'processing' jobs older than 30 minutes are reset to 'pending'
-- **No Complex Monitoring**: Simple timeout-based detection
+- **On Startup**: All 'processing' jobs are reset to 'pending'
+- **No Complex Monitoring**: Simple state-based detection
 - **Self-Healing**: System automatically recovers from crashes
-
-### Gap Detectio
-- **Simple Logic**: Any range not marked as 'completed' is a gap
-- **Trust State Table**: Single source of truth approach
 
 ## Monitoring & Validation
 
 ### Progress Monitoring
 ```bash
-# Check overall progress (uses maintain operation)
+# Check overall progress (uses validate operation)
 make status
 
 # View detailed logs
@@ -620,7 +612,7 @@ make ps
 ```
 
 ### Validation Reports
-The maintain operation provides comprehensive reports:
+The validate operation provides progress reports:
 
 ```
 === INDEXING PROGRESS ===
@@ -630,7 +622,7 @@ blocks:
   Processing ranges: 0
   Failed ranges: 0
   Pending ranges: 0
-  Highest block: 18125000
+  Highest attempted: 18125000
   Total rows: 125,000,000
 
 transactions:
@@ -638,25 +630,16 @@ transactions:
   Processing ranges: 0
   Failed ranges: 1
   Pending ranges: 1
-  Highest block: 18124000
+  Highest attempted: 18125000
   Total rows: 45,230,123
 
-=== GAPS DETECTED ===
+=== MAINTENANCE NEEDED ===
 
-transactions: 2 gaps found
-  Gap 1: blocks 18124000-18125000 (1000 blocks)
-  Gap 2: blocks 18120000-18121000 (1000 blocks)
+transactions: 2 ranges need attention
+  Failed range: blocks 18124000-18125000 (1000 blocks)
+  Pending range: blocks 18120000-18121000 (1000 blocks)
 
-=== TIMESTAMP ISSUES ===
-
-logs: 150 rows with invalid timestamps
-contracts: 0 rows with invalid timestamps
-
-=== MAINTENANCE ACTIONS ===
-
-✓ Fixed 2 gaps in transactions
-✓ Fixed 150 timestamp issues in logs
-✓ All issues resolved
+💡 Run 'make maintain' to process these ranges
 ```
 
 ### Real-time Monitoring
@@ -664,14 +647,14 @@ During operations, the system provides clear progress updates:
 
 ```
 Historical Progress: 45/116 ranges (38.8%) | ✓ 43 | ✗ 2 | Rate: 12.5 ranges/min | ETA: 5.7 min
-Maintain Progress: Fixed 12/15 issues | Gaps: 8 | Timestamps: 4 | Failed: 0
+Maintain Progress: Fixed 12/15 ranges | ✓ 10 | ✗ 2 | Processed: 80%
 ```
 
 ## Performance Tuning
 
 ### Simplified Tuning Guidelines
 
-1. **Start with Defaults**: The new defaults are optimized for reliability
+1. **Start with Defaults**: The defaults are optimized for reliability
 2. **Scale Workers for Historical**: Use 4-16 workers for large historical jobs
 3. **Keep Batches Small**: 100-block batches prevent memory issues
 4. **Respect RPC Limits**: Conservative defaults prevent rate limiting
@@ -683,7 +666,7 @@ Maintain Progress: Fixed 12/15 issues | Gaps: 8 | Timestamps: 4 | Failed: 0
 # Production settings
 WORKERS=1                    # Single worker for stability
 BATCH_SIZE=100              # Small batches for low latency
-REQUESTS_PER_SECOND=30      # Conservative rate
+REQUESTS_PER_SECOND=20      # Conservative rate
 CONFIRMATION_BLOCKS=12      # Standard reorg protection
 POLL_INTERVAL=10           # Regular polling
 ```
@@ -710,10 +693,6 @@ BATCH_SIZE=100             # Reliable processing
 
 ## Troubleshooting
 
-### Simplified Issue Resolution
-
-**Most issues can be resolved with**: `make maintain`
-
 ### Common Issues
 
 #### "Blocks missing valid timestamps"
@@ -726,11 +705,11 @@ make historical START_BLOCK=X END_BLOCK=Y MODE=custom DATASETS=blocks
 make maintain
 ```
 
-#### "Everything appears as gaps"
-**Cause**: Missing state tracking  
+#### Ranges stuck as 'failed' or 'pending'
+**Cause**: Worker crashes, network issues, or processing failures  
 **Solution**:
 ```bash
-# Maintain operation will automatically rebuild state
+# Use maintain operation to retry these ranges
 make maintain
 ```
 
@@ -759,8 +738,8 @@ BATCH_SIZE=50 WORKERS=2 make historical
 ### Error Resolution Workflow
 
 1. **Check logs**: `make logs`
-2. **Run maintenance**: `make maintain` 
-3. **Validate results**: `make status`
+2. **Check status**: `make status`
+3. **Process failed/pending**: `make maintain`
 4. **If issues persist**: Reduce batch size/workers and retry
 
 ## Use Case Examples
@@ -780,13 +759,13 @@ make historical START_BLOCK=18000000 END_BLOCK=latest WORKERS=8
 make continuous
 ```
 
-#### 2. Existing Data (Migration from Other Indexer)
+#### 2. Existing Data (Recovery from Issues)
 ```bash
 # Setup
 make build  
 make run-migrations
 
-# Fix any data issues and create proper state tracking
+# Process any failed/pending ranges
 make maintain
 
 # Verify everything is working
@@ -801,7 +780,7 @@ make continuous
 # Target specific historical period
 make historical START_BLOCK=12000000 END_BLOCK=13000000 MODE=full
 
-# Validate completeness
+# Check for any incomplete ranges
 make maintain
 
 # Analyze specific events
@@ -811,10 +790,10 @@ make historical START_BLOCK=12500000 END_BLOCK=12600000 \
 
 #### 4. Maintenance and Recovery
 ```bash
-# Regular health check and issue fixing
+# Regular health check and fix failed/pending ranges
 make maintain
 
-# After system issues - this fixes everything
+# After system issues - this processes incomplete work
 make maintain
 
 # Verify all issues resolved  
@@ -824,9 +803,9 @@ make status
 #### 5. Debugging Data Issues
 ```bash
 # Check what's wrong
-make maintain START_BLOCK=1000000 END_BLOCK=2000000
+make status
 
-# Fix issues in specific range
+# Fix incomplete ranges in specific area
 make maintain START_BLOCK=1000000 END_BLOCK=2000000
 ```
 
@@ -884,6 +863,30 @@ make maintain START_BLOCK=18000000 END_BLOCK=18001000
 # Validate results
 make status
 ```
+
+## Roadmap Features
+
+The following features are mentioned in the codebase but not yet implemented:
+
+### Automatic Gap Detection
+- Detect missing ranges between completed blocks
+- Smart gap identification beyond simple state table scanning
+- Cross-table validation to find data inconsistencies
+
+### Automatic Timestamp Fixing
+- Detect and fix invalid '1970-01-01' timestamps
+- Join with blocks table to correct timestamp issues
+- Batch timestamp correction operations
+
+### Enhanced Validation
+- Deep data validation across all tables
+- Completeness checks beyond state table
+- Data consistency verification
+
+### State Reconstruction
+- Rebuild indexing_state from existing data tables
+- Recover from corrupted state tracking
+- Automatic state healing
 
 ## License
 
