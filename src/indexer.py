@@ -235,33 +235,54 @@ class CryoIndexer:
             sys.exit(1)
     
     def _run_maintain(self):
-        """Run maintenance operation - purely state-driven from indexing_state table."""
+        """Run maintenance operation - process failed/pending ranges, optionally filtered by block range."""
         logger.info("Starting maintenance operation")
-        logger.info("Scanning indexing_state table for failed/pending ranges...")
         
-        # Get all failed and pending ranges directly from state table
-        all_issues = self.state_manager.get_failed_and_pending_ranges(settings.mode.value, settings.datasets)
+        # Determine range filter
+        start_filter = settings.start_block if settings.start_block > 0 else 0
+        end_filter = settings.end_block if settings.end_block > 0 else 0
+        
+        if start_filter > 0 or end_filter > 0:
+            logger.info(f"Filtering maintenance to block range: {start_filter or 'start'} to {end_filter or 'end'}")
+            logger.info("Scanning indexing_state table for failed/pending ranges in specified range...")
+        else:
+            logger.info("Processing ALL failed/pending ranges in indexing_state table...")
+        
+        # Get issues, optionally filtered by range
+        all_issues = self.state_manager.get_failed_and_pending_ranges(
+            settings.mode.value, 
+            settings.datasets,
+            start_filter,
+            end_filter
+        )
         
         if not all_issues:
-            logger.info("🎉 No maintenance issues found!")
-            logger.info("All ranges in indexing_state table are either completed or currently processing.")
+            if start_filter > 0 or end_filter > 0:
+                logger.info("🎉 No maintenance issues found in the specified range!")
+            else:
+                logger.info("🎉 No maintenance issues found!")
+            logger.info("All ranges in scope are either completed or currently processing.")
             return
         
         # Group issues by type for reporting
         failed_issues = [issue for issue in all_issues if issue[3] == 'failed']
         pending_issues = [issue for issue in all_issues if issue[3] == 'pending']
         
-        logger.info(f"Found {len(all_issues)} ranges needing maintenance:")
+        if start_filter > 0 or end_filter > 0:
+            logger.info(f"Found {len(all_issues)} ranges needing maintenance in range {start_filter or 'start'}-{end_filter or 'end'}:")
+        else:
+            logger.info(f"Found {len(all_issues)} ranges needing maintenance:")
+        
         logger.info(f"  - {len(failed_issues)} failed ranges")
         logger.info(f"  - {len(pending_issues)} pending ranges")
         
-        # Log what we're going to fix
-        for start, end, dataset, status in all_issues[:10]:  # Show first 10
+        # Log what we're going to fix (first 10)
+        for start, end, dataset, status in all_issues[:10]:
             logger.info(f"Will fix: {dataset} {start}-{end} (status: {status})")
         if len(all_issues) > 10:
             logger.info(f"... and {len(all_issues) - 10} more ranges")
         
-        # Process issues - ONE ISSUE AT A TIME
+        # Process issues
         if settings.workers == 1:
             self._maintain_single_state_issues(all_issues)
         else:

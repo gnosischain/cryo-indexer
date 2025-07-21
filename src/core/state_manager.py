@@ -485,10 +485,16 @@ class StateManager:
             return False
         
 
-    def get_failed_and_pending_ranges(self, mode: str, datasets: List[str]) -> List[Tuple[int, int, str, str]]:
+    def get_failed_and_pending_ranges(self, mode: str, datasets: List[str], start_block: int = 0, end_block: int = 0) -> List[Tuple[int, int, str, str]]:
         """
         Get all failed and pending ranges from indexing_state table.
-        This is the core logic for maintain operation - purely state-driven.
+        Optionally filter by block range.
+        
+        Args:
+            mode: Indexing mode
+            datasets: List of datasets to check
+            start_block: Filter ranges >= this block (0 = no filter)
+            end_block: Filter ranges <= this block (0 = no filter)
         
         Returns:
             List of (start_block, end_block, dataset, status) tuples
@@ -501,32 +507,45 @@ class StateManager:
             # Build dataset filter
             datasets_str = "','".join(datasets)
             
-            # Get all failed and pending ranges
+            # Base query
             query = f"""
             SELECT DISTINCT start_block, end_block, dataset, status
             FROM {self.database}.indexing_state
             WHERE mode = '{mode}'
             AND dataset IN ('{datasets_str}')
             AND status IN ('failed', 'pending')
-            ORDER BY dataset, start_block
             """
+            
+            # Add block range filters if specified
+            if start_block > 0:
+                query += f" AND start_block >= {start_block}"
+            
+            if end_block > 0:
+                query += f" AND end_block <= {end_block}"
+                
+            query += " ORDER BY dataset, start_block"
             
             result = client.query(query)
             
             for row in result.result_rows:
-                start_block = row[0]
-                end_block = row[1]
+                start_block_val = row[0]
+                end_block_val = row[1]
                 dataset = row[2]
                 status = row[3]
                 
                 # Skip invalid ranges for diff datasets
-                if dataset in self.diff_datasets and start_block == 0:
-                    logger.warning(f"Skipping invalid range for diff dataset {dataset}: {start_block}-{end_block}")
+                if dataset in self.diff_datasets and start_block_val == 0:
+                    logger.warning(f"Skipping invalid range for diff dataset {dataset}: {start_block_val}-{end_block_val}")
                     continue
                     
-                issues.append((start_block, end_block, dataset, status))
+                issues.append((start_block_val, end_block_val, dataset, status))
             
-            logger.info(f"Found {len(issues)} failed/pending ranges in indexing_state table")
+            # Log what we found
+            if start_block > 0 or end_block > 0:
+                range_desc = f"in range {start_block or 'start'}-{end_block or 'end'}"
+                logger.info(f"Found {len(issues)} failed/pending ranges {range_desc}")
+            else:
+                logger.info(f"Found {len(issues)} failed/pending ranges (all ranges)")
             
             # Log breakdown by status
             failed_count = len([x for x in issues if x[3] == 'failed'])
