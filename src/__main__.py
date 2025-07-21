@@ -1,5 +1,5 @@
 """
-Cryo Indexer - Main entry point
+Cryo Indexer - Simplified entry point
 """
 import sys
 import os

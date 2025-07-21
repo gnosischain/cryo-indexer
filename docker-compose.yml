@@ -13,11 +13,10 @@ x-indexer-env: &indexer-env
   CLICKHOUSE_SECURE:   ${CLICKHOUSE_SECURE:-true}
 
   WORKERS:                 ${WORKERS:-1}
-  BATCH_SIZE:              ${BATCH_SIZE:-1000}
+  BATCH_SIZE:              ${BATCH_SIZE:-100}
   MAX_RETRIES:             ${MAX_RETRIES:-3}
-  INDEXING_RANGE_SIZE:     ${INDEXING_RANGE_SIZE:-1000}
-  REQUESTS_PER_SECOND:     ${REQUESTS_PER_SECOND:-50}
-  MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-5}
+  REQUESTS_PER_SECOND:     ${REQUESTS_PER_SECOND:-30}
+  MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-3}
   CRYO_TIMEOUT:            ${CRYO_TIMEOUT:-300}
 
   START_BLOCK:             ${START_BLOCK:-0}
@@ -25,36 +24,17 @@ x-indexer-env: &indexer-env
   CONFIRMATION_BLOCKS:     ${CONFIRMATION_BLOCKS:-12}
   POLL_INTERVAL:           ${POLL_INTERVAL:-10}
 
-  BACKFILL_CHUNK_SIZE:     ${BACKFILL_CHUNK_SIZE:-100000}
-  BACKFILL_FORCE:          ${BACKFILL_FORCE:-false}
-  GAP_DETECTION_STATE_CHUNK_SIZE:  ${GAP_DETECTION_STATE_CHUNK_SIZE:-100000}
-  GAP_DETECTION_TABLE_CHUNK_SIZE:  ${GAP_DETECTION_TABLE_CHUNK_SIZE:-10000}
-  GAP_DETECTION_THRESHOLD:         ${GAP_DETECTION_THRESHOLD:-0.8}
-  TIMESTAMP_FIX_BATCH_SIZE:        ${TIMESTAMP_FIX_BATCH_SIZE:-100000}
-  STRICT_TIMESTAMP_MODE:           ${STRICT_TIMESTAMP_MODE:-false}
-  STALE_JOB_TIMEOUT_MINUTES:       ${STALE_JOB_TIMEOUT_MINUTES:-30}
-
-  # Enhanced gap filling settings
-  HANDLE_FAILED_RANGES:           ${HANDLE_FAILED_RANGES:-false}
-  DELETE_FAILED_BEFORE_RETRY:     ${DELETE_FAILED_BEFORE_RETRY:-false}
-  MAX_RETRIES_OVERRIDE:           ${MAX_RETRIES_OVERRIDE:-0}
-
-  # Deduplication settings (Delete Before Insert strategy) - SIMPLIFIED
-  DELETE_BEFORE_REPROCESS:        ${DELETE_BEFORE_REPROCESS:-true}
-  DELETION_WAIT_TIME:             ${DELETION_WAIT_TIME:-1.0}
-  # REMOVED: VERIFY_COMPLETION_THRESHOLD and TRUST_INDEXING_STATE
-
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
 x-indexer-resources: &resources
   deploy:
     resources:
       limits:
-        memory: ${MEMORY_LIMIT:-4G}
-        cpus:   ${CPU_LIMIT:-2}
+        memory: 4G
+        cpus: '2'
       reservations:
-        memory: ${MEMORY_RESERVATION:-2G}
-        cpus:   ${CPU_RESERVATION:-1}
+        memory: 2G
+        cpus: '1'
 
 # --------------------------------------------------------------------------
 # 1. Volumes
@@ -70,8 +50,6 @@ volumes:
   indexer_logs_full:
   indexer_data_custom:
   indexer_logs_custom:
-  consolidate_data:      
-  consolidate_logs:
 
 # --------------------------------------------------------------------------
 # 2. Services
@@ -148,12 +126,12 @@ services:
       - ./migrations:/app/migrations
     <<: *resources
 
-  # Optional one-shot migration job
+  # Migration job
   migrations:
     image: cryo-indexer:latest
     container_name: cryo-migrations-${TIMESTAMP:-default}
     profiles: ["migrations"]
-    entrypoint: ["python", "-m", "src", "migrations"]
+    entrypoint: ["python", "-m", "src.db.migrations"]
     environment:
       CLICKHOUSE_HOST:     ${CLICKHOUSE_HOST}
       CLICKHOUSE_USER:     ${CLICKHOUSE_USER}
@@ -165,7 +143,7 @@ services:
     volumes:
       - ./migrations:/app/migrations
 
-  # Optional one-shot historical indexing job
+  # Historical indexing job
   historical-job:
     image: cryo-indexer:latest
     container_name: cryo-historical-${TIMESTAMP:-default}
@@ -181,39 +159,23 @@ services:
       - ./migrations:/app/migrations
     <<: *resources
 
-  # Optional one-shot backfill job
-  backfill-job:
+  # Maintenance job
+  maintain-job:
     image: cryo-indexer:latest
-    container_name: cryo-backfill-${TIMESTAMP:-default}
-    profiles: ["backfill"]
+    container_name: cryo-maintain-${TIMESTAMP:-default}
+    profiles: ["maintain"]
     restart: "no"
     environment:
       <<: *indexer-env
       MODE: ${MODE:-minimal}
-      OPERATION: backfill
+      OPERATION: maintain
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./migrations:/app/migrations
     <<: *resources
 
-  # Optional one-shot fill-gaps job
-  fill-gaps-job:
-    image: cryo-indexer:latest
-    container_name: cryo-fill-gaps-${TIMESTAMP:-default}
-    profiles: ["fill-gaps"]
-    restart: "no"
-    environment:
-      <<: *indexer-env
-      MODE: ${MODE:-minimal}
-      OPERATION: fill_gaps
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./migrations:/app/migrations
-    <<: *resources
-
-  # Optional one-shot validate job
+  # Validation job
   validate-job:
     image: cryo-indexer:latest
     container_name: cryo-validate-${TIMESTAMP:-default}
@@ -226,37 +188,5 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - ./migrations:/app/migrations
-    <<: *resources
-
-  # Optional one-shot timestamp fix job
-  fix-timestamps-job:
-    image: cryo-indexer:latest
-    container_name: cryo-fix-timestamps-${TIMESTAMP:-default}
-    profiles: ["fix-timestamps"]
-    restart: "no"
-    environment:
-      <<: *indexer-env
-      OPERATION: fix_timestamps
-      MODE: full
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./migrations:/app/migrations
-    <<: *resources
-
-  consolidate-job:
-    image: cryo-indexer:latest
-    container_name: cryo-consolidate-${TIMESTAMP:-default}
-    profiles: ["consolidate"]
-    restart: "no"
-    environment:
-      <<: *indexer-env
-      MODE: ${MODE:-full}
-      OPERATION: consolidate  # Make sure this is set
-      ETH_RPC_URL: "not-needed-for-consolidate"
-    volumes:
-      - consolidate_data:/app/data
-      - consolidate_logs:/app/logs
       - ./migrations:/app/migrations
     <<: *resources
