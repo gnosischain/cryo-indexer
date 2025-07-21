@@ -79,18 +79,27 @@ class CryoIndexer:
             sys.exit(1)
     
     def _run_continuous(self):
-        """Run continuous indexing, following the chain tip."""
-        logger.info("Starting continuous indexing")
+        """Run continuous indexing, following the chain tip with consistent 100-block ranges."""
+        logger.info("Starting continuous indexing with fixed 100-block ranges")
         
-        # Get starting point from database
+        # Get starting point from database  
         last_block = self.state_manager.get_last_synced_block(
             settings.mode.value, settings.datasets
         )
         
         if settings.start_block > last_block:
             last_block = settings.start_block
-            
-        logger.info(f"Starting from block {last_block}")
+        
+        # Always align to batch_size boundaries for continuous mode
+        # Round down to nearest batch_size boundary to ensure consistent ranges
+        aligned_start = (last_block // settings.batch_size) * settings.batch_size
+        if aligned_start < last_block:
+            aligned_start += settings.batch_size
+        
+        logger.info(f"Starting from block {last_block}, aligned to range start {aligned_start}")
+        logger.info(f"Using fixed batch size: {settings.batch_size} blocks")
+        
+        current_range_start = aligned_start
         
         # Create worker
         worker = IndexerWorker(
@@ -110,23 +119,24 @@ class CryoIndexer:
                 latest_block = self.blockchain.get_latest_block_number()
                 safe_block = latest_block - settings.confirmation_blocks
                 
-                # Check if there's work to do
-                if safe_block > last_block:
-                    # Process in small batches for reliability
-                    batch_end = min(last_block + settings.batch_size, safe_block)
-                    
-                    logger.info(f"Processing blocks {last_block}-{batch_end}")
-                    success = worker.process_range(last_block, batch_end, settings.datasets)
+                # Calculate next range
+                range_end = current_range_start + settings.batch_size
+                
+                # Check if we can process this range
+                if range_end <= safe_block:
+                    logger.info(f"Processing blocks {current_range_start}-{range_end} (exactly {settings.batch_size} blocks)")
+                    success = worker.process_range(current_range_start, range_end, settings.datasets)
                     
                     if success:
-                        last_block = batch_end
+                        current_range_start = range_end  # Move to next 100-block range
+                        logger.debug(f"Range completed, next range: {current_range_start}-{current_range_start + settings.batch_size}")
                     else:
-                        logger.error(f"Failed to process blocks {last_block}-{batch_end}")
+                        logger.error(f"Failed to process blocks {current_range_start}-{range_end}, will retry")
                         time.sleep(settings.poll_interval)
                 else:
-                    logger.debug(f"No new blocks. Latest: {latest_block}, Last processed: {last_block}")
+                    logger.debug(f"Waiting for more blocks. Need {range_end}, safe block is {safe_block}")
                     time.sleep(settings.poll_interval)
-                    
+                        
             except Exception as e:
                 logger.error(f"Error in continuous loop: {e}", exc_info=True)
                 time.sleep(settings.poll_interval)
