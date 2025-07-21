@@ -1,10 +1,8 @@
--- Create comprehensive indexing state management tables
--- Optimized for ClickHouse Cloud with minimal RAM usage
-
+-- Simplified indexing state management table
 
 CREATE TABLE IF NOT EXISTS {{database}}.indexing_state
 (
-    `mode` String,                    -- Indexing mode (default, full, minimal, etc.)
+    `mode` String,                    -- Indexing mode (minimal, full, etc.)
     `dataset` String,                 -- Dataset name (blocks, transactions, etc.)
     `start_block` UInt32,            -- Start of the range
     `end_block` UInt32,              -- End of the range (exclusive)
@@ -12,15 +10,11 @@ CREATE TABLE IF NOT EXISTS {{database}}.indexing_state
     `worker_id` String DEFAULT '',    -- Worker processing this range
     `attempt_count` UInt8 DEFAULT 0,  -- Number of attempts
     `created_at` DateTime DEFAULT now(),
-    `started_at` Nullable(DateTime),
     `completed_at` Nullable(DateTime),
     `rows_indexed` Nullable(UInt64),
     `error_message` Nullable(String),
-    `batch_id` String DEFAULT '',     -- For grouping related ranges
-    `version` DateTime DEFAULT now(), -- Version column for ReplacingMergeTree
     `insert_version` UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9)),
     
-   
     INDEX idx_status (status) TYPE minmax GRANULARITY 4,
     INDEX idx_mode_dataset (mode, dataset) TYPE minmax GRANULARITY 4
 )
@@ -29,7 +23,7 @@ PARTITION BY toYYYYMM(created_at)
 ORDER BY (mode, dataset, start_block)
 SETTINGS index_granularity = 8192;
 
-
+-- Simple progress view
 CREATE VIEW IF NOT EXISTS {{database}}.indexing_progress AS
 SELECT 
     mode,
@@ -42,19 +36,5 @@ SELECT
     sum(rows_indexed) as total_rows_indexed
 FROM {{database}}.indexing_state
 GROUP BY mode, dataset;
-
-
-CREATE TABLE IF NOT EXISTS {{database}}.sync_position
-(
-    `mode` String,
-    `dataset` String,
-    `last_synced_block` UInt32,
-    `updated_at` DateTime DEFAULT now(),
-    `insert_version` UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
-)
-ENGINE = ReplacingMergeTree(insert_version)
-ORDER BY (mode, dataset)
-SETTINGS index_granularity = 8192;
-
 
 INSERT INTO {{database}}.migrations (name) VALUES ('012_create_indexing_state');

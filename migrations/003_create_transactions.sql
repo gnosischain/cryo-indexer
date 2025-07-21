@@ -20,6 +20,12 @@ CREATE TABLE IF NOT EXISTS {{database}}.transactions
     `n_input_bytes` Nullable(UInt32),
     `n_input_zero_bytes` Nullable(UInt32),
     `n_input_nonzero_bytes` Nullable(UInt32),
+    `n_rlp_bytes` Nullable(UInt32),
+    `timestamp` Nullable(UInt32),
+    `r` Nullable(String),
+    `s` Nullable(String),
+    `v` Nullable(UInt32),
+    `block_hash` Nullable(String),
     `chain_id` Nullable(UInt64),
     `block_timestamp` DateTime64(0, 'UTC'),
     `insert_version` UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))

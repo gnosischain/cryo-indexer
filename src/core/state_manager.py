@@ -1,13 +1,12 @@
 """
-Database-based state management for the indexer.
-Simplified version that trusts indexing_state table completely.
+Simplified state management for the indexer.
+Single source of truth with clear status model.
 """
 from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from loguru import logger
 import uuid
-from ..config import settings
 
 
 @dataclass
@@ -21,63 +20,34 @@ class IndexingRange:
     worker_id: str = ""
     attempt_count: int = 0
     created_at: Optional[datetime] = None
-    started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     rows_indexed: Optional[int] = None
     error_message: Optional[str] = None
-    batch_id: str = ""
 
 
 class StateManager:
-    """Manages indexing state in ClickHouse - simplified to trust state completely."""
+    """Simplified state management using only indexing_state table."""
     
     def __init__(self, clickhouse_manager):
         self.db = clickhouse_manager
         self.database = clickhouse_manager.database
         
-        # Get range size from settings
-        self.range_size = getattr(settings, 'indexing_range_size', 1000)
-    
-    def _prepare_value(self, value: Any, column_type: str = 'string') -> str:
-        """
-        Prepare a value for SQL insertion with consistent NULL handling.
-        
-        Args:
-            value: The value to prepare
-            column_type: Type of the column ('string', 'number', 'datetime')
-            
-        Returns:
-            Properly formatted SQL value
-        """
-        if value is None or (isinstance(value, str) and value.strip() == ''):
-            return 'NULL'
-        elif column_type == 'string':
-            # Escape single quotes and return quoted string
-            safe_value = str(value).replace("'", "''")
-            return f"'{safe_value}'"
-        elif column_type == 'number':
-            return str(value)
-        elif column_type == 'datetime':
-            return f"'{value}'" if value else 'NULL'
-        else:
-            return f"'{value}'"
+        # Datasets that cannot start from block 0
+        self.diff_datasets = {'balance_diffs', 'code_diffs', 'nonce_diffs', 'storage_diffs'}
     
     def get_range_status(self, mode: str, dataset: str, start_block: int, end_block: int) -> Optional[str]:
         """
-        Get the current status of a range from indexing_state.
+        Get the current status of a range.
         Returns: 'completed', 'processing', 'failed', 'pending', or None if not found
-        
-        Also checks if 'processing' ranges are stale and should be considered available.
         """
         try:
             client = self.db._connect()
             
-            # Get the latest status with timing info
             query = f"""
-            SELECT status, started_at, worker_id
+            SELECT status, created_at
             FROM {self.database}.indexing_state
-            WHERE mode = {self._prepare_value(mode)}
-              AND dataset = {self._prepare_value(dataset)}
+            WHERE mode = '{mode}'
+              AND dataset = '{dataset}'
               AND start_block = {start_block}
               AND end_block = {end_block}
             ORDER BY created_at DESC
@@ -89,35 +59,13 @@ class StateManager:
                 return None
                 
             status = result.result_rows[0][0]
-            started_at = result.result_rows[0][1]
-            worker_id = result.result_rows[0][2] if len(result.result_rows[0]) > 2 else None
+            created_at = result.result_rows[0][1]
             
-            # If status is 'processing', check if it's stale
-            if status == 'processing' and started_at:
-                stale_timeout = getattr(settings, 'stale_job_timeout_minutes', 30)
-                stale_check_query = f"""
-                SELECT 
-                    CASE 
-                        WHEN started_at < now() - INTERVAL {stale_timeout} MINUTE 
-                        THEN 1 
-                        ELSE 0 
-                    END as is_stale
-                FROM {self.database}.indexing_state
-                WHERE mode = {self._prepare_value(mode)}
-                  AND dataset = {self._prepare_value(dataset)}
-                  AND start_block = {start_block}
-                  AND end_block = {end_block}
-                  AND status = 'processing'
-                  AND started_at = '{started_at}'
-                """
-                stale_result = client.query(stale_check_query)
-                
-                if stale_result.result_rows and stale_result.result_rows[0][0] == 1:
-                    logger.warning(
-                        f"Range {dataset} {start_block}-{end_block} has stale 'processing' status "
-                        f"(worker: {worker_id}, started: {started_at})"
-                    )
-                    # Consider it as available for claiming
+            # Check if processing status is stale (older than 30 minutes)
+            if status == 'processing' and created_at:
+                stale_threshold = datetime.now() - timedelta(minutes=30)
+                if created_at < stale_threshold:
+                    logger.warning(f"Stale processing range found: {dataset} {start_block}-{end_block}")
                     return 'stale'
             
             return status
@@ -127,35 +75,28 @@ class StateManager:
             return None
     
     def claim_range(self, mode: str, dataset: str, start_block: int, end_block: int, 
-                   worker_id: str, batch_id: str = "", force: bool = False) -> bool:
+                   worker_id: str) -> bool:
         """
         Atomically claim a block range for processing.
         Returns True if successfully claimed, False if already being processed.
         """
         try:
-            # Get current status
             status = self.get_range_status(mode, dataset, start_block, end_block)
             
-            # If force mode, always claim
-            if force:
-                logger.debug(f"Force claiming range {dataset} {start_block}-{end_block}")
-            else:
-                # Check if we can claim this range
-                if status == 'completed':
-                    logger.debug(f"Range {dataset} {start_block}-{end_block} already completed")
-                    return False
-                elif status == 'processing':
-                    logger.debug(f"Range {dataset} {start_block}-{end_block} already being processed")
-                    return False
+            # Check if we can claim this range
+            if status == 'completed':
+                return False
+            elif status == 'processing':
+                return False
             
             # Claim the range
             client = self.db._connect()
             insert_query = f"""
             INSERT INTO {self.database}.indexing_state
-            (mode, dataset, start_block, end_block, status, worker_id, started_at, batch_id)
+            (mode, dataset, start_block, end_block, status, worker_id, created_at)
             VALUES
-            ({self._prepare_value(mode)}, {self._prepare_value(dataset)}, {start_block}, {end_block}, 
-             'processing', {self._prepare_value(worker_id)}, now(), {self._prepare_value(batch_id)})
+            ('{mode}', '{dataset}', {start_block}, {end_block}, 
+             'processing', '{worker_id}', now())
             """
             client.command(insert_query)
             return True
@@ -165,53 +106,21 @@ class StateManager:
             return False
     
     def complete_range(self, mode: str, dataset: str, start_block: int, 
-                  end_block: int, rows_indexed: int = 0) -> None:
+                      end_block: int, rows_indexed: int = 0) -> None:
         """Mark a range as completed."""
         try:
             client = self.db._connect()
             
-            # First, get the started_at time from the existing processing entry
-            get_started_query = f"""
-            SELECT started_at 
-            FROM {self.database}.indexing_state
-            WHERE mode = {self._prepare_value(mode)}
-            AND dataset = {self._prepare_value(dataset)}
-            AND start_block = {start_block}
-            AND end_block = {end_block}
-            AND status = 'processing'
-            ORDER BY created_at DESC
-            LIMIT 1
+            update_query = f"""
+            INSERT INTO {self.database}.indexing_state
+            (mode, dataset, start_block, end_block, status, completed_at, rows_indexed)
+            VALUES
+            ('{mode}', '{dataset}', {start_block}, {end_block}, 
+             'completed', now(), {rows_indexed})
             """
-            result = client.query(get_started_query)
-            
-            started_at = None
-            if result.result_rows and result.result_rows[0][0]:
-                started_at = result.result_rows[0][0]
-            
-            # Now insert the completed entry with the preserved started_at
-            if started_at:
-                update_query = f"""
-                INSERT INTO {self.database}.indexing_state
-                (mode, dataset, start_block, end_block, status, started_at, completed_at, rows_indexed)
-                VALUES
-                ({self._prepare_value(mode)}, {self._prepare_value(dataset)}, {start_block}, {end_block}, 
-                'completed', '{started_at}', now(), {rows_indexed})
-                """
-            else:
-                # Fallback if we couldn't find the started_at (shouldn't happen normally)
-                update_query = f"""
-                INSERT INTO {self.database}.indexing_state
-                (mode, dataset, start_block, end_block, status, completed_at, rows_indexed)
-                VALUES
-                ({self._prepare_value(mode)}, {self._prepare_value(dataset)}, {start_block}, {end_block}, 
-                'completed', now(), {rows_indexed})
-                """
-            
             client.command(update_query)
             
-            # Update sync position for continuous mode
-            if mode == "continuous":
-                self.update_sync_position(mode, dataset, end_block)
+            logger.debug(f"Marked {dataset} range {start_block}-{end_block} as completed ({rows_indexed} rows)")
                 
         except Exception as e:
             logger.error(f"Error completing range: {e}")
@@ -222,62 +131,51 @@ class StateManager:
         try:
             client = self.db._connect()
             
-            # Get current attempt count first
+            # Get current attempt count
             count_query = f"""
             SELECT COALESCE(MAX(attempt_count), 0) + 1
             FROM {self.database}.indexing_state
-            WHERE mode = {self._prepare_value(mode)}
-              AND dataset = {self._prepare_value(dataset)}
+            WHERE mode = '{mode}'
+              AND dataset = '{dataset}'
               AND start_block = {start_block}
               AND end_block = {end_block}
             """
             result = client.query(count_query)
             next_attempt = result.result_rows[0][0] if result.result_rows else 1
             
-            # Prepare error message - truncate to 500 chars
-            safe_error = error_message[:500] if error_message else None
+            # Truncate error message
+            safe_error = error_message[:500] if error_message else ""
+            safe_error = safe_error.replace("'", "''")  # Escape single quotes
             
             update_query = f"""
             INSERT INTO {self.database}.indexing_state
             (mode, dataset, start_block, end_block, status, error_message, attempt_count)
             VALUES
-            ({self._prepare_value(mode)}, {self._prepare_value(dataset)}, {start_block}, {end_block}, 
-             'failed', {self._prepare_value(safe_error)}, {next_attempt})
+            ('{mode}', '{dataset}', {start_block}, {end_block}, 
+             'failed', '{safe_error}', {next_attempt})
             """
             client.command(update_query)
+            
+            logger.error(f"Marked {dataset} range {start_block}-{end_block} as failed (attempt {next_attempt})")
             
         except Exception as e:
             logger.error(f"Error marking range as failed: {e}")
     
     def get_last_synced_block(self, mode: str, datasets: List[str]) -> int:
         """
-        Get the last successfully synced block for a mode.
-        Returns the minimum across all datasets to ensure completeness.
+        Get the last successfully synced block across all datasets.
+        Returns the minimum to ensure completeness.
         """
         try:
             client = self.db._connect()
             
-            # For continuous mode, check sync position
-            if mode == "continuous":
-                datasets_str = "','".join(datasets)
-                query = f"""
-                SELECT MIN(last_synced_block) as min_block
-                FROM {self.database}.sync_position
-                WHERE mode = {self._prepare_value(mode)}
-                  AND dataset IN ('{datasets_str}')
-                """
-                result = client.query(query)
-                if result.result_rows and result.result_rows[0][0] is not None:
-                    return result.result_rows[0][0]
-            
-            # Otherwise, check completed ranges
             datasets_str = "','".join(datasets)
             query = f"""
             SELECT 
                 dataset,
                 MAX(end_block) as last_block
             FROM {self.database}.indexing_state
-            WHERE mode = {self._prepare_value(mode)}
+            WHERE mode = '{mode}'
               AND dataset IN ('{datasets_str}')
               AND status = 'completed'
             GROUP BY dataset
@@ -295,273 +193,166 @@ class StateManager:
             logger.error(f"Error getting last synced block: {e}")
             return 0
     
-    def update_sync_position(self, mode: str, dataset: str, block_number: int) -> None:
-        """Update the sync position for continuous indexing."""
-        try:
-            client = self.db._connect()
-            query = f"""
-            INSERT INTO {self.database}.sync_position
-            (mode, dataset, last_synced_block)
-            VALUES ({self._prepare_value(mode)}, {self._prepare_value(dataset)}, {block_number})
-            """
-            client.command(query)
-        except Exception as e:
-            logger.error(f"Error updating sync position: {e}")
-    
     def find_gaps(self, mode: str, dataset: str, start_block: int, 
-                  end_block: int, min_gap_size: int = 1) -> List[Tuple[int, int]]:
+          end_block: int) -> List[Tuple[int, int]]:
         """
-        Find gaps in indexed data based on indexing_state.
-        A gap is any range that isn't marked as 'completed'.
+        Find gaps in indexed data - ONLY REAL GAPS, NOT CONTINUATION RANGES.
+        A gap is a missing range WITHIN the completed scope, not beyond it.
         """
         gaps = []
         
         try:
             client = self.db._connect()
             
-            # Align to range boundaries
-            aligned_start = (start_block // self.range_size) * self.range_size
-            aligned_end = ((end_block // self.range_size) + 1) * self.range_size
+            # Step 1: Get the actual range that was attempted for this dataset
+            highest_attempted = self._get_highest_attempted_block(mode, dataset)
             
-            # Find all completed ranges
-            query = f"""
+            if highest_attempted == 0:
+                logger.info(f"No data found for {dataset} in mode {mode}")
+                return []
+            
+            # Step 2: Determine effective range to check
+            effective_start = start_block
+            if dataset in self.diff_datasets and effective_start == 0:
+                effective_start = 1000  # Start from first valid range for diff datasets
+            
+            # CRITICAL FIX: Only look for gaps WITHIN the attempted range, not beyond it
+            if end_block == 0 or end_block > highest_attempted:
+                effective_end = highest_attempted
+            else:
+                effective_end = min(end_block, highest_attempted)
+            
+            # Don't look for gaps beyond what was actually attempted
+            if effective_end <= effective_start:
+                logger.info(f"No gap detection needed for {dataset}: effective range {effective_start}-{effective_end}")
+                return []
+            
+            logger.debug(f"Gap detection for {dataset}: checking {effective_start} to {effective_end}")
+            
+            # Step 3: Get all COMPLETED ranges within this span
+            completed_query = f"""
             SELECT start_block, end_block
             FROM {self.database}.indexing_state
-            WHERE mode = {self._prepare_value(mode)}
-              AND dataset = {self._prepare_value(dataset)}
-              AND status = 'completed'
-              AND start_block >= {aligned_start}
-              AND end_block <= {aligned_end}
+            WHERE mode = '{mode}'
+            AND dataset = '{dataset}'
+            AND status = 'completed'
+            AND start_block >= {effective_start}
+            AND end_block <= {effective_end}
             ORDER BY start_block
             """
-            result = client.query(query)
-            
+            result = client.query(completed_query)
             completed_ranges = [(row[0], row[1]) for row in result.result_rows]
             
-            # Find gaps
-            current = aligned_start
+            # Step 4: Find missing ranges (gaps between completed ranges)
+            # ONLY within the effective range, not extending beyond
+            current = effective_start
             for comp_start, comp_end in completed_ranges:
                 if current < comp_start:
+                    # Found a gap WITHIN the attempted range
                     gaps.append((current, comp_start))
                 current = max(current, comp_end)
             
-            # Check for gap at the end
-            if current < aligned_end:
-                gaps.append((current, aligned_end))
-            
-            # Also find non-completed ranges (failed, pending, etc)
-            non_completed_query = f"""
-            SELECT start_block, end_block
+            # Step 5: Add explicitly failed ranges
+            failed_query = f"""
+            SELECT DISTINCT start_block, end_block
             FROM {self.database}.indexing_state
-            WHERE mode = {self._prepare_value(mode)}
-              AND dataset = {self._prepare_value(dataset)}
-              AND status != 'completed'
-              AND status != 'processing'
-              AND start_block >= {aligned_start}
-              AND end_block <= {aligned_end}
+            WHERE mode = '{mode}'
+            AND dataset = '{dataset}'
+            AND status = 'failed'
+            AND start_block >= {effective_start}
+            AND end_block <= {effective_end}
             ORDER BY start_block
             """
-            result = client.query(non_completed_query)
+            result = client.query(failed_query)
             
             for row in result.result_rows:
-                gaps.append((row[0], row[1]))
+                gap_range = (row[0], row[1])
+                if dataset in self.diff_datasets and gap_range[0] == 0:
+                    continue
+                if gap_range not in gaps:
+                    gaps.append(gap_range)
             
-            # Remove duplicates and sort
+            # Step 6: Remove duplicates and sort
             gaps = sorted(list(set(gaps)))
             
-            logger.info(f"Found {len(gaps)} gaps for {dataset} in range {start_block}-{end_block}")
-            return gaps
+            # Step 7: Final validation
+            validated_gaps = []
+            for gap_start, gap_end in gaps:
+                # Skip invalid ranges
+                if dataset in self.diff_datasets and gap_start == 0:
+                    continue
+                
+                # Skip tiny ranges
+                if gap_end - gap_start < 100:  # Must be substantial gap
+                    continue
+                
+                # Double-check this range isn't actually completed
+                check_query = f"""
+                SELECT COUNT(*) 
+                FROM {self.database}.indexing_state
+                WHERE mode = '{mode}'
+                AND dataset = '{dataset}'
+                AND status = 'completed'
+                AND start_block = {gap_start}
+                AND end_block = {gap_end}
+                """
+                result = client.query(check_query)
+                
+                if result.result_rows[0][0] == 0:  # Not completed
+                    validated_gaps.append((gap_start, gap_end))
+            
+            if validated_gaps:
+                logger.info(f"Found {len(validated_gaps)} REAL gaps for {dataset} (missing ranges within attempted scope)")
+                for gap_start, gap_end in validated_gaps:
+                    logger.info(f"  Real Gap: {dataset} {gap_start}-{gap_end}")
+            else:
+                logger.info(f"No real gaps found for {dataset} ✓ (all attempted ranges are complete)")
+            
+            return validated_gaps
             
         except Exception as e:
             logger.error(f"Error finding gaps: {e}")
             return []
-    
-    def get_failed_ranges(self, mode: str, dataset: str, start_block: int, 
-                         end_block: int, max_attempts: Optional[int] = None) -> List[Tuple[int, int, int, str]]:
+
+
+    def _get_highest_attempted_block(self, mode: str, dataset: str) -> int:
         """
-        Get failed ranges within the specified block range.
-        Returns list of tuples: (start_block, end_block, attempt_count, error_message)
+        Get the highest block that was actually attempted (completed, failed, or processing).
+        This helps distinguish between real gaps and simply unprocessed work.
         """
         try:
             client = self.db._connect()
             
-            # Build query
+            # Find the highest end_block across all statuses for this dataset
             query = f"""
-            SELECT start_block, end_block, attempt_count, error_message
+            SELECT MAX(end_block) as highest_block
             FROM {self.database}.indexing_state
-            WHERE mode = {self._prepare_value(mode)}
-              AND dataset = {self._prepare_value(dataset)}
-              AND status = 'failed'
-              AND start_block >= {start_block}
-              AND end_block <= {end_block}
-            """
-            
-            # Add max attempts filter if specified
-            if max_attempts is not None:
-                query += f" AND attempt_count < {max_attempts}"
-            
-            query += " ORDER BY start_block"
-            
-            result = client.query(query)
-            
-            failed_ranges = []
-            for row in result.result_rows:
-                failed_ranges.append((row[0], row[1], row[2], row[3] or ""))
-                logger.debug(f"Found failed range for {dataset}: {row[0]}-{row[1]} (attempts: {row[2]})")
-            
-            logger.info(f"Found {len(failed_ranges)} failed ranges for {dataset}")
-            return failed_ranges
-            
-        except Exception as e:
-            logger.error(f"Error getting failed ranges: {e}")
-            return []
-    
-    def delete_range_entries(self, mode: str, dataset: str, ranges: List[Tuple[int, int]]) -> int:
-        """
-        Delete indexing_state entries for specified ranges.
-        Returns number of ranges deleted.
-        """
-        try:
-            client = self.db._connect()
-            deleted_count = 0
-            
-            for start_block, end_block in ranges:
-                delete_query = f"""
-                ALTER TABLE {self.database}.indexing_state
-                DELETE WHERE mode = {self._prepare_value(mode)}
-                  AND dataset = {self._prepare_value(dataset)}
-                  AND start_block = {start_block}
-                  AND end_block = {end_block}
-                """
-                client.command(delete_query)
-                deleted_count += 1
-                logger.debug(f"Deleted entry for {dataset} range {start_block}-{end_block}")
-            
-            logger.info(f"Deleted {deleted_count} range entries for {dataset}")
-            return deleted_count
-            
-        except Exception as e:
-            logger.error(f"Error deleting range entries: {e}")
-            return 0
-    
-    def get_stale_jobs(self, timeout_minutes: int = 30) -> List[IndexingRange]:
-        """Find jobs that have been processing for too long."""
-        try:
-            client = self.db._connect()
-            query = f"""
-            SELECT mode, dataset, start_block, end_block, worker_id, started_at, attempt_count
-            FROM {self.database}.indexing_state
-            WHERE status = 'processing'
-              AND started_at < now() - INTERVAL {timeout_minutes} MINUTE
-            LIMIT 1000
+            WHERE mode = '{mode}'
+            AND dataset = '{dataset}'
+            AND status IN ('completed', 'failed', 'processing', 'pending')
             """
             result = client.query(query)
             
-            stale_jobs = []
-            for row in result.result_rows:
-                stale_jobs.append(IndexingRange(
-                    mode=row[0],
-                    dataset=row[1],
-                    start_block=row[2],
-                    end_block=row[3],
-                    worker_id=row[4],
-                    started_at=row[5],
-                    attempt_count=row[6] if len(row) > 6 else 0,
-                    status='processing'
-                ))
+            if result.result_rows and result.result_rows[0][0] is not None:
+                highest = result.result_rows[0][0]
+                logger.debug(f"Highest attempted block for {dataset}: {highest}")
+                return highest
             
-            return stale_jobs
-            
-        except Exception as e:
-            logger.error(f"Error finding stale jobs: {e}")
-            return []
-    
-    def reset_stale_jobs(self, timeout_minutes: int = 30) -> int:
-        """Reset stale jobs back to pending status."""
-        try:
-            client = self.db._connect()
-            
-            # First get the stale jobs
-            stale_jobs = self.get_stale_jobs(timeout_minutes)
-            
-            # Reset each one
-            reset_count = 0
-            for job in stale_jobs:
-                next_attempt = job.attempt_count + 1
-                
-                reset_query = f"""
-                INSERT INTO {self.database}.indexing_state
-                (mode, dataset, start_block, end_block, status, attempt_count)
-                VALUES
-                ({self._prepare_value(job.mode)}, {self._prepare_value(job.dataset)}, 
-                 {job.start_block}, {job.end_block}, 'pending', {next_attempt})
-                """
-                client.command(reset_query)
-                reset_count += 1
-                
-            if reset_count > 0:
-                logger.info(f"Reset {reset_count} stale jobs")
-                
-            return reset_count
-            
-        except Exception as e:
-            logger.error(f"Error resetting stale jobs: {e}")
             return 0
-    
-    def reset_all_processing_jobs(self) -> int:
+            
+        except Exception as e:
+            logger.error(f"Error getting highest attempted block: {e}")
+            return 0
+
+
+    def get_processing_summary(self, mode: str) -> Dict[str, Dict]:
         """
-        Reset ALL 'processing' jobs to 'pending' status.
-        Called on startup to clean up from previous crashes.
+        Enhanced progress summary that separates real gaps from unprocessed work.
         """
         try:
             client = self.db._connect()
             
-            # Get all processing jobs
-            query = f"""
-            SELECT mode, dataset, start_block, end_block, worker_id, attempt_count
-            FROM {self.database}.indexing_state
-            WHERE status = 'processing'
-            """
-            result = client.query(query)
-            
-            reset_count = 0
-            for row in result.result_rows:
-                mode, dataset, start_block, end_block, worker_id, attempt_count = row[:6]
-                next_attempt = (attempt_count or 0) + 1
-                
-                # Insert a new 'pending' entry
-                reset_query = f"""
-                INSERT INTO {self.database}.indexing_state
-                (mode, dataset, start_block, end_block, status, attempt_count, error_message)
-                VALUES
-                ({self._prepare_value(mode)}, {self._prepare_value(dataset)}, 
-                 {start_block}, {end_block}, 'pending', {next_attempt}, 
-                 {self._prepare_value('Reset from processing on startup')})
-                """
-                client.command(reset_query)
-                reset_count += 1
-                
-                logger.info(
-                    f"Reset {dataset} {start_block}-{end_block} from 'processing' to 'pending' "
-                    f"(was worker: {worker_id})"
-                )
-            
-            if reset_count > 0:
-                logger.info(f"Reset {reset_count} processing jobs on startup")
-            else:
-                logger.info("No processing jobs found to reset")
-                
-            return reset_count
-            
-        except Exception as e:
-            logger.error(f"Error resetting processing jobs: {e}")
-            return 0
-    
-    def get_progress_summary(self, mode: str) -> Dict[str, Dict]:
-        """Get indexing progress summary."""
-        try:
-            client = self.db._connect()
-            
+            # Get basic stats
             query = f"""
             SELECT 
                 dataset,
@@ -570,10 +361,11 @@ class StateManager:
                 countIf(status = 'processing') as processing_ranges,
                 countIf(status = 'failed') as failed_ranges,
                 countIf(status = 'pending') as pending_ranges,
-                MAX(end_block) as highest_block,
+                MAX(end_block) as highest_attempted_block,
+                maxIf(end_block, status = 'completed') as highest_completed_block,
                 SUM(rows_indexed) as total_rows_indexed
             FROM {self.database}.indexing_state
-            WHERE mode = {self._prepare_value(mode)}
+            WHERE mode = '{mode}'
             GROUP BY dataset
             """
             result = client.query(query)
@@ -587,29 +379,166 @@ class StateManager:
                     'processing_ranges': row[3],
                     'failed_ranges': row[4],
                     'pending_ranges': row[5],
-                    'highest_block': row[6],
-                    'total_rows_indexed': row[7] or 0,
-                    'range_size': self.range_size
+                    'highest_attempted_block': row[6] or 0,
+                    'highest_completed_block': row[7] or 0,
+                    'total_rows_indexed': row[8] or 0,
+                    
+                    # Calculate progress percentage
+                    'completion_percentage': (row[2] / row[1] * 100) if row[1] > 0 else 0,
+                    
+                    # Determine status
+                    'status': self._determine_dataset_status(row[2], row[3], row[4], row[5])
                 }
                 
             return summary
             
         except Exception as e:
-            logger.error(f"Error getting progress summary: {e}")
+            logger.error(f"Error getting processing summary: {e}")
             return {}
+
+
+    def _determine_dataset_status(self, completed: int, processing: int, failed: int, pending: int) -> str:
+        """Determine the overall status of a dataset."""
+        total = completed + processing + failed + pending
         
-    def get_max_completed_block(self, mode: str, dataset: str) -> int:
-        """Get the maximum completed block for a dataset."""
+        if total == 0:
+            return "no_data"
+        elif completed == total:
+            return "complete"
+        elif processing > 0:
+            return "in_progress"
+        elif failed > 0 and pending == 0 and processing == 0:
+            return "failed"
+        elif pending > 0:
+            return "pending"
+        else:
+            return "mixed"
+    
+    def cleanup_stale_jobs(self, timeout_minutes: int = 30) -> int:
+        """Reset ALL processing jobs to pending on startup (not just stale ones)."""
         try:
             client = self.db._connect()
-            result = client.query(f"""
-                SELECT MAX(end_block) 
-                FROM {self.database}.indexing_state
-                WHERE mode = {self._prepare_value(mode)}
-                AND dataset = {self._prepare_value(dataset)}
-                AND status = 'completed'
-            """)
-            return result.result_rows[0][0] if result.result_rows and result.result_rows[0][0] else 0
+            
+            # Find ALL processing jobs (not just stale ones)
+            stale_query = f"""
+            SELECT mode, dataset, start_block, end_block, worker_id
+            FROM {self.database}.indexing_state
+            WHERE status = 'processing'
+            """
+            result = client.query(stale_query)
+            
+            reset_count = 0
+            for row in result.result_rows:
+                mode, dataset, start_block, end_block, worker_id = row
+                
+                # Skip invalid ranges for diff datasets
+                if dataset in self.diff_datasets and start_block == 0:
+                    logger.warning(f"Skipping invalid processing range for diff dataset {dataset}: {start_block}-{end_block}")
+                    continue
+                
+                # Reset to pending
+                reset_query = f"""
+                INSERT INTO {self.database}.indexing_state
+                (mode, dataset, start_block, end_block, status, error_message)
+                VALUES
+                ('{mode}', '{dataset}', {start_block}, {end_block}, 
+                 'pending', 'Reset from processing job on startup (worker: {worker_id})')
+                """
+                client.command(reset_query)
+                reset_count += 1
+                
+                logger.info(f"Reset processing job: {dataset} {start_block}-{end_block} (was worker: {worker_id})")
+            
+            if reset_count > 0:
+                logger.info(f"Reset {reset_count} processing jobs")
+                
+            return reset_count
+            
         except Exception as e:
-            logger.error(f"Error getting max completed block: {e}")
+            logger.error(f"Error cleaning up stale jobs: {e}")
             return 0
+    
+    def has_valid_timestamps(self, start_block: int, end_block: int) -> bool:
+        """Check if all blocks in range have valid timestamps."""
+        try:
+            client = self.db._connect()
+            
+            expected_count = end_block - start_block
+            
+            query = f"""
+            SELECT COUNT(*) 
+            FROM {self.database}.blocks
+            WHERE block_number >= {start_block} 
+              AND block_number < {end_block}
+              AND timestamp IS NOT NULL
+              AND timestamp > 0
+              AND toDateTime(timestamp) > toDateTime('1971-01-01 00:00:00')
+            """
+            
+            result = client.query(query)
+            actual_count = result.result_rows[0][0] if result.result_rows else 0
+            
+            return actual_count == expected_count
+            
+        except Exception as e:
+            logger.error(f"Error checking timestamps: {e}")
+            return False
+        
+
+    def get_failed_and_pending_ranges(self, mode: str, datasets: List[str]) -> List[Tuple[int, int, str, str]]:
+        """
+        Get all failed and pending ranges from indexing_state table.
+        This is the core logic for maintain operation - purely state-driven.
+        
+        Returns:
+            List of (start_block, end_block, dataset, status) tuples
+        """
+        issues = []
+        
+        try:
+            client = self.db._connect()
+            
+            # Build dataset filter
+            datasets_str = "','".join(datasets)
+            
+            # Get all failed and pending ranges
+            query = f"""
+            SELECT DISTINCT start_block, end_block, dataset, status
+            FROM {self.database}.indexing_state
+            WHERE mode = '{mode}'
+            AND dataset IN ('{datasets_str}')
+            AND status IN ('failed', 'pending')
+            ORDER BY dataset, start_block
+            """
+            
+            result = client.query(query)
+            
+            for row in result.result_rows:
+                start_block = row[0]
+                end_block = row[1]
+                dataset = row[2]
+                status = row[3]
+                
+                # Skip invalid ranges for diff datasets
+                if dataset in self.diff_datasets and start_block == 0:
+                    logger.warning(f"Skipping invalid range for diff dataset {dataset}: {start_block}-{end_block}")
+                    continue
+                    
+                issues.append((start_block, end_block, dataset, status))
+            
+            logger.info(f"Found {len(issues)} failed/pending ranges in indexing_state table")
+            
+            # Log breakdown by status
+            failed_count = len([x for x in issues if x[3] == 'failed'])
+            pending_count = len([x for x in issues if x[3] == 'pending'])
+            
+            if failed_count > 0:
+                logger.info(f"  - {failed_count} failed ranges (need to retry)")
+            if pending_count > 0:
+                logger.info(f"  - {pending_count} pending ranges (never processed)")
+                
+            return issues
+            
+        except Exception as e:
+            logger.error(f"Error getting failed/pending ranges: {e}")
+            return []

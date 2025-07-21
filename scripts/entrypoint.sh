@@ -2,24 +2,17 @@
 set -e
 
 # Print configuration
-echo "Cryo Indexer Configuration:"
-echo "=========================="
-echo "Network: ${NETWORK_NAME:-gnosis}"
+echo "Cryo Indexer - Simplified"
+echo "========================="
+echo "Network: ${NETWORK_NAME:-ethereum}"
 echo "Operation: ${OPERATION:-continuous}"
 echo "Mode: ${MODE:-minimal}"
-echo "Workers: ${WORKERS:-1}"
-echo "Batch Size: ${BATCH_SIZE:-1000}"
 
-# Validate MODE parameter
-if [[ "${MODE}" != "minimal" && "${MODE}" != "extra" && "${MODE}" != "diffs" && "${MODE}" != "full" && "${MODE}" != "custom" ]]; then
-    echo "WARNING: Invalid MODE '${MODE}'. Valid options are: minimal, extra, diffs, full, custom"
-    echo "Setting MODE to 'minimal'"
-    export MODE="minimal"
-fi
-
-if [ "${OPERATION}" = "historical" ]; then
-    echo "Start Block: ${START_BLOCK}"
-    echo "End Block: ${END_BLOCK}"
+if [ "${OPERATION}" = "historical" ] || [ "${OPERATION}" = "maintain" ]; then
+    echo "Workers: ${WORKERS:-1}"
+    if [ -n "${START_BLOCK}" ] && [ -n "${END_BLOCK}" ]; then
+        echo "Block Range: ${START_BLOCK} to ${END_BLOCK}"
+    fi
 fi
 
 if [ -n "${DATASETS}" ]; then
@@ -28,7 +21,7 @@ fi
 
 echo ""
 
-# Verify required environment variables
+# Validate required environment variables
 if [ -z "$ETH_RPC_URL" ]; then
     echo "ERROR: ETH_RPC_URL is required"
     exit 1
@@ -37,6 +30,13 @@ fi
 if [ -z "$CLICKHOUSE_HOST" ]; then
     echo "ERROR: CLICKHOUSE_HOST is required"
     exit 1
+fi
+
+# Validate MODE parameter
+if [[ "${MODE}" != "minimal" && "${MODE}" != "extra" && "${MODE}" != "diffs" && "${MODE}" != "full" && "${MODE}" != "custom" ]]; then
+    echo "WARNING: Invalid MODE '${MODE}'. Valid options are: minimal, extra, diffs, full, custom"
+    echo "Setting MODE to 'minimal'"
+    export MODE="minimal"
 fi
 
 # Test ClickHouse connection
@@ -62,14 +62,8 @@ fi
 # Create required directories
 mkdir -p /app/data /app/logs
 
-# Run migrations if requested
-if [ "${RUN_MIGRATIONS}" = "true" ]; then
-    echo "Running database migrations..."
-    python -m src.migrations
-fi
-
 # Start the indexer
 echo ""
 echo "Starting indexer..."
 echo "=================="
-exec python -m src.indexer
+exec python -m src
