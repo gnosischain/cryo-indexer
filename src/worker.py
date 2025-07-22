@@ -73,6 +73,7 @@ class IndexerWorker:
                 'nonce',
                 'base_fee_per_gas',
                 'withdrawals_root',
+                'withdrawals',
                 'chain_id'
             ],
             # For other datasets, we can use 'all' or specify columns as needed

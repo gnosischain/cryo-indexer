@@ -108,7 +108,8 @@ cryo-indexer/
 │   ├── 009_create_code_diffs.sql
 │   ├── 010_create_nonce_diffs.sql
 │   ├── 011_create_storage_diffs.sql
-│   └── 012_create_indexing_state.sql  # Simplified state management
+│   ├── 012_create_indexing_state.sql  # Simplified state management
+│   └── 013_create_withdrawals.sql     # Withdrawals table (auto-populated)
 ├── requirements.txt               # Python dependencies
 ├── scripts/
 │   └── entrypoint.sh             # Simplified container entrypoint
@@ -459,10 +460,52 @@ The indexer automatically creates these tables in ClickHouse:
 - **`nonce_diffs`** - Account nonce changes
 - **`storage_diffs`** - Contract storage changes
 
+### Automatic Side Tables
+- **`withdrawals`** - Validator withdrawals (automatically populated when processing blocks)
+
 ### Management Tables
 - **`indexing_state`** - Single source of truth for all indexing state
 - **`indexing_progress`** - Real-time progress view (materialized view)
 - **`migrations`** - Database migration tracking
+
+### Withdrawals Table
+
+The withdrawals table is automatically populated whenever blocks are processed. It contains:
+
+- **Block Context**: `block_number`, `block_hash`, `withdrawals_root`, `chain_id`, `block_timestamp`
+- **Withdrawal Data**: `withdrawal_index`, `validator_index`, `address`, `amount`
+- **System Fields**: `insert_version` (for deduplication)
+
+**Key Features**:
+- **Automatic Population**: No separate dataset needed - filled when processing blocks
+- **Normalized Structure**: Individual rows for each withdrawal (not JSON arrays)
+- **Easy Querying**: Standard SQL queries work naturally
+- **Consistent Timestamps**: Same timestamp validation as other tables
+
+**Example Queries**:
+```sql
+-- Get all withdrawals for a specific validator
+SELECT * FROM withdrawals 
+WHERE validator_index = '0x2a696'
+ORDER BY block_number;
+
+-- Total withdrawal amounts by address
+SELECT address, SUM(hexToUInt256(amount)) as total_amount
+FROM withdrawals 
+WHERE block_number >= 17000000
+GROUP BY address
+ORDER BY total_amount DESC;
+
+-- Daily withdrawal summary
+SELECT 
+    toDate(block_timestamp) as date,
+    COUNT(*) as withdrawal_count,
+    COUNT(DISTINCT address) as unique_addresses,
+    SUM(hexToUInt256(amount)) as total_amount
+FROM withdrawals
+GROUP BY date
+ORDER BY date;
+```
 
 ## Running with Docker
 
@@ -494,7 +537,7 @@ MODE=minimal
 # Build the image
 docker-compose build
 
-# Run migrations
+# Run migrations (includes withdrawals table creation)
 docker-compose --profile migrations up migrations
 
 # Start continuous indexing
@@ -510,16 +553,16 @@ docker-compose --profile maintain up maintain-job
 
 ### Running Different Modes
 ```bash
-# Minimal mode (default)
+# Minimal mode (default) - includes automatic withdrawals processing
 docker-compose up cryo-indexer-minimal
 
-# Extra mode (contracts, transfers, traces)
+# Extra mode (contracts, transfers, traces) - includes automatic withdrawals processing
 docker-compose up cryo-indexer-extra
 
-# Diffs mode (state changes)
+# Diffs mode (state changes) - includes automatic withdrawals processing
 docker-compose up cryo-indexer-diffs
 
-# Full mode (everything)
+# Full mode (everything) - includes automatic withdrawals processing
 docker-compose up cryo-indexer-full
 
 # Custom mode
@@ -532,16 +575,16 @@ docker-compose up cryo-indexer-custom
 ### Setup Commands
 ```bash
 make build          # Build Docker image
-make run-migrations # Run database migrations
+make run-migrations # Run database migrations (includes withdrawals table)
 ```
 
 ### Core Operations
 ```bash
-# Continuous indexing
+# Continuous indexing (automatically processes withdrawals when processing blocks)
 make continuous     # Start real-time indexing
 make start          # Alias for continuous
 
-# Historical indexing
+# Historical indexing (automatically processes withdrawals when processing blocks)
 make historical START_BLOCK=1000000 END_BLOCK=2000000
 make historical START_BLOCK=1000000 END_BLOCK=2000000 WORKERS=8
 
@@ -551,7 +594,7 @@ make maintain       # Fix failed/pending ranges from state table
 
 ### Quick Operations
 ```bash
-# Different modes
+# Different modes (all automatically process withdrawals when processing blocks)
 make minimal        # Start minimal mode
 make full          # Start full mode
 make custom DATASETS=blocks,transactions,traces
@@ -750,7 +793,7 @@ BATCH_SIZE=50 WORKERS=2 make historical
 ```bash
 # Setup
 make build
-make run-migrations
+make run-migrations  # Creates all tables including withdrawals
 
 # Historical sync  
 make historical START_BLOCK=18000000 END_BLOCK=latest WORKERS=8
@@ -763,7 +806,7 @@ make continuous
 ```bash
 # Setup
 make build  
-make run-migrations
+make run-migrations  # Adds withdrawals table if not exists
 
 # Process any failed/pending ranges
 make maintain
@@ -777,7 +820,7 @@ make continuous
 
 #### 3. Research Project (Specific Time Period)
 ```bash
-# Target specific historical period
+# Target specific historical period (includes withdrawals automatically)
 make historical START_BLOCK=12000000 END_BLOCK=13000000 MODE=full
 
 # Check for any incomplete ranges
@@ -813,7 +856,7 @@ make maintain START_BLOCK=1000000 END_BLOCK=2000000
 
 #### Local Development
 ```bash
-# Test with small range
+# Test with small range (includes withdrawals processing)
 make test-range START_BLOCK=18000000
 
 # Test different modes
@@ -854,7 +897,7 @@ python -m src
 
 ### Testing
 ```bash
-# Test with small range
+# Test with small range (automatically processes withdrawals)
 make test-range START_BLOCK=18000000
 
 # Test maintenance

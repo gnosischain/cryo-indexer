@@ -1,5 +1,5 @@
 # Use pre-built base image with Cryo already compiled
-FROM ghcr.io/gnosischain/cryo-base:20250610
+FROM ghcr.io/gnosischain/cryo-base:20250722
 
 WORKDIR /app
 

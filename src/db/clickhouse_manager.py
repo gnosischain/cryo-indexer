@@ -1,4 +1,5 @@
 import os
+import json
 import pandas as pd
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
@@ -74,7 +75,7 @@ class ClickHouseManager:
     def insert_parquet_file(self, file_path: str) -> int:
         """
         Insert data from a parquet file into ClickHouse.
-        Simplified with strict timestamp requirements.
+        For blocks, also processes withdrawals automatically.
         """
         try:
             client = self._connect()
@@ -101,13 +102,22 @@ class ClickHouseManager:
             
             # Read the parquet file
             df = read_parquet_to_pandas(file_path)
-            
+
             if df.empty:
                 logger.warning(f"Empty DataFrame from {file_path}")
                 return 0
             
             # Clean the data
             df = self._clean_dataframe(df, table_name)
+            
+            # Special handling for blocks: also process withdrawals BEFORE cleaning
+            withdrawals_df_for_processing = None
+            if dataset == 'blocks' and 'withdrawals' in df.columns:
+                # Keep a copy of the original dataframe for withdrawals processing
+                withdrawals_df_for_processing = df.copy()
+                # Remove withdrawals column from the blocks dataframe
+                df = df.drop(columns=['withdrawals'])
+                logger.debug("Removed withdrawals column from blocks DataFrame for table insertion")
             
             # Add timestamps for non-blocks datasets
             if dataset != 'blocks' and 'block_number' in df.columns:
@@ -116,7 +126,7 @@ class ClickHouseManager:
             # Final validation
             self._validate_dataframe(df, table_name)
             
-            # Insert the data
+            # Insert the main data
             result = client.insert_df(f"{self.database}.{table_name}", df)
             
             # Handle the result
@@ -126,11 +136,122 @@ class ClickHouseManager:
                 row_count = result or len(df)
                 
             logger.info(f"Inserted {row_count} rows into {table_name}")
+            
+            # Special handling for blocks: also process withdrawals
+            if dataset == 'blocks' and withdrawals_df_for_processing is not None:
+                withdrawals_count = self._process_withdrawals(withdrawals_df_for_processing, client)
+                if withdrawals_count > 0:
+                    logger.info(f"Inserted {withdrawals_count} withdrawal records")
+                    row_count += withdrawals_count
+            
             return row_count
                 
         except Exception as e:
             logger.error(f"Error inserting parquet file {file_path}: {e}")
             raise
+    
+    def _process_withdrawals(self, blocks_df: pd.DataFrame, client: Client) -> int:
+        """
+        Process withdrawals from blocks DataFrame and insert into withdrawals table.
+        """
+        try:
+            if 'withdrawals' not in blocks_df.columns:
+                logger.debug("No withdrawals column found in blocks data")
+                return 0
+            
+            # Filter blocks that have withdrawals
+            blocks_with_withdrawals = blocks_df[blocks_df['withdrawals'].notna() & 
+                                               (blocks_df['withdrawals'] != '') &
+                                               (blocks_df['withdrawals'] != '[]')]
+            
+            if blocks_with_withdrawals.empty:
+                logger.debug("No blocks with withdrawals found")
+                return 0
+            
+            logger.info(f"Processing withdrawals from {len(blocks_with_withdrawals)} blocks")
+            
+            withdrawal_records = []
+            
+            for _, block_row in blocks_with_withdrawals.iterrows():
+                try:
+                    # Parse withdrawals JSON
+                    withdrawals_data = block_row['withdrawals']
+                    
+                    # Handle different formats
+                    if isinstance(withdrawals_data, str):
+                        if withdrawals_data.strip() in ['', '[]', 'null']:
+                            continue
+                        withdrawals_list = json.loads(withdrawals_data)
+                    elif isinstance(withdrawals_data, list):
+                        withdrawals_list = withdrawals_data
+                    else:
+                        logger.warning(f"Unexpected withdrawals format in block {block_row.get('block_number')}: {type(withdrawals_data)}")
+                        continue
+                    
+                    if not withdrawals_list:
+                        continue
+                    
+                    # Extract block-level info
+                    block_number = block_row.get('block_number')
+                    block_hash = block_row.get('block_hash')
+                    withdrawals_root = block_row.get('withdrawals_root')
+                    chain_id = block_row.get('chain_id')
+                    
+                    # Create timestamp from block timestamp
+                    if 'timestamp' in block_row and pd.notna(block_row['timestamp']):
+                        block_timestamp = pd.Timestamp.fromtimestamp(int(block_row['timestamp']))
+                    else:
+                        logger.warning(f"No valid timestamp for block {block_number}")
+                        continue
+                    
+                    # Process each withdrawal
+                    for withdrawal in withdrawals_list:
+                        if not isinstance(withdrawal, dict):
+                            logger.warning(f"Invalid withdrawal format in block {block_number}: {withdrawal}")
+                            continue
+                        
+                        withdrawal_record = {
+                            'block_number': block_number,
+                            'block_hash': block_hash,
+                            'withdrawals_root': withdrawals_root,
+                            'withdrawal_index': withdrawal.get('index'),
+                            'validator_index': withdrawal.get('validatorIndex'),
+                            'address': withdrawal.get('address'),
+                            'amount': withdrawal.get('amount'),
+                            'chain_id': chain_id,
+                            'block_timestamp': block_timestamp
+                        }
+                        
+                        withdrawal_records.append(withdrawal_record)
+                        
+                except Exception as e:
+                    logger.error(f"Error processing withdrawals for block {block_row.get('block_number')}: {e}")
+                    continue
+            
+            if not withdrawal_records:
+                logger.debug("No valid withdrawal records to insert")
+                return 0
+            
+            # Convert to DataFrame and insert
+            withdrawals_df = pd.DataFrame(withdrawal_records)
+            
+            # Validate withdrawals DataFrame
+            self._validate_dataframe(withdrawals_df, 'withdrawals')
+            
+            # Insert withdrawals
+            result = client.insert_df(f"{self.database}.withdrawals", withdrawals_df)
+            
+            if isinstance(result, QuerySummary):
+                withdrawals_count = result.written_rows if hasattr(result, 'written_rows') else len(withdrawals_df)
+            else:
+                withdrawals_count = result or len(withdrawals_df)
+            
+            return withdrawals_count
+            
+        except Exception as e:
+            logger.error(f"Error processing withdrawals: {e}")
+            # Don't raise - withdrawals are supplementary data
+            return 0
     
     def _clean_dataframe(self, df: pd.DataFrame, table_name: str) -> pd.DataFrame:
         """Clean and prepare DataFrame for insertion."""
