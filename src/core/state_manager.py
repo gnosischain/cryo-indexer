@@ -415,42 +415,67 @@ class StateManager:
             return "mixed"
     
     def cleanup_stale_jobs(self, timeout_minutes: int = 30) -> int:
-        """Reset ALL processing jobs to pending on startup (not just stale ones)."""
+        """
+        FIXED: Reset only TRULY stale processing jobs, not recently completed ones.
+        """
         try:
             client = self.db._connect()
             
-            # Find ALL processing jobs (not just stale ones)
+            # Find processing jobs that are actually stale (older than timeout)
+            stale_threshold = datetime.now() - timedelta(minutes=timeout_minutes)
+            
             stale_query = f"""
-            SELECT mode, dataset, start_block, end_block, worker_id
+            SELECT mode, dataset, start_block, end_block, worker_id, created_at
             FROM {self.database}.indexing_state
             WHERE status = 'processing'
+              AND created_at < '{stale_threshold.strftime('%Y-%m-%d %H:%M:%S')}'
             """
             result = client.query(stale_query)
             
             reset_count = 0
             for row in result.result_rows:
-                mode, dataset, start_block, end_block, worker_id = row
+                mode, dataset, start_block, end_block, worker_id, created_at = row
                 
                 # Skip invalid ranges for diff datasets
                 if dataset in self.diff_datasets and start_block == 0:
                     logger.warning(f"Skipping invalid processing range for diff dataset {dataset}: {start_block}-{end_block}")
                     continue
                 
-                # Reset to pending
+                # Check if there's already a completed entry for this range
+                # (This prevents resetting ranges that were completed by maintenance)
+                check_completed_query = f"""
+                SELECT COUNT(*) 
+                FROM {self.database}.indexing_state
+                WHERE mode = '{mode}'
+                  AND dataset = '{dataset}'
+                  AND start_block = {start_block}
+                  AND end_block = {end_block}
+                  AND status = 'completed'
+                  AND created_at > '{created_at.strftime('%Y-%m-%d %H:%M:%S')}'
+                """
+                check_result = client.query(check_completed_query)
+                
+                if check_result.result_rows[0][0] > 0:
+                    logger.info(f"Skipping reset of {dataset} {start_block}-{end_block} - already completed after processing")
+                    continue
+                
+                # Reset to pending only if it's truly stale
                 reset_query = f"""
                 INSERT INTO {self.database}.indexing_state
                 (mode, dataset, start_block, end_block, status, error_message)
                 VALUES
                 ('{mode}', '{dataset}', {start_block}, {end_block}, 
-                 'pending', 'Reset from processing job on startup (worker: {worker_id})')
+                 'pending', 'Reset from stale processing job (worker: {worker_id}, age: {timeout_minutes}+ min)')
                 """
                 client.command(reset_query)
                 reset_count += 1
                 
-                logger.info(f"Reset processing job: {dataset} {start_block}-{end_block} (was worker: {worker_id})")
+                logger.info(f"Reset stale processing job: {dataset} {start_block}-{end_block} (was worker: {worker_id})")
             
             if reset_count > 0:
-                logger.info(f"Reset {reset_count} processing jobs")
+                logger.info(f"Reset {reset_count} truly stale processing jobs")
+            else:
+                logger.debug("No stale processing jobs found")
                 
             return reset_count
             

@@ -37,6 +37,9 @@ class IndexerWorker:
         self.rpc_url = rpc_url
         self.mode = mode
         
+        # Check if this is a maintenance worker
+        self.is_maintenance = worker_id.startswith('maintain')
+        
         # Table mappings
         self.table_mappings = {
             'blocks': 'blocks',
@@ -105,7 +108,7 @@ class IndexerWorker:
         # Create worker-specific data directory
         os.makedirs(self.data_dir, exist_ok=True)
         
-        logger.info(f"Worker {worker_id} initialized for mode {mode}")
+        logger.info(f"Worker {worker_id} initialized for mode {mode} (maintenance: {self.is_maintenance})")
     
     def process_range(
         self, 
@@ -164,8 +167,9 @@ class IndexerWorker:
                 self.mode, dataset, start_block, end_block
             )
             
-            # Skip if already completed
-            if status == 'completed':
+            # For maintenance operations, we always process regardless of status
+            # For normal operations, skip if already completed
+            if not self.is_maintenance and status == 'completed':
                 logger.info(f"Worker {self.worker_id}: {dataset} range {start_block}-{end_block} already completed")
                 return True
             
@@ -175,6 +179,13 @@ class IndexerWorker:
             ):
                 logger.warning(f"Worker {self.worker_id}: Could not claim {dataset} range {start_block}-{end_block}")
                 return False
+            
+            # For maintenance operations, delete existing data first
+            if self.is_maintenance:
+                table_name = self.table_mappings.get(dataset, dataset)
+                deleted_rows = self.clickhouse.delete_range_data(table_name, start_block, end_block)
+                if deleted_rows > 0:
+                    logger.info(f"Worker {self.worker_id}: Deleted {deleted_rows} existing rows for {dataset} {start_block}-{end_block}")
             
             # Process the dataset
             logger.info(f"Worker {self.worker_id}: Processing {dataset} {start_block}-{end_block}")

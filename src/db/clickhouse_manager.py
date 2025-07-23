@@ -71,6 +71,37 @@ class ClickHouseManager:
             logger.error(f"Error ensuring database exists: {e}")
             raise
     
+    def delete_range_data(self, table_name: str, start_block: int, end_block: int) -> int:
+        """Delete all data for a specific block range from a table."""
+        try:
+            client = self._connect()
+            
+            # First count how many rows will be deleted
+            count_query = f"""
+            SELECT COUNT(*) 
+            FROM {self.database}.{table_name}
+            WHERE block_number >= {start_block} AND block_number < {end_block}
+            """
+            result = client.query(count_query)
+            rows_to_delete = result.result_rows[0][0] if result.result_rows else 0
+            
+            if rows_to_delete > 0:
+                # Delete the data
+                delete_query = f"""
+                DELETE FROM {self.database}.{table_name}
+                WHERE block_number >= {start_block} AND block_number < {end_block}
+                """
+                client.command(delete_query)
+                logger.info(f"Deleted {rows_to_delete} rows for range {start_block}-{end_block} from {table_name}")
+            else:
+                logger.debug(f"No data to delete for range {start_block}-{end_block} from {table_name}")
+            
+            return rows_to_delete
+            
+        except Exception as e:
+            logger.error(f"Error deleting range data from {table_name}: {e}")
+            raise
+    
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
     def insert_parquet_file(self, file_path: str) -> int:
         """
