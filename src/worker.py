@@ -126,19 +126,43 @@ class IndexerWorker:
                 return True
             
             # Step 1: Process blocks if needed
+            blocks_were_processed = False
             if 'blocks' in datasets:
                 logger.info(f"Worker {self.worker_id}: Processing blocks {start_block}-{end_block}")
                 
-                if not self._process_single_dataset('blocks', start_block, end_block):
-                    logger.error(f"Worker {self.worker_id}: Failed to process blocks")
-                    return False
+                # Check if blocks were actually processed (not just skipped as completed)
+                status = self.state_manager.get_range_status(
+                    self.mode, 'blocks', start_block, end_block
+                )
                 
-                # Always verify timestamps for blocks (simple check)
+                if status == 'completed':
+                    logger.info(f"Worker {self.worker_id}: Blocks range {start_block}-{end_block} already completed")
+                    blocks_were_processed = False  # They were already there, not newly processed
+                else:
+                    # Actually process the blocks
+                    success = self._process_single_dataset('blocks', start_block, end_block)
+                    if not success:
+                        logger.error(f"Worker {self.worker_id}: Failed to process blocks")
+                        return False
+                    blocks_were_processed = True  # We just processed them
+                
+                # Only verify timestamps if we just processed blocks OR if they should already be valid
                 if not self.state_manager.has_valid_timestamps(start_block, end_block):
-                    logger.error(f"Worker {self.worker_id}: Blocks missing valid timestamps")
-                    return False
+                    if blocks_were_processed:
+                        logger.error(f"Worker {self.worker_id}: Newly processed blocks missing valid timestamps")
+                        return False
+                    else:
+                        # Blocks were already "completed" but have invalid timestamps
+                        # This indicates a data integrity issue that needs to be fixed
+                        logger.error(f"Worker {self.worker_id}: Previously completed blocks have invalid timestamps. Range needs reprocessing.")
+                        # Mark the blocks range as failed so it gets reprocessed
+                        self.state_manager.fail_range(
+                            self.mode, 'blocks', start_block, end_block, 
+                            "Previously completed blocks have invalid timestamps"
+                        )
+                        return False
             
-            # Step 2: Process other datasets
+            # Step 2: Process other datasets (unchanged)
             other_datasets = [d for d in datasets if d != 'blocks']
             for dataset in other_datasets:
                 # Adjust start block for diff datasets
