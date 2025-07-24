@@ -59,15 +59,6 @@ class StateManager:
                 return None
                 
             status = result.result_rows[0][0]
-            created_at = result.result_rows[0][1]
-            
-            # Check if processing status is stale (older than 30 minutes)
-            if status == 'processing' and created_at:
-                stale_threshold = datetime.now() - timedelta(minutes=30)
-                if created_at < stale_threshold:
-                    logger.warning(f"Stale processing range found: {dataset} {start_block}-{end_block}")
-                    return 'stale'
-            
             return status
             
         except Exception as e:
@@ -314,7 +305,6 @@ class StateManager:
             logger.error(f"Error finding gaps: {e}")
             return []
 
-
     def _get_highest_attempted_block(self, mode: str, dataset: str) -> int:
         """
         Get the highest block that was actually attempted (completed, failed, or processing).
@@ -343,7 +333,6 @@ class StateManager:
         except Exception as e:
             logger.error(f"Error getting highest attempted block: {e}")
             return 0
-
 
     def get_processing_summary(self, mode: str) -> Dict[str, Dict]:
         """
@@ -396,7 +385,6 @@ class StateManager:
             logger.error(f"Error getting processing summary: {e}")
             return {}
 
-
     def _determine_dataset_status(self, completed: int, processing: int, failed: int, pending: int) -> str:
         """Determine the overall status of a dataset."""
         total = completed + processing + failed + pending
@@ -416,73 +404,12 @@ class StateManager:
     
     def cleanup_stale_jobs(self, timeout_minutes: int = 30) -> int:
         """
-        FIXED: Reset only TRULY stale processing jobs, not recently completed ones.
+        DISABLED: Don't reset any jobs during startup.
+        This prevents interference with maintain operations.
         """
-        try:
-            client = self.db._connect()
-            
-            # Find processing jobs that are actually stale (older than timeout)
-            stale_threshold = datetime.now() - timedelta(minutes=timeout_minutes)
-            
-            stale_query = f"""
-            SELECT mode, dataset, start_block, end_block, worker_id, created_at
-            FROM {self.database}.indexing_state
-            WHERE status = 'processing'
-              AND created_at < '{stale_threshold.strftime('%Y-%m-%d %H:%M:%S')}'
-            """
-            result = client.query(stale_query)
-            
-            reset_count = 0
-            for row in result.result_rows:
-                mode, dataset, start_block, end_block, worker_id, created_at = row
-                
-                # Skip invalid ranges for diff datasets
-                if dataset in self.diff_datasets and start_block == 0:
-                    logger.warning(f"Skipping invalid processing range for diff dataset {dataset}: {start_block}-{end_block}")
-                    continue
-                
-                # Check if there's already a completed entry for this range
-                # (This prevents resetting ranges that were completed by maintenance)
-                check_completed_query = f"""
-                SELECT COUNT(*) 
-                FROM {self.database}.indexing_state
-                WHERE mode = '{mode}'
-                  AND dataset = '{dataset}'
-                  AND start_block = {start_block}
-                  AND end_block = {end_block}
-                  AND status = 'completed'
-                  AND created_at > '{created_at.strftime('%Y-%m-%d %H:%M:%S')}'
-                """
-                check_result = client.query(check_completed_query)
-                
-                if check_result.result_rows[0][0] > 0:
-                    logger.info(f"Skipping reset of {dataset} {start_block}-{end_block} - already completed after processing")
-                    continue
-                
-                # Reset to pending only if it's truly stale
-                reset_query = f"""
-                INSERT INTO {self.database}.indexing_state
-                (mode, dataset, start_block, end_block, status, error_message)
-                VALUES
-                ('{mode}', '{dataset}', {start_block}, {end_block}, 
-                 'pending', 'Reset from stale processing job (worker: {worker_id}, age: {timeout_minutes}+ min)')
-                """
-                client.command(reset_query)
-                reset_count += 1
-                
-                logger.info(f"Reset stale processing job: {dataset} {start_block}-{end_block} (was worker: {worker_id})")
-            
-            if reset_count > 0:
-                logger.info(f"Reset {reset_count} truly stale processing jobs")
-            else:
-                logger.debug("No stale processing jobs found")
-                
-            return reset_count
-            
-        except Exception as e:
-            logger.error(f"Error cleaning up stale jobs: {e}")
-            return 0
-    
+        logger.info("Stale job cleanup is DISABLED to prevent interference with maintain operations")
+        return 0
+
     def has_valid_timestamps(self, start_block: int, end_block: int) -> bool:
         """Check if all blocks in range have valid timestamps."""
         try:
@@ -508,81 +435,3 @@ class StateManager:
         except Exception as e:
             logger.error(f"Error checking timestamps: {e}")
             return False
-        
-
-    def get_failed_and_pending_ranges(self, mode: str, datasets: List[str], start_block: int = 0, end_block: int = 0) -> List[Tuple[int, int, str, str]]:
-        """
-        Get all failed and pending ranges from indexing_state table.
-        Optionally filter by block range.
-        
-        Args:
-            mode: Indexing mode
-            datasets: List of datasets to check
-            start_block: Filter ranges >= this block (0 = no filter)
-            end_block: Filter ranges <= this block (0 = no filter)
-        
-        Returns:
-            List of (start_block, end_block, dataset, status) tuples
-        """
-        issues = []
-        
-        try:
-            client = self.db._connect()
-            
-            # Build dataset filter
-            datasets_str = "','".join(datasets)
-            
-            # Base query
-            query = f"""
-            SELECT DISTINCT start_block, end_block, dataset, status
-            FROM {self.database}.indexing_state
-            WHERE mode = '{mode}'
-            AND dataset IN ('{datasets_str}')
-            AND status IN ('failed', 'pending')
-            """
-            
-            # Add block range filters if specified
-            if start_block > 0:
-                query += f" AND start_block >= {start_block}"
-            
-            if end_block > 0:
-                query += f" AND end_block <= {end_block}"
-                
-            query += " ORDER BY dataset, start_block"
-            
-            result = client.query(query)
-            
-            for row in result.result_rows:
-                start_block_val = row[0]
-                end_block_val = row[1]
-                dataset = row[2]
-                status = row[3]
-                
-                # Skip invalid ranges for diff datasets
-                if dataset in self.diff_datasets and start_block_val == 0:
-                    logger.warning(f"Skipping invalid range for diff dataset {dataset}: {start_block_val}-{end_block_val}")
-                    continue
-                    
-                issues.append((start_block_val, end_block_val, dataset, status))
-            
-            # Log what we found
-            if start_block > 0 or end_block > 0:
-                range_desc = f"in range {start_block or 'start'}-{end_block or 'end'}"
-                logger.info(f"Found {len(issues)} failed/pending ranges {range_desc}")
-            else:
-                logger.info(f"Found {len(issues)} failed/pending ranges (all ranges)")
-            
-            # Log breakdown by status
-            failed_count = len([x for x in issues if x[3] == 'failed'])
-            pending_count = len([x for x in issues if x[3] == 'pending'])
-            
-            if failed_count > 0:
-                logger.info(f"  - {failed_count} failed ranges (need to retry)")
-            if pending_count > 0:
-                logger.info(f"  - {pending_count} pending ranges (never processed)")
-                
-            return issues
-            
-        except Exception as e:
-            logger.error(f"Error getting failed/pending ranges: {e}")
-            return []

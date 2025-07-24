@@ -55,7 +55,6 @@ class IndexerWorker:
         }
 
         # Define columns for each dataset
-        # For blocks, we explicitly exclude total_difficulty columns to avoid overflow
         self.dataset_columns = {
             'blocks': [
                 'block_hash',
@@ -79,7 +78,6 @@ class IndexerWorker:
                 'withdrawals',
                 'chain_id'
             ],
-            # For other datasets, we can use 'all' or specify columns as needed
             'transactions': 'all',
             'logs': [
                 'block_number',
@@ -118,9 +116,15 @@ class IndexerWorker:
     ) -> bool:
         """
         Process a block range for the given datasets.
-        Simplified: process blocks first, then other datasets.
+        For maintain operations, this is bypassed - we call _extract_and_load_dataset directly.
         """
         try:
+            # For maintenance operations, we don't do the normal range processing
+            # because the indexer already handles state management
+            if self.is_maintenance:
+                logger.debug(f"Worker {self.worker_id}: Maintenance mode - skipping normal range processing")
+                return True
+            
             # Step 1: Process blocks if needed
             if 'blocks' in datasets:
                 logger.info(f"Worker {self.worker_id}: Processing blocks {start_block}-{end_block}")
@@ -129,7 +133,7 @@ class IndexerWorker:
                     logger.error(f"Worker {self.worker_id}: Failed to process blocks")
                     return False
                 
-                # Verify blocks have valid timestamps
+                # Always verify timestamps for blocks (simple check)
                 if not self.state_manager.has_valid_timestamps(start_block, end_block):
                     logger.error(f"Worker {self.worker_id}: Blocks missing valid timestamps")
                     return False
@@ -162,48 +166,46 @@ class IndexerWorker:
     ) -> bool:
         """Process a single dataset for a block range."""
         try:
-            # Check current state
-            status = self.state_manager.get_range_status(
-                self.mode, dataset, start_block, end_block
-            )
-            
-            # For maintenance operations, we always process regardless of status
-            # For normal operations, skip if already completed
-            if not self.is_maintenance and status == 'completed':
-                logger.info(f"Worker {self.worker_id}: {dataset} range {start_block}-{end_block} already completed")
-                return True
-            
-            # Claim the range
-            if not self.state_manager.claim_range(
-                self.mode, dataset, start_block, end_block, self.worker_id
-            ):
-                logger.warning(f"Worker {self.worker_id}: Could not claim {dataset} range {start_block}-{end_block}")
-                return False
-            
-            # For maintenance operations, delete existing data first
-            if self.is_maintenance:
-                table_name = self.table_mappings.get(dataset, dataset)
-                deleted_rows = self.clickhouse.delete_range_data(table_name, start_block, end_block)
-                if deleted_rows > 0:
-                    logger.info(f"Worker {self.worker_id}: Deleted {deleted_rows} existing rows for {dataset} {start_block}-{end_block}")
+            # For maintenance operations, skip state checking since the indexer handles it
+            if not self.is_maintenance:
+                # Check current state for normal operations
+                status = self.state_manager.get_range_status(
+                    self.mode, dataset, start_block, end_block
+                )
+                
+                if status == 'completed':
+                    logger.info(f"Worker {self.worker_id}: {dataset} range {start_block}-{end_block} already completed")
+                    return True
+                
+                # Claim the range for normal operations
+                if not self.state_manager.claim_range(
+                    self.mode, dataset, start_block, end_block, self.worker_id
+                ):
+                    logger.warning(f"Worker {self.worker_id}: Could not claim {dataset} range {start_block}-{end_block}")
+                    return False
+            else:
+                # For maintenance, we already claimed, so just log that we're processing
+                logger.info(f"Worker {self.worker_id}: MAINTENANCE MODE - processing {dataset} {start_block}-{end_block}")
             
             # Process the dataset
             logger.info(f"Worker {self.worker_id}: Processing {dataset} {start_block}-{end_block}")
             success = self._extract_and_load_dataset(start_block, end_block, [dataset])
             
             if not success:
-                self.state_manager.fail_range(
-                    self.mode, dataset, start_block, end_block, "Processing failed"
-                )
+                if not self.is_maintenance:
+                    self.state_manager.fail_range(
+                        self.mode, dataset, start_block, end_block, "Processing failed"
+                    )
                 return False
             
             return True
             
         except Exception as e:
             logger.error(f"Worker {self.worker_id}: Error processing {dataset}: {e}")
-            self.state_manager.fail_range(
-                self.mode, dataset, start_block, end_block, str(e)
-            )
+            if not self.is_maintenance:
+                self.state_manager.fail_range(
+                    self.mode, dataset, start_block, end_block, str(e)
+                )
             return False
     
     def _extract_and_load_dataset(
@@ -224,7 +226,7 @@ class IndexerWorker:
             # Load data to ClickHouse
             total_rows = self._load_to_clickhouse(datasets)
             
-            # Mark as completed
+            # ALWAYS mark as completed when processing succeeds (including maintenance)
             for dataset in datasets:
                 self.state_manager.complete_range(
                     self.mode, dataset, start_block, end_block, total_rows

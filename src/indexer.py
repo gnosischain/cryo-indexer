@@ -43,8 +43,9 @@ class CryoIndexer:
         )
         self.state_manager = StateManager(self.clickhouse)
         
-        # Clean up stale jobs on startup
-        self.state_manager.cleanup_stale_jobs()
+        # For maintain operations, skip all cleanup
+        if settings.operation != OperationType.MAINTAIN:
+            self.state_manager.cleanup_stale_jobs()
         
         # Create directories
         os.makedirs(settings.data_dir, exist_ok=True)
@@ -245,65 +246,176 @@ class CryoIndexer:
             sys.exit(1)
     
     def _run_maintain(self):
-        """Run maintenance operation - process failed/pending ranges, optionally filtered by block range."""
-        logger.info("Starting maintenance operation")
+        """
+        Process all non-completed ranges using the same flow as historical/continuous.
+        Simple: find non-completed ranges, then process them exactly like other modes.
+        """
+        logger.info("Starting maintain operation")
         
         # Determine range filter
         start_filter = settings.start_block if settings.start_block > 0 else 0
         end_filter = settings.end_block if settings.end_block > 0 else 0
         
         if start_filter > 0 or end_filter > 0:
-            logger.info(f"Filtering maintenance to block range: {start_filter or 'start'} to {end_filter or 'end'}")
-            logger.info("Scanning indexing_state table for failed/pending ranges in specified range...")
+            logger.info(f"Range filter: START_BLOCK={start_filter} END_BLOCK={end_filter}")
         else:
-            logger.info("Processing ALL failed/pending ranges in indexing_state table...")
+            logger.info("No range filter - processing ALL non-completed ranges")
         
-        # Get issues, optionally filtered by range
-        all_issues = self.state_manager.get_failed_and_pending_ranges(
-            settings.mode.value, 
-            settings.datasets,
-            start_filter,
-            end_filter
-        )
-        
-        if not all_issues:
-            if start_filter > 0 or end_filter > 0:
-                logger.info("🎉 No maintenance issues found in the specified range!")
+        try:
+            # Get all non-completed ranges that need processing
+            failed_ranges = self._get_non_completed_ranges(start_filter, end_filter)
+            
+            if not failed_ranges:
+                logger.info("✅ No non-completed ranges found - nothing to maintain!")
+                return
+            
+            logger.info(f"Found {len(failed_ranges)} non-completed ranges to process")
+            
+            # Process them using the same logic as historical mode
+            if settings.workers == 1:
+                self._process_maintain_ranges_single(failed_ranges)
             else:
-                logger.info("🎉 No maintenance issues found!")
-            logger.info("All ranges in scope are either completed or currently processing.")
-            return
-        
-        # Group issues by type for reporting
-        failed_issues = [issue for issue in all_issues if issue[3] == 'failed']
-        pending_issues = [issue for issue in all_issues if issue[3] == 'pending']
-        
-        if start_filter > 0 or end_filter > 0:
-            logger.info(f"Found {len(all_issues)} ranges needing maintenance in range {start_filter or 'start'}-{end_filter or 'end'}:")
-        else:
-            logger.info(f"Found {len(all_issues)} ranges needing maintenance:")
-        
-        logger.info(f"  - {len(failed_issues)} failed ranges")
-        logger.info(f"  - {len(pending_issues)} pending ranges")
-        
-        # Log what we're going to fix (first 10)
-        for start, end, dataset, status in all_issues[:10]:
-            logger.info(f"Will fix: {dataset} {start}-{end} (status: {status})")
-        if len(all_issues) > 10:
-            logger.info(f"... and {len(all_issues) - 10} more ranges")
-        
-        # Process issues
-        if settings.workers == 1:
-            self._maintain_single_state_issues(all_issues)
-        else:
-            self._maintain_parallel_state_issues(all_issues)
-        
-        logger.info("Maintenance operation completed")
+                self._process_maintain_ranges_parallel(failed_ranges)
+                
+            logger.info("✅ MAINTAIN OPERATION COMPLETE")
+                    
+        except Exception as e:
+            logger.error(f"Error in maintain operation: {e}")
+            sys.exit(1)
 
-    def _maintain_single_state_issues(self, all_issues: List[Tuple[int, int, str, str]]):
-        """Single-threaded maintenance - process each state issue individually."""
+    def _get_non_completed_ranges(self, start_filter: int, end_filter: int) -> List[Tuple[int, int, str]]:
+        """
+        Get all ranges that are not completed (failed, processing, pending).
+        ASSUMES ALL SCRAPERS ARE STOPPED - Claims all non-completed ranges.
+        Returns list of (start_block, end_block, dataset) tuples.
+        """
+        try:
+            client = self.state_manager.db._connect()
+            
+            # Build WHERE clause
+            where_clause = f"mode = '{settings.mode.value}'"
+            datasets_str = "','".join(settings.datasets)
+            where_clause += f" AND dataset IN ('{datasets_str}')"
+            
+            if start_filter > 0:
+                where_clause += f" AND start_block >= {start_filter}"
+            if end_filter > 0:
+                where_clause += f" AND end_block <= {end_filter}"
+            
+            # RELIABLE APPROACH: Use MAX(created_at) to get the truly latest record
+            # Since maintain assumes scrapers are stopped, we claim ALL non-completed ranges
+            query = f"""
+            WITH latest_per_range AS (
+                SELECT 
+                    start_block,
+                    end_block,
+                    dataset,
+                    MAX(created_at) as max_created_at
+                FROM {self.state_manager.database}.indexing_state
+                WHERE {where_clause}
+                GROUP BY start_block, end_block, dataset
+            ),
+            latest_status AS (
+                SELECT 
+                    l.start_block,
+                    l.end_block,
+                    l.dataset,
+                    s.status
+                FROM latest_per_range l
+                JOIN {self.state_manager.database}.indexing_state s
+                ON l.start_block = s.start_block 
+                AND l.end_block = s.end_block 
+                AND l.dataset = s.dataset
+                AND l.max_created_at = s.created_at
+                WHERE s.mode = '{settings.mode.value}'
+            )
+            SELECT 
+                start_block,
+                end_block,
+                dataset
+            FROM latest_status
+            WHERE status != 'completed'
+            AND NOT (dataset IN ('balance_diffs', 'code_diffs', 'nonce_diffs', 'storage_diffs') AND start_block = 0)
+            ORDER BY dataset, start_block
+            """
+            
+            result = client.query(query)
+            ranges = [(row[0], row[1], row[2]) for row in result.result_rows]
+            
+            # Debug: Show what we found
+            if ranges:
+                logger.info(f"Found {len(ranges)} non-completed ranges:")
+                for start, end, dataset in ranges[:10]:  # Show first 10
+                    # Get the actual latest status for debugging
+                    debug_query = f"""
+                    SELECT status, created_at, worker_id
+                    FROM {self.state_manager.database}.indexing_state
+                    WHERE mode = '{settings.mode.value}'
+                    AND dataset = '{dataset}'
+                    AND start_block = {start}
+                    AND end_block = {end}
+                    ORDER BY created_at DESC
+                    LIMIT 5
+                    """
+                    debug_result = client.query(debug_query)
+                    statuses = [(row[0], str(row[1]), row[2]) for row in debug_result.result_rows]
+                    logger.info(f"  DEBUG {dataset} {start}-{end}: ALL recent statuses = {statuses}")
+                    
+                    # Also check what our query logic found as latest
+                    latest_query = f"""
+                    WITH latest_per_range AS (
+                        SELECT 
+                            start_block,
+                            end_block,
+                            dataset,
+                            MAX(created_at) as max_created_at
+                        FROM {self.state_manager.database}.indexing_state
+                        WHERE mode = '{settings.mode.value}'
+                        AND dataset = '{dataset}'
+                        AND start_block = {start}
+                        AND end_block = {end}
+                        GROUP BY start_block, end_block, dataset
+                    ),
+                    latest_status AS (
+                        SELECT 
+                            l.start_block,
+                            l.end_block,
+                            l.dataset,
+                            s.status,
+                            s.created_at
+                        FROM latest_per_range l
+                        JOIN {self.state_manager.database}.indexing_state s
+                        ON l.start_block = s.start_block 
+                        AND l.end_block = s.end_block 
+                        AND l.dataset = s.dataset
+                        AND l.max_created_at = s.created_at
+                        WHERE s.mode = '{settings.mode.value}'
+                    )
+                    SELECT status, created_at FROM latest_status
+                    """
+                    latest_result = client.query(latest_query)
+                    latest_status = latest_result.result_rows[0] if latest_result.result_rows else None
+                    logger.info(f"  DEBUG QUERY LOGIC FOUND: {latest_status}")
+                
+                if len(ranges) > 10:
+                    logger.info(f"  ... and {len(ranges) - 10} more ranges")
+            
+            logger.info(f"Non-completed ranges breakdown:")
+            for dataset in settings.datasets:
+                dataset_ranges = [r for r in ranges if r[2] == dataset]
+                if dataset_ranges:
+                    logger.info(f"  {dataset}: {len(dataset_ranges)} ranges")
+            
+            return ranges
+            
+        except Exception as e:
+            logger.error(f"Error getting non-completed ranges: {e}")
+            return []
+
+    def _process_maintain_ranges_single(self, ranges: List[Tuple[int, int, str]]):
+        """Process maintain ranges one by one using normal worker flow."""
         worker = IndexerWorker(
-            worker_id="maintain",
+            worker_id="maintain_single",
             blockchain=self.blockchain,
             clickhouse=self.clickhouse,
             state_manager=self.state_manager,
@@ -316,27 +428,30 @@ class CryoIndexer:
         fixed = 0
         failed = 0
         
-        for i, (start, end, dataset, status) in enumerate(all_issues):
-            logger.info(f"Processing issue {i+1}/{len(all_issues)}: {dataset} {start}-{end} (was: {status})")
+        for i, (start, end, dataset) in enumerate(ranges):
+            logger.info(f"Processing range {i+1}/{len(ranges)}: {dataset} {start}-{end}")
             
-            # Process this specific dataset and range
-            success = worker.process_range(start, end, [dataset])
+            # Use the same flow as historical/continuous:
+            # 1. Delete existing data (for maintain)
+            # 2. Process the range normally (claim -> process -> complete/fail)
             
-            if success:
+            if self._process_maintain_range(worker, start, end, dataset):
                 fixed += 1
-                logger.info(f"✓ Fixed {dataset} {start}-{end}")
+                logger.info(f"✅ Fixed {dataset} {start}-{end}")
             else:
                 failed += 1
-                logger.error(f"✗ Failed {dataset} {start}-{end}")
+                logger.error(f"❌ Failed {dataset} {start}-{end}")
         
-        logger.info(f"Maintenance complete. Fixed: {fixed}, Failed: {failed}")
+        logger.info(f"Single-threaded processing complete. Fixed: {fixed}, Failed: {failed}")
 
-    def _maintain_parallel_state_issues(self, all_issues: List[Tuple[int, int, str, str]]):
-        """Parallel maintenance - process each state issue individually."""
-        def fix_issue(issue_info):
-            start, end, dataset, status = issue_info
+    def _process_maintain_ranges_parallel(self, ranges: List[Tuple[int, int, str]]):
+        """Process maintain ranges in parallel using normal worker flow."""
+        def process_maintain_range(range_info):
+            start, end, dataset = range_info
+            worker_id = f"maintain_parallel_{threading.current_thread().ident}"
+            
             worker = IndexerWorker(
-                worker_id=f"maintain_{threading.current_thread().ident}",
+                worker_id=worker_id,
                 blockchain=self.blockchain,
                 clickhouse=self.clickhouse,
                 state_manager=self.state_manager,
@@ -346,32 +461,53 @@ class CryoIndexer:
                 mode=settings.mode.value
             )
             
-            success = worker.process_range(start, end, [dataset])
+            success = self._process_maintain_range(worker, start, end, dataset)
             return (start, end, dataset, success)
         
         fixed = 0
         failed = 0
         
         with ThreadPoolExecutor(max_workers=settings.workers) as executor:
-            future_to_issue = {executor.submit(fix_issue, issue): issue for issue in all_issues}
+            futures = {executor.submit(process_maintain_range, r): r for r in ranges}
             
-            for future in as_completed(future_to_issue):
+            for future in as_completed(futures):
                 start, end, dataset, success = future.result()
-                
                 if success:
                     fixed += 1
-                    logger.info(f"✓ Fixed {dataset} {start}-{end}")
+                    logger.info(f"✅ Fixed {dataset} {start}-{end}")
                 else:
                     failed += 1
-                    logger.error(f"✗ Failed {dataset} {start}-{end}")
+                    logger.error(f"❌ Failed {dataset} {start}-{end}")
         
-        logger.info(f"Maintenance complete. Fixed: {fixed}, Failed: {failed}")
+        logger.info(f"Parallel processing complete. Fixed: {fixed}, Failed: {failed}")
+
+    def _process_maintain_range(self, worker: IndexerWorker, start: int, end: int, dataset: str) -> bool:
+        """
+        Process a single maintain range using the SAME flow as historical/continuous.
+        The only difference is we delete existing data first.
+        """
+        try:
+            # Step 1: Delete existing data (this is maintain-specific)
+            table_name = worker.table_mappings.get(dataset, dataset)
+            deleted_rows = self.clickhouse.delete_range_data(table_name, start, end)
+            if deleted_rows > 0:
+                logger.info(f"Deleted {deleted_rows} existing rows for {dataset} {start}-{end}")
+            
+            # Step 2: Process using the SAME flow as historical/continuous
+            # This will: claim_range -> extract_and_load -> complete_range (OR fail_range)
+            success = worker._process_single_dataset(dataset, start, end)
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error processing maintain range {dataset} {start}-{end}: {e}")
+            return False
     
     def _run_validate(self):
         """Run validation operation to check data integrity (read-only)."""
         logger.info("Starting validation operation")
         
-        # Get progress summary - FIXED: Use correct method name
+        # Get progress summary
         summary = self.state_manager.get_processing_summary(settings.mode.value)
         
         print("\n=== INDEXING PROGRESS ===\n")
