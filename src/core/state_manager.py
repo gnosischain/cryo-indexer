@@ -417,20 +417,49 @@ class StateManager:
             
             expected_count = end_block - start_block
             
+            # CRITICAL FIX: Use FINAL to get deduplicated view from ReplacingMergeTree
             query = f"""
-            SELECT COUNT(*) 
-            FROM {self.database}.blocks
+            SELECT COUNT(DISTINCT block_number) 
+            FROM {self.database}.blocks FINAL
             WHERE block_number >= {start_block} 
-              AND block_number < {end_block}
-              AND timestamp IS NOT NULL
-              AND timestamp > 0
-              AND toDateTime(timestamp) > toDateTime('1971-01-01 00:00:00')
+            AND block_number < {end_block}
+            AND timestamp IS NOT NULL
+            AND timestamp > 0
+            AND toDateTime(timestamp) > toDateTime('1971-01-01 00:00:00')
             """
             
             result = client.query(query)
             actual_count = result.result_rows[0][0] if result.result_rows else 0
             
-            return actual_count == expected_count
+            if actual_count != expected_count:
+                # Debug with FINAL to see actual deduplicated state
+                debug_query = f"""
+                SELECT 
+                    block_number,
+                    timestamp,
+                    toDateTime(timestamp) as formatted_timestamp
+                FROM {self.database}.blocks FINAL
+                WHERE block_number >= {start_block} 
+                AND block_number < {end_block}
+                ORDER BY block_number
+                LIMIT 5
+                """
+                
+                debug_result = client.query(debug_query)
+                logger.error(f"Timestamp validation failed for blocks {start_block}-{end_block}")
+                logger.error(f"Expected: {expected_count}, Found: {actual_count}")
+                
+                if debug_result.result_rows:
+                    logger.error("Sample blocks (deduplicated view):")
+                    for row in debug_result.result_rows:
+                        logger.error(f"  Block {row[0]}: timestamp={row[1]}, formatted={row[2]}")
+                else:
+                    logger.error("No blocks found in deduplicated view - this indicates a serious data issue")
+                
+                return False
+            
+            logger.debug(f"Timestamp validation passed: {actual_count}/{expected_count} blocks have valid timestamps")
+            return True
             
         except Exception as e:
             logger.error(f"Error checking timestamps: {e}")
