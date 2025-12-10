@@ -49,7 +49,7 @@ help:
 
 # Build the Docker image
 build:
-	docker build -t cryo-indexer:latest .
+	docker build -t cryo-indexer:latest . --no-cache
 
 # Run database migrations
 run-migrations:
@@ -60,7 +60,7 @@ run-migrations:
 # Start continuous indexing
 continuous:
 	@echo "Starting continuous indexing with MODE=$(MODE)"
-	docker-compose up -d cryo-indexer-$(MODE)
+	docker-compose up cryo-indexer-$(MODE)
 	@echo "Started continuous indexing. Run 'make logs' to view logs."
 
 # Start (alias for continuous)

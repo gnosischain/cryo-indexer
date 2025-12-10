@@ -36,7 +36,7 @@ class IndexerSettings:
         self.clickhouse_database = os.environ.get("CLICKHOUSE_DATABASE", "blockchain")
         self.clickhouse_port = int(os.environ.get("CLICKHOUSE_PORT", "8443"))
         self.clickhouse_secure = os.environ.get("CLICKHOUSE_SECURE", "true").lower() == "true"
-        
+
         # Operation settings
         self.operation = OperationType(os.environ.get("OPERATION", "continuous").lower())
         

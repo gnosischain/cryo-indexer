@@ -153,6 +153,7 @@ services:
       <<: *indexer-env
       MODE: ${MODE:-minimal}
       OPERATION: historical
+      DATASETS: ${DATASETS:-blocks,transactions,logs}
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
