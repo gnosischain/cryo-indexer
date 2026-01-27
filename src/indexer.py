@@ -30,6 +30,7 @@ class CryoIndexer:
         logger.info(f"Mode: {settings.mode.value}")
         logger.info(f"Datasets: {settings.datasets}")
         logger.info(f"Workers: {settings.workers}")
+        logger.info(f"Max retries per dataset: {settings.max_retries}")
         
         # Initialize components
         self.blockchain = BlockchainClient(settings.eth_rpc_url)
@@ -80,8 +81,17 @@ class CryoIndexer:
             sys.exit(1)
     
     def _run_continuous(self):
-        """Run continuous indexing, following the chain tip with consistent 100-block ranges."""
+        """
+        Run continuous indexing, following the chain tip with consistent 100-block ranges.
+        
+        Implements per-dataset retry tracking:
+        - Each dataset is tracked independently for retry attempts
+        - After max_retries failures, a dataset is skipped for the current range
+        - Once all datasets are either completed or skipped, move to next range
+        - Failed datasets can be fixed later with 'make maintain'
+        """
         logger.info("Starting continuous indexing with fixed 100-block ranges")
+        logger.info(f"Max retries per dataset: {settings.max_retries}")
         
         # Get starting point from database  
         last_block = self.state_manager.get_last_synced_block(
@@ -101,6 +111,9 @@ class CryoIndexer:
         logger.info(f"Using fixed batch size: {settings.batch_size} blocks")
         
         current_range_start = aligned_start
+        
+        # Per-dataset retry tracking: {(start_block, end_block, dataset): retry_count}
+        dataset_retry_counts: Dict[Tuple[int, int, str], int] = {}
         
         # Create worker
         worker = IndexerWorker(
@@ -125,14 +138,81 @@ class CryoIndexer:
                 
                 # Check if we can process this range
                 if range_end <= safe_block:
-                    logger.info(f"Processing blocks {current_range_start}-{range_end} (exactly {settings.batch_size} blocks)")
-                    success = worker.process_range(current_range_start, range_end, settings.datasets)
+                    # Filter out datasets that have exceeded max retries for this range
+                    datasets_to_process = []
+                    skipped_datasets = []
+                    
+                    for dataset in settings.datasets:
+                        key = (current_range_start, range_end, dataset)
+                        retry_count = dataset_retry_counts.get(key, 0)
+                        
+                        if retry_count >= settings.max_retries:
+                            skipped_datasets.append(dataset)
+                        else:
+                            datasets_to_process.append(dataset)
+                    
+                    # Log skipped datasets
+                    if skipped_datasets:
+                        logger.warning(
+                            f"Skipping datasets for range {current_range_start}-{range_end} "
+                            f"(max retries {settings.max_retries} exceeded): {skipped_datasets}"
+                        )
+                    
+                    # Check if all datasets are done (either completed or max retries exceeded)
+                    if not datasets_to_process:
+                        logger.warning(
+                            f"All datasets exhausted for range {current_range_start}-{range_end}. "
+                            f"Moving to next range. Run 'make maintain' to fix failed datasets."
+                        )
+                        # Clear retry counts for this range and move forward
+                        dataset_retry_counts = {
+                            k: v for k, v in dataset_retry_counts.items() 
+                            if k[0] != current_range_start or k[1] != range_end
+                        }
+                        current_range_start = range_end
+                        continue
+                    
+                    logger.info(
+                        f"Processing blocks {current_range_start}-{range_end} "
+                        f"(exactly {settings.batch_size} blocks, datasets: {datasets_to_process})"
+                    )
+                    
+                    # Process the range with filtered datasets
+                    success, failed_datasets = worker.process_range(
+                        current_range_start, range_end, datasets_to_process
+                    )
                     
                     if success:
-                        current_range_start = range_end  # Move to next 100-block range
-                        logger.debug(f"Range completed, next range: {current_range_start}-{current_range_start + settings.batch_size}")
+                        # All datasets succeeded - move to next range
+                        logger.info(f"Range {current_range_start}-{range_end} completed successfully")
+                        
+                        # Clear retry counts for this range
+                        dataset_retry_counts = {
+                            k: v for k, v in dataset_retry_counts.items() 
+                            if k[0] != current_range_start or k[1] != range_end
+                        }
+                        current_range_start = range_end
                     else:
-                        logger.error(f"Failed to process blocks {current_range_start}-{range_end}, will retry")
+                        # Some datasets failed - increment their retry counts
+                        for dataset in failed_datasets:
+                            key = (current_range_start, range_end, dataset)
+                            current_count = dataset_retry_counts.get(key, 0)
+                            new_count = current_count + 1
+                            dataset_retry_counts[key] = new_count
+                            
+                            if new_count >= settings.max_retries:
+                                logger.error(
+                                    f"Dataset '{dataset}' for range {current_range_start}-{range_end} "
+                                    f"failed {new_count} times (max: {settings.max_retries}). "
+                                    f"Will be skipped. Run 'make maintain' to fix."
+                                )
+                            else:
+                                logger.warning(
+                                    f"Dataset '{dataset}' for range {current_range_start}-{range_end} "
+                                    f"failed, attempt {new_count}/{settings.max_retries}"
+                                )
+                        
+                        # Sleep before retrying
                         time.sleep(settings.poll_interval)
                 else:
                     logger.debug(f"Waiting for more blocks. Need {range_end}, safe block is {safe_block}")
@@ -175,13 +255,13 @@ class CryoIndexer:
             batch_end = min(current + settings.batch_size, settings.end_block)
             
             logger.info(f"Processing blocks {current}-{batch_end}")
-            success = worker.process_range(current, batch_end, settings.datasets)
+            success, failed_datasets = worker.process_range(current, batch_end, settings.datasets)
             
             if success:
                 current = batch_end
                 self._log_progress(current - settings.start_block, total_blocks)
             else:
-                logger.error(f"Failed to process blocks {current}-{batch_end}")
+                logger.error(f"Failed to process blocks {current}-{batch_end}, failed datasets: {failed_datasets}")
                 time.sleep(5)  # Brief pause before retry
         
         logger.info("Historical indexing complete")
@@ -217,22 +297,22 @@ class CryoIndexer:
                 mode=settings.mode.value
             )
             
-            success = worker.process_range(start, end, settings.datasets)
-            return (start, end, success)
+            success, failed_datasets = worker.process_range(start, end, settings.datasets)
+            return (start, end, success, failed_datasets)
         
         # Process ranges in parallel
         with ThreadPoolExecutor(max_workers=settings.workers) as executor:
             future_to_range = {executor.submit(process_range, r): r for r in ranges}
             
             for future in as_completed(future_to_range):
-                start, end, success = future.result()
+                start, end, success, failed_datasets = future.result()
                 
                 if success:
                     completed += 1
                     logger.info(f"✓ Completed {start}-{end}")
                 else:
                     failed += 1
-                    logger.error(f"✗ Failed {start}-{end}")
+                    logger.error(f"✗ Failed {start}-{end}, failed datasets: {failed_datasets}")
                 
                 # Progress report
                 if (completed + failed) % 10 == 0:

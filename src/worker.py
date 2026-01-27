@@ -113,20 +113,28 @@ class IndexerWorker:
         start_block: int, 
         end_block: int, 
         datasets: List[str]
-    ) -> bool:
+    ) -> Tuple[bool, List[str]]:
         """
         Process a block range for the given datasets.
-        For maintain operations, this is bypassed - we call _extract_and_load_dataset directly.
+        
+        Returns:
+            Tuple[bool, List[str]]: (all_success, failed_datasets)
+            - all_success: True if all datasets processed successfully
+            - failed_datasets: List of dataset names that failed
+            
+        Note: If 'blocks' fails, all datasets are considered failed since
+        other datasets depend on block timestamps.
         """
+        failed_datasets = []
+        
         try:
             # For maintenance operations, we don't do the normal range processing
             # because the indexer already handles state management
             if self.is_maintenance:
                 logger.debug(f"Worker {self.worker_id}: Maintenance mode - skipping normal range processing")
-                return True
+                return (True, [])
             
-            # Step 1: Process blocks if needed
-            blocks_were_processed = False
+            # Step 1: Process blocks if needed (CRITICAL - must succeed for other datasets)
             if 'blocks' in datasets:
                 logger.info(f"Worker {self.worker_id}: Processing blocks {start_block}-{end_block}")
                 
@@ -137,32 +145,33 @@ class IndexerWorker:
                 
                 if status == 'completed':
                     logger.info(f"Worker {self.worker_id}: Blocks range {start_block}-{end_block} already completed")
-                    blocks_were_processed = False  # They were already there, not newly processed
+                    blocks_success = True
+                    blocks_were_newly_processed = False
                 else:
                     # Actually process the blocks
-                    success = self._process_single_dataset('blocks', start_block, end_block)
-                    if not success:
-                        logger.error(f"Worker {self.worker_id}: Failed to process blocks")
-                        return False
-                    blocks_were_processed = True  # We just processed them
+                    blocks_success = self._process_single_dataset('blocks', start_block, end_block)
+                    blocks_were_newly_processed = blocks_success
                 
-                # Only verify timestamps if we just processed blocks OR if they should already be valid
+                if not blocks_success:
+                    logger.error(f"Worker {self.worker_id}: Failed to process blocks")
+                    # If blocks fail, ALL datasets fail (others depend on timestamps)
+                    return (False, datasets.copy())
+                
+                # Verify timestamps exist for this range
                 if not self.state_manager.has_valid_timestamps(start_block, end_block):
-                    if blocks_were_processed:
+                    if blocks_were_newly_processed:
                         logger.error(f"Worker {self.worker_id}: Newly processed blocks missing valid timestamps")
-                        return False
+                        return (False, datasets.copy())
                     else:
                         # Blocks were already "completed" but have invalid timestamps
-                        # This indicates a data integrity issue that needs to be fixed
                         logger.error(f"Worker {self.worker_id}: Previously completed blocks have invalid timestamps. Range needs reprocessing.")
-                        # Mark the blocks range as failed so it gets reprocessed
                         self.state_manager.fail_range(
                             self.mode, 'blocks', start_block, end_block, 
                             "Previously completed blocks have invalid timestamps"
                         )
-                        return False
+                        return (False, datasets.copy())
             
-            # Step 2: Process other datasets (unchanged)
+            # Step 2: Process other datasets (DON'T exit early on failure - continue with others)
             other_datasets = [d for d in datasets if d != 'blocks']
             for dataset in other_datasets:
                 # Adjust start block for diff datasets
@@ -173,14 +182,22 @@ class IndexerWorker:
                 
                 if not self._process_single_dataset(dataset, dataset_start, end_block):
                     logger.error(f"Worker {self.worker_id}: Failed to process {dataset}")
-                    return False
+                    failed_datasets.append(dataset)
+                    # DON'T return here - continue processing other datasets
+            
+            if failed_datasets:
+                logger.warning(f"Worker {self.worker_id}: Range {start_block}-{end_block} completed with failures: {failed_datasets}")
+                return (False, failed_datasets)
             
             logger.info(f"Worker {self.worker_id}: Successfully processed all datasets for {start_block}-{end_block}")
-            return True
+            return (True, [])
             
         except Exception as e:
             logger.error(f"Worker {self.worker_id}: Error processing {start_block}-{end_block}: {e}")
-            return False
+            # On exception, consider all remaining unprocessed datasets as failed
+            if not failed_datasets:
+                failed_datasets = datasets.copy()
+            return (False, failed_datasets)
     
     def _process_single_dataset(
         self, 
