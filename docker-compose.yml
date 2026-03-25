@@ -50,6 +50,8 @@ volumes:
   indexer_logs_full:
   indexer_data_custom:
   indexer_logs_custom:
+  indexer_data_live:
+  indexer_logs_live:
 
 # --------------------------------------------------------------------------
 # 2. Services
@@ -126,6 +128,27 @@ services:
       - ./migrations:/app/migrations
     <<: *resources
 
+  # Live indexer (near-real-time, 2-day TTL)
+  cryo-indexer-live:
+    image: cryo-indexer:latest
+    container_name: cryo-indexer-live
+    restart: ${RESTART_POLICY:-unless-stopped}
+    environment:
+      <<: *indexer-env
+      MODE: minimal
+      OPERATION: continuous
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE_LIVE:-execution_live}
+      BATCH_SIZE: "10"
+      CONFIRMATION_BLOCKS: "6"
+      POLL_INTERVAL: "5"
+      START_BLOCK: ${LIVE_START_BLOCK:-0}
+      MIGRATIONS_DIR: /app/migrations_live
+    volumes:
+      - indexer_data_live:/app/data
+      - indexer_logs_live:/app/logs
+      - ./migrations_live:/app/migrations_live
+    <<: *resources
+
   # Migration job
   migrations:
     image: cryo-indexer:latest
@@ -170,6 +193,7 @@ services:
       <<: *indexer-env
       MODE: ${MODE:-minimal}
       OPERATION: maintain
+      DATASETS: ${DATASETS:-blocks,transactions,logs}
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -186,6 +210,7 @@ services:
       <<: *indexer-env
       MODE: ${MODE:-minimal}
       OPERATION: validate
+      DATASETS: ${DATASETS:-blocks,transactions,logs}
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

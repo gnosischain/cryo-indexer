@@ -97,11 +97,24 @@ class ClickHouseManager:
                 logger.debug(f"No data to delete for range {start_block}-{end_block} from {table_name}")
             
             return rows_to_delete
-            
+
         except Exception as e:
             logger.error(f"Error deleting range data from {table_name}: {e}")
             raise
-    
+
+    def delete_range_with_related(self, table_name: str, start_block: int, end_block: int) -> int:
+        """
+        Delete data for a block range, including related tables.
+        For blocks, also deletes the corresponding withdrawals.
+        """
+        rows = self.delete_range_data(table_name, start_block, end_block)
+        if table_name == 'blocks':
+            withdrawal_rows = self.delete_range_data('withdrawals', start_block, end_block)
+            if withdrawal_rows > 0:
+                logger.info(f"Also deleted {withdrawal_rows} withdrawal rows for range {start_block}-{end_block}")
+            rows += withdrawal_rows
+        return rows
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
     def insert_parquet_file(self, file_path: str) -> int:
         """

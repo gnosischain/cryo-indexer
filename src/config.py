@@ -6,10 +6,11 @@ from enum import Enum
 
 class OperationType(Enum):
     """Simplified operation types."""
-    CONTINUOUS = "continuous"    # Follow chain tip
-    HISTORICAL = "historical"    # Index specific range
-    MAINTAIN = "maintain"        # Fix data integrity issues
-    VALIDATE = "validate"        # Check data integrity (read-only)
+    CONTINUOUS = "continuous"        # Follow chain tip
+    HISTORICAL = "historical"        # Index specific range
+    MAINTAIN = "maintain"            # Fix data integrity issues (requires scrapers stopped)
+    VALIDATE = "validate"            # Check data integrity (read-only)
+    AUTO_MAINTAIN = "auto-maintain"  # Periodic self-healing (safe while continuous runs)
 
 
 class IndexMode(Enum):
@@ -66,6 +67,10 @@ class IndexerSettings:
         self.max_concurrent_requests = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "2"))
         self.cryo_timeout = int(os.environ.get("CRYO_TIMEOUT", "600"))
         
+        # Auto-maintain settings
+        self.auto_maintain_lookback_hours = int(os.environ.get("AUTO_MAINTAIN_LOOKBACK_HOURS", "48"))
+        self.stuck_range_timeout_hours = int(os.environ.get("STUCK_RANGE_TIMEOUT_HOURS", "2"))
+
         # Directories
         self.data_dir = os.environ.get("DATA_DIR", "/app/data")
         self.log_dir = os.environ.get("LOG_DIR", "/app/logs")
