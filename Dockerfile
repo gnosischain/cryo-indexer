@@ -18,6 +18,7 @@ RUN pip3 install --no-cache-dir --upgrade pip && \
 
 # Copy application files
 COPY migrations/ /app/migrations/
+COPY migrations_live/ /app/migrations_live/
 COPY src/ /app/src/
 COPY scripts/ /app/scripts/
 
