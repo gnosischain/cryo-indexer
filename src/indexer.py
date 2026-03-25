@@ -13,6 +13,7 @@ from .core.state_manager import StateManager
 from .core.utils import setup_logging
 from .db.clickhouse_manager import ClickHouseManager
 from .worker import IndexerWorker
+from . import observability as obs
 from .observability import start_metrics_server, update_health
 
 
@@ -152,6 +153,8 @@ class CryoIndexer:
                 # Get latest block
                 latest_block = self.blockchain.get_latest_block_number()
                 safe_block = latest_block - settings.confirmation_blocks
+                obs.chain_head_block.set(latest_block)
+                obs.chain_lag_blocks.labels(dataset='all').set(latest_block - current_range_start)
                 
                 # Calculate next range
                 range_end = current_range_start + settings.batch_size

@@ -12,6 +12,7 @@ from .core.state_manager import StateManager
 from .core.utils import find_parquet_files, format_block_range
 from .db.clickhouse_manager import ClickHouseManager
 from .config import settings
+from . import observability as obs
 
 
 class IndexerWorker:
@@ -231,16 +232,20 @@ class IndexerWorker:
             success = self._extract_and_load_dataset(start_block, end_block, [dataset])
             
             if not success:
+                obs.blocks_failed_total.labels(dataset=dataset).inc()
                 if not self.is_maintenance:
                     self.state_manager.fail_range(
                         dataset, start_block, end_block, "Processing failed"
                     )
                 return False
-            
+
+            obs.blocks_indexed_total.labels(dataset=dataset).inc()
+            obs.highest_completed_block.labels(dataset=dataset).set(end_block)
             return True
-            
+
         except Exception as e:
             logger.error(f"Worker {self.worker_id}: Error processing {dataset}: {e}")
+            obs.blocks_failed_total.labels(dataset=dataset).inc()
             if not self.is_maintenance:
                 self.state_manager.fail_range(
                     dataset, start_block, end_block, str(e)
@@ -255,25 +260,34 @@ class IndexerWorker:
     ) -> bool:
         """Extract data using Cryo and load to ClickHouse."""
         try:
+            range_start = time.time()
+            dataset_label = datasets[0] if len(datasets) == 1 else 'multi'
+
             # Clean data directory
             self._clean_data_directory()
-            
+
             # Extract data
             logger.info(f"Worker {self.worker_id}: Extracting {datasets} for blocks {start_block}-{end_block}")
+            extract_start = time.time()
             self._run_cryo(start_block, end_block, datasets)
-            
+            obs.cryo_extract_duration_seconds.labels(dataset=dataset_label).observe(time.time() - extract_start)
+
             # Load data to ClickHouse
+            insert_start = time.time()
             total_rows = self._load_to_clickhouse(datasets)
-            
+            obs.clickhouse_insert_duration_seconds.labels(dataset=dataset_label).observe(time.time() - insert_start)
+            obs.rows_inserted_total.labels(dataset=dataset_label).inc(total_rows)
+
             # ALWAYS mark as completed when processing succeeds (including maintenance)
             for dataset in datasets:
                 self.state_manager.complete_range(
                     dataset, start_block, end_block, total_rows
                 )
-            
+
+            obs.range_duration_seconds.labels(dataset=dataset_label, operation='extract_and_load').observe(time.time() - range_start)
             logger.info(f"Worker {self.worker_id}: Successfully processed {datasets} ({total_rows} rows)")
             return True
-            
+
         except Exception as e:
             logger.error(f"Worker {self.worker_id}: Error extracting/loading {datasets}: {e}")
             return False
