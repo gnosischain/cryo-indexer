@@ -13,6 +13,7 @@ from .core.state_manager import StateManager
 from .core.utils import setup_logging
 from .db.clickhouse_manager import ClickHouseManager
 from .worker import IndexerWorker
+from .observability import start_metrics_server, update_health
 
 
 class CryoIndexer:
@@ -44,13 +45,31 @@ class CryoIndexer:
         )
         self.state_manager = StateManager(self.clickhouse)
         
-        # For maintain operations, skip all cleanup
-        if settings.operation != OperationType.MAINTAIN:
-            self.state_manager.cleanup_stale_jobs()
+        # For maintain operations, skip stuck range recovery at startup
+        # (maintain will call it explicitly as part of its flow)
+        if settings.operation not in (OperationType.MAINTAIN, OperationType.AUTO_MAINTAIN, OperationType.VALIDATE):
+            recovered = self.state_manager.recover_stuck_ranges(
+                timeout_hours=settings.stuck_range_timeout_hours
+            )
+            if recovered > 0:
+                logger.info(f"Recovered {recovered} stuck processing ranges at startup")
         
+        # Start metrics/health HTTP server on port 9090
+        try:
+            start_metrics_server(port=9090)
+            update_health(
+                status='ok',
+                clickhouse_connected=True,
+                rpc_connected=True,
+                operation=settings.operation.value,
+                datasets=settings.datasets
+            )
+        except Exception as e:
+            logger.warning(f"Failed to start metrics server: {e}")
+
         # Create directories
         os.makedirs(settings.data_dir, exist_ok=True)
-        
+
         # Set up signal handling
         signal.signal(signal.SIGINT, self._handle_exit)
         signal.signal(signal.SIGTERM, self._handle_exit)
@@ -76,6 +95,8 @@ class CryoIndexer:
             self._run_maintain()
         elif settings.operation == OperationType.VALIDATE:
             self._run_validate()
+        elif settings.operation == OperationType.AUTO_MAINTAIN:
+            self._run_auto_maintain()
         else:
             logger.error(f"Unknown operation: {settings.operation}")
             sys.exit(1)
@@ -95,7 +116,7 @@ class CryoIndexer:
         
         # Get starting point from database  
         last_block = self.state_manager.get_last_synced_block(
-            settings.mode.value, settings.datasets
+            settings.datasets
         )
         
         if settings.start_block > last_block:
@@ -123,8 +144,7 @@ class CryoIndexer:
             state_manager=self.state_manager,
             data_dir=settings.data_dir,
             network_name=settings.network_name,
-            rpc_url=settings.eth_rpc_url,
-            mode=settings.mode.value
+            rpc_url=settings.eth_rpc_url
         )
         
         while self.running:
@@ -244,8 +264,7 @@ class CryoIndexer:
             state_manager=self.state_manager,
             data_dir=settings.data_dir,
             network_name=settings.network_name,
-            rpc_url=settings.eth_rpc_url,
-            mode=settings.mode.value
+            rpc_url=settings.eth_rpc_url
         )
         
         current = settings.start_block
@@ -293,8 +312,7 @@ class CryoIndexer:
                 state_manager=self.state_manager,
                 data_dir=settings.data_dir,
                 network_name=settings.network_name,
-                rpc_url=settings.eth_rpc_url,
-                mode=settings.mode.value
+                rpc_url=settings.eth_rpc_url
             )
             
             success, failed_datasets = worker.process_range(start, end, settings.datasets)
@@ -344,12 +362,30 @@ class CryoIndexer:
         try:
             # Get all non-completed ranges that need processing
             failed_ranges = self._get_non_completed_ranges(start_filter, end_filter)
-            
+
+            # Also find gap ranges (never-indexed ranges within completed scope)
+            # These are ranges with NO entry in indexing_state at all
+            existing_set = set(failed_ranges)
+            for dataset in settings.datasets:
+                gaps = self.state_manager.find_gaps(
+                    dataset, start_filter, end_filter
+                )
+                for gap_start, gap_end in gaps:
+                    # Split large gaps into batch_size-sized ranges
+                    current = gap_start
+                    while current < gap_end:
+                        range_end = min(current + settings.batch_size, gap_end)
+                        range_tuple = (current, range_end, dataset)
+                        if range_tuple not in existing_set:
+                            failed_ranges.append(range_tuple)
+                            existing_set.add(range_tuple)
+                        current = range_end
+
             if not failed_ranges:
-                logger.info("✅ No non-completed ranges found - nothing to maintain!")
+                logger.info("✅ No non-completed ranges or gaps found - nothing to maintain!")
                 return
-            
-            logger.info(f"Found {len(failed_ranges)} non-completed ranges to process")
+
+            logger.info(f"Found {len(failed_ranges)} ranges to process (including gaps)")
             
             # Process them using the same logic as historical mode
             if settings.workers == 1:
@@ -363,6 +399,193 @@ class CryoIndexer:
             logger.error(f"Error in maintain operation: {e}")
             sys.exit(1)
 
+    def _run_auto_maintain(self):
+        """
+        Periodic self-healing operation. Safe to run alongside continuous indexer.
+        Scans recent data for gaps, failed ranges, stuck processing, and zero-row completions.
+        Uses claim_range() for concurrency safety (not maintenance mode).
+        """
+        logger.info("Starting auto-maintain operation")
+        logger.info(f"Lookback: {settings.auto_maintain_lookback_hours} hours")
+        logger.info(f"Stuck range timeout: {settings.stuck_range_timeout_hours} hours")
+
+        try:
+            # Step 1: Recover stuck processing ranges
+            recovered = self.state_manager.recover_stuck_ranges(
+                timeout_hours=settings.stuck_range_timeout_hours
+            )
+            if recovered > 0:
+                logger.info(f"Recovered {recovered} stuck processing ranges")
+
+            # Step 2: Calculate lookback window
+            # Gnosis chain: ~5 second block time = ~720 blocks/hour
+            blocks_per_hour = 720
+            lookback_blocks = settings.auto_maintain_lookback_hours * blocks_per_hour
+
+            ranges_to_fix = []
+            existing_set = set()
+
+            for dataset in settings.datasets:
+                highest = self.state_manager._get_highest_attempted_block(dataset)
+                if highest == 0:
+                    continue
+
+                lookback_start = max(0, highest - lookback_blocks)
+                # Align to batch_size
+                lookback_start = (lookback_start // settings.batch_size) * settings.batch_size
+
+                logger.info(f"Auto-maintain scanning {dataset}: blocks {lookback_start}-{highest}")
+
+                # Step 3: Find gaps in recent window
+                gaps = self.state_manager.find_gaps(dataset, lookback_start, highest)
+                for gap_start, gap_end in gaps:
+                    current = gap_start
+                    while current < gap_end:
+                        range_end = min(current + settings.batch_size, gap_end)
+                        range_tuple = (current, range_end, dataset)
+                        if range_tuple not in existing_set:
+                            ranges_to_fix.append(range_tuple)
+                            existing_set.add(range_tuple)
+                        current = range_end
+
+                # Step 4: Find failed ranges in recent window
+                try:
+                    client = self.state_manager.db._connect()
+                    failed_query = f"""
+                    SELECT DISTINCT start_block, end_block
+                    FROM {self.state_manager.database}.indexing_state FINAL
+                    WHERE dataset = '{dataset}'
+                    AND status = 'failed'
+                    AND start_block >= {lookback_start}
+                    AND end_block <= {highest}
+                    ORDER BY start_block
+                    """
+                    result = client.query(failed_query)
+                    for row in result.result_rows:
+                        range_tuple = (row[0], row[1], dataset)
+                        if range_tuple not in existing_set:
+                            ranges_to_fix.append(range_tuple)
+                            existing_set.add(range_tuple)
+                except Exception as e:
+                    logger.error(f"Error finding failed ranges for {dataset}: {e}")
+
+                # Step 5: Find zero-row completed ranges
+                zero_ranges = self.state_manager.find_zero_row_ranges(
+                    dataset, lookback_start, highest
+                )
+                for start, end in zero_ranges:
+                    self.state_manager.mark_range_for_reprocess(dataset, start, end)
+                    range_tuple = (start, end, dataset)
+                    if range_tuple not in existing_set:
+                        ranges_to_fix.append(range_tuple)
+                        existing_set.add(range_tuple)
+
+            if not ranges_to_fix:
+                logger.info("✅ Auto-maintain: no issues found in recent data")
+                return
+
+            logger.info(f"Auto-maintain found {len(ranges_to_fix)} ranges to fix")
+
+            # Step 6: Process ranges using normal worker flow (NOT maintenance mode)
+            # Use claim_range for concurrency safety with continuous indexer
+            if settings.workers == 1:
+                self._process_auto_maintain_single(ranges_to_fix)
+            else:
+                self._process_auto_maintain_parallel(ranges_to_fix)
+
+            logger.info("✅ AUTO-MAINTAIN OPERATION COMPLETE")
+
+        except Exception as e:
+            logger.error(f"Error in auto-maintain operation: {e}")
+            sys.exit(1)
+
+    def _process_auto_maintain_single(self, ranges):
+        worker = IndexerWorker(
+            worker_id="auto_maintain_single",
+            blockchain=self.blockchain,
+            clickhouse=self.clickhouse,
+            state_manager=self.state_manager,
+            data_dir=settings.data_dir,
+            network_name=settings.network_name,
+            rpc_url=settings.eth_rpc_url
+        )
+
+        fixed = 0
+        skipped = 0
+        failed = 0
+
+        for i, (start, end, dataset) in enumerate(ranges):
+            logger.info(f"Auto-maintain {i+1}/{len(ranges)}: {dataset} {start}-{end}")
+
+            # Delete existing data (including withdrawals for blocks)
+            table_name = worker.table_mappings.get(dataset, dataset)
+            self.clickhouse.delete_range_with_related(table_name, start, end)
+
+            # Process using normal flow (claim_range will skip if continuous has it)
+            success = worker._process_single_dataset(dataset, start, end)
+            if success:
+                fixed += 1
+                logger.info(f"✅ Auto-fixed {dataset} {start}-{end}")
+            else:
+                # Check if it was skipped due to claim conflict
+                status = self.state_manager.get_range_status(dataset, start, end)
+                if status == 'processing':
+                    skipped += 1
+                    logger.info(f"⏭️ Skipped {dataset} {start}-{end} (being processed by another worker)")
+                else:
+                    failed += 1
+                    logger.error(f"❌ Failed to fix {dataset} {start}-{end}")
+
+        logger.info(f"Auto-maintain complete. Fixed: {fixed}, Skipped: {skipped}, Failed: {failed}")
+
+    def _process_auto_maintain_parallel(self, ranges):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        fixed = 0
+        skipped = 0
+        failed = 0
+
+        def process_range(start, end, dataset):
+            worker = IndexerWorker(
+                worker_id=f"auto_maintain_parallel_{id(start)}",
+                blockchain=self.blockchain,
+                clickhouse=self.clickhouse,
+                state_manager=self.state_manager,
+                data_dir=settings.data_dir,
+                network_name=settings.network_name,
+                rpc_url=settings.eth_rpc_url
+            )
+
+            table_name = worker.table_mappings.get(dataset, dataset)
+            self.clickhouse.delete_range_with_related(table_name, start, end)
+
+            return worker._process_single_dataset(dataset, start, end)
+
+        with ThreadPoolExecutor(max_workers=settings.workers) as executor:
+            futures = {}
+            for start, end, dataset in ranges:
+                future = executor.submit(process_range, start, end, dataset)
+                futures[future] = (start, end, dataset)
+
+            for future in as_completed(futures):
+                start, end, dataset = futures[future]
+                try:
+                    if future.result():
+                        fixed += 1
+                        logger.info(f"✅ Auto-fixed {dataset} {start}-{end}")
+                    else:
+                        status = self.state_manager.get_range_status(dataset, start, end)
+                        if status == 'processing':
+                            skipped += 1
+                        else:
+                            failed += 1
+                            logger.error(f"❌ Failed {dataset} {start}-{end}")
+                except Exception as e:
+                    failed += 1
+                    logger.error(f"❌ Error fixing {dataset} {start}-{end}: {e}")
+
+        logger.info(f"Auto-maintain parallel complete. Fixed: {fixed}, Skipped: {skipped}, Failed: {failed}")
+
     def _get_non_completed_ranges(self, start_filter: int, end_filter: int) -> List[Tuple[int, int, str]]:
         """
         Get all ranges that are not completed (failed, processing, pending).
@@ -373,9 +596,8 @@ class CryoIndexer:
             client = self.state_manager.db._connect()
             
             # Build WHERE clause
-            where_clause = f"mode = '{settings.mode.value}'"
             datasets_str = "','".join(settings.datasets)
-            where_clause += f" AND dataset IN ('{datasets_str}')"
+            where_clause = f"dataset IN ('{datasets_str}')"
             
             if start_filter > 0:
                 where_clause += f" AND start_block >= {start_filter}"
@@ -407,9 +629,8 @@ class CryoIndexer:
                 AND l.end_block = s.end_block 
                 AND l.dataset = s.dataset
                 AND l.max_created_at = s.created_at
-                WHERE s.mode = '{settings.mode.value}'
             )
-            SELECT 
+            SELECT
                 start_block,
                 end_block,
                 dataset
@@ -430,8 +651,7 @@ class CryoIndexer:
                     debug_query = f"""
                     SELECT status, created_at, worker_id
                     FROM {self.state_manager.database}.indexing_state
-                    WHERE mode = '{settings.mode.value}'
-                    AND dataset = '{dataset}'
+                    WHERE dataset = '{dataset}'
                     AND start_block = {start}
                     AND end_block = {end}
                     ORDER BY created_at DESC
@@ -450,8 +670,7 @@ class CryoIndexer:
                             dataset,
                             MAX(created_at) as max_created_at
                         FROM {self.state_manager.database}.indexing_state
-                        WHERE mode = '{settings.mode.value}'
-                        AND dataset = '{dataset}'
+                        WHERE dataset = '{dataset}'
                         AND start_block = {start}
                         AND end_block = {end}
                         GROUP BY start_block, end_block, dataset
@@ -469,7 +688,6 @@ class CryoIndexer:
                         AND l.end_block = s.end_block 
                         AND l.dataset = s.dataset
                         AND l.max_created_at = s.created_at
-                        WHERE s.mode = '{settings.mode.value}'
                     )
                     SELECT status, created_at FROM latest_status
                     """
@@ -501,8 +719,7 @@ class CryoIndexer:
             state_manager=self.state_manager,
             data_dir=settings.data_dir,
             network_name=settings.network_name,
-            rpc_url=settings.eth_rpc_url,
-            mode=settings.mode.value
+            rpc_url=settings.eth_rpc_url
         )
         
         fixed = 0
@@ -537,8 +754,7 @@ class CryoIndexer:
                 state_manager=self.state_manager,
                 data_dir=settings.data_dir,
                 network_name=settings.network_name,
-                rpc_url=settings.eth_rpc_url,
-                mode=settings.mode.value
+                rpc_url=settings.eth_rpc_url
             )
             
             success = self._process_maintain_range(worker, start, end, dataset)
@@ -569,7 +785,7 @@ class CryoIndexer:
         try:
             # Step 1: Delete existing data (this is maintain-specific)
             table_name = worker.table_mappings.get(dataset, dataset)
-            deleted_rows = self.clickhouse.delete_range_data(table_name, start, end)
+            deleted_rows = self.clickhouse.delete_range_with_related(table_name, start, end)
             if deleted_rows > 0:
                 logger.info(f"Deleted {deleted_rows} existing rows for {dataset} {start}-{end}")
             
@@ -588,7 +804,7 @@ class CryoIndexer:
         logger.info("Starting validation operation")
         
         # Get progress summary
-        summary = self.state_manager.get_processing_summary(settings.mode.value)
+        summary = self.state_manager.get_processing_summary()
         
         print("\n=== INDEXING PROGRESS ===\n")
         for dataset, stats in summary.items():
@@ -614,7 +830,7 @@ class CryoIndexer:
             total_gaps = 0
             for dataset in settings.datasets:
                 gaps = self.state_manager.find_gaps(
-                    settings.mode.value, dataset, start, end
+                    dataset, start, end
                 )
                 
                 if gaps:

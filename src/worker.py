@@ -18,15 +18,14 @@ class IndexerWorker:
     """Simplified worker for processing block ranges."""
     
     def __init__(
-        self, 
+        self,
         worker_id: str,
         blockchain: BlockchainClient,
         clickhouse: ClickHouseManager,
         state_manager: StateManager,
         data_dir: str,
         network_name: str,
-        rpc_url: str,
-        mode: str
+        rpc_url: str
     ):
         self.worker_id = worker_id
         self.blockchain = blockchain
@@ -35,7 +34,6 @@ class IndexerWorker:
         self.data_dir = os.path.join(data_dir, f"worker_{worker_id}")
         self.network_name = network_name
         self.rpc_url = rpc_url
-        self.mode = mode
         
         # Check if this is a maintenance worker
         self.is_maintenance = worker_id.startswith('maintain')
@@ -106,7 +104,7 @@ class IndexerWorker:
         # Create worker-specific data directory
         os.makedirs(self.data_dir, exist_ok=True)
         
-        logger.info(f"Worker {worker_id} initialized for mode {mode} (maintenance: {self.is_maintenance})")
+        logger.info(f"Worker {worker_id} initialized (maintenance: {self.is_maintenance})")
     
     def process_range(
         self, 
@@ -140,7 +138,7 @@ class IndexerWorker:
                 
                 # Check if blocks were actually processed (not just skipped as completed)
                 status = self.state_manager.get_range_status(
-                    self.mode, 'blocks', start_block, end_block
+                    'blocks', start_block, end_block
                 )
                 
                 if status == 'completed':
@@ -166,7 +164,7 @@ class IndexerWorker:
                         # Blocks were already "completed" but have invalid timestamps
                         logger.error(f"Worker {self.worker_id}: Previously completed blocks have invalid timestamps. Range needs reprocessing.")
                         self.state_manager.fail_range(
-                            self.mode, 'blocks', start_block, end_block, 
+                            'blocks', start_block, end_block, 
                             "Previously completed blocks have invalid timestamps"
                         )
                         return (False, datasets.copy())
@@ -211,7 +209,7 @@ class IndexerWorker:
             if not self.is_maintenance:
                 # Check current state for normal operations
                 status = self.state_manager.get_range_status(
-                    self.mode, dataset, start_block, end_block
+                    dataset, start_block, end_block
                 )
                 
                 if status == 'completed':
@@ -220,7 +218,7 @@ class IndexerWorker:
                 
                 # Claim the range for normal operations
                 if not self.state_manager.claim_range(
-                    self.mode, dataset, start_block, end_block, self.worker_id
+                    dataset, start_block, end_block, self.worker_id
                 ):
                     logger.warning(f"Worker {self.worker_id}: Could not claim {dataset} range {start_block}-{end_block}")
                     return False
@@ -235,7 +233,7 @@ class IndexerWorker:
             if not success:
                 if not self.is_maintenance:
                     self.state_manager.fail_range(
-                        self.mode, dataset, start_block, end_block, "Processing failed"
+                        dataset, start_block, end_block, "Processing failed"
                     )
                 return False
             
@@ -245,7 +243,7 @@ class IndexerWorker:
             logger.error(f"Worker {self.worker_id}: Error processing {dataset}: {e}")
             if not self.is_maintenance:
                 self.state_manager.fail_range(
-                    self.mode, dataset, start_block, end_block, str(e)
+                    dataset, start_block, end_block, str(e)
                 )
             return False
     
@@ -270,7 +268,7 @@ class IndexerWorker:
             # ALWAYS mark as completed when processing succeeds (including maintenance)
             for dataset in datasets:
                 self.state_manager.complete_range(
-                    self.mode, dataset, start_block, end_block, total_rows
+                    dataset, start_block, end_block, total_rows
                 )
             
             logger.info(f"Worker {self.worker_id}: Successfully processed {datasets} ({total_rows} rows)")
