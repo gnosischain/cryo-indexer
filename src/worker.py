@@ -157,28 +157,40 @@ class IndexerWorker:
                     return (False, datasets.copy())
                 
                 # Verify timestamps exist for this range
-                if not self.state_manager.has_valid_timestamps(start_block, end_block):
-                    if blocks_were_newly_processed:
-                        logger.error(f"Worker {self.worker_id}: Newly processed blocks missing valid timestamps")
-                        return (False, datasets.copy())
-                    else:
-                        # Blocks were already "completed" but have invalid timestamps
-                        logger.error(f"Worker {self.worker_id}: Previously completed blocks have invalid timestamps. Range needs reprocessing.")
+                check = self.state_manager.validate_timestamps(start_block, end_block)
+                if not check.ok:
+                    reason = (
+                        f"Block timestamps unusable ({check.reason}): "
+                        f"{check.valid}/{check.expected} valid, {check.present} present"
+                    )
+                    logger.error(f"Worker {self.worker_id}: {reason}")
+
+                    # Only re-open the blocks range when the rows are demonstrably bad, or
+                    # when they were supposedly completed by an earlier run. If they were
+                    # just written and are merely not readable yet, the blocks themselves
+                    # are fine and re-extracting them would be wasted work.
+                    if check.reason == 'invalid' or not blocks_were_newly_processed:
                         self.state_manager.fail_range(
-                            'blocks', start_block, end_block, 
-                            "Previously completed blocks have invalid timestamps"
+                            'blocks', start_block, end_block, reason
                         )
-                        return (False, datasets.copy())
-            
+
+                    # Leave a trail for the datasets we are abandoning. Without this the
+                    # range ends up with blocks=completed and NO row at all for
+                    # transactions/logs, which ordinary gap detection cannot see.
+                    self._mark_skipped_datasets_failed(
+                        [d for d in datasets if d != 'blocks'],
+                        start_block, end_block,
+                        f"Skipped: {reason}"
+                    )
+                    return (False, datasets.copy())
+
             # Step 2: Process other datasets (DON'T exit early on failure - continue with others)
             other_datasets = [d for d in datasets if d != 'blocks']
             for dataset in other_datasets:
-                # Adjust start block for diff datasets
-                dataset_start = start_block
-                if dataset in ['balance_diffs', 'code_diffs', 'nonce_diffs', 'storage_diffs'] and start_block == 0:
-                    dataset_start = 1
-                    logger.info(f"Worker {self.worker_id}: Adjusted start block for {dataset} from 0 to 1")
-                
+                dataset_start = self._dataset_start_block(dataset, start_block)
+                if dataset_start != start_block:
+                    logger.info(f"Worker {self.worker_id}: Adjusted start block for {dataset} from {start_block} to {dataset_start}")
+
                 if not self._process_single_dataset(dataset, dataset_start, end_block):
                     logger.error(f"Worker {self.worker_id}: Failed to process {dataset}")
                     failed_datasets.append(dataset)
@@ -198,10 +210,43 @@ class IndexerWorker:
                 failed_datasets = datasets.copy()
             return (False, failed_datasets)
     
+    DIFF_DATASETS = ('balance_diffs', 'code_diffs', 'nonce_diffs', 'storage_diffs')
+
+    def _dataset_start_block(self, dataset: str, start_block: int) -> int:
+        """Diff datasets cannot be extracted for block 0."""
+        if dataset in self.DIFF_DATASETS and start_block == 0:
+            return 1
+        return start_block
+
+    def _mark_skipped_datasets_failed(
+        self,
+        datasets: List[str],
+        start_block: int,
+        end_block: int,
+        reason: str
+    ) -> None:
+        """
+        Record a 'failed' state row for datasets we are giving up on before they were
+        ever attempted, so the range shows up in gap detection instead of vanishing.
+        Datasets already completed for this range are left alone.
+        """
+        if self.is_maintenance:
+            return
+
+        for dataset in datasets:
+            dataset_start = self._dataset_start_block(dataset, start_block)
+            try:
+                if self.state_manager.get_range_status(dataset, dataset_start, end_block) == 'completed':
+                    continue
+                self.state_manager.fail_range(dataset, dataset_start, end_block, reason)
+                obs.blocks_failed_total.labels(dataset=dataset).inc()
+            except Exception as e:
+                logger.error(f"Worker {self.worker_id}: Could not mark {dataset} {dataset_start}-{end_block} failed: {e}")
+
     def _process_single_dataset(
-        self, 
-        dataset: str, 
-        start_block: int, 
+        self,
+        dataset: str,
+        start_block: int,
         end_block: int
     ) -> bool:
         """Process a single dataset for a block range."""

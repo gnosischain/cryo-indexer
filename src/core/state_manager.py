@@ -3,11 +3,31 @@ Simplified state management for the indexer.
 Single source of truth with clear status model.
 Mode-independent: tracks state by (dataset, start_block, end_block) only.
 """
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, NamedTuple
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from loguru import logger
+import time
 import uuid
+
+
+class TimestampCheck(NamedTuple):
+    """
+    Outcome of validating the timestamps of a freshly written block range.
+
+    reason:
+      'ok'          - every block in the range is present with a usable timestamp
+      'invalid'     - every block is visible, but some have a missing/garbage timestamp
+                      (the data is genuinely wrong; do NOT index dependent datasets)
+      'not_visible' - blocks are still missing from the read replica after retries
+                      (read-after-write lag, or a real hole - we cannot tell)
+      'error'       - the validation query itself failed
+    """
+    ok: bool
+    reason: str
+    expected: int
+    valid: int
+    present: int
 
 
 @dataclass
@@ -34,6 +54,9 @@ class StateManager:
 
         # Datasets that cannot start from block 0
         self.diff_datasets = {'balance_diffs', 'code_diffs', 'nonce_diffs', 'storage_diffs'}
+
+        # Flipped off the first time the server rejects select_sequential_consistency
+        self._sequential_consistency_supported = True
 
     def get_range_status(self, dataset: str, start_block: int, end_block: int) -> Optional[str]:
         """
@@ -528,57 +551,174 @@ class StateManager:
         except Exception as e:
             logger.error(f"Error marking range for reprocess: {e}")
 
+    # Read-after-write validation of a just-inserted block range.
+    #
+    # On ClickHouse Cloud (SharedMergeTree) a SELECT issued a second after the INSERT
+    # regularly still misses the rows, so "found 0 of 100" is NOT evidence that the
+    # blocks are wrong - only that this replica has not caught up yet. Retry with a
+    # short backoff, and ask for sequential consistency so the read is guaranteed to
+    # observe our own write.
+    TIMESTAMP_VALIDATION_ATTEMPTS = 5
+    TIMESTAMP_VALIDATION_BACKOFF_SECONDS = 0.5
+
+    def validate_timestamps(self, start_block: int, end_block: int) -> TimestampCheck:
+        """
+        Check that every block in [start_block, end_block) is present with a usable
+        timestamp, distinguishing "not visible yet" from "genuinely bad".
+
+        The invariant callers rely on is unchanged: unless this returns ok=True, no
+        dependent dataset (transactions, logs, ...) may be indexed against this range,
+        because those derive their partition timestamps from the blocks table.
+        """
+        expected_count = end_block - start_block
+        if expected_count <= 0:
+            return TimestampCheck(True, 'ok', 0, 0, 0)
+
+        last_error: Optional[Exception] = None
+        valid_count = 0
+        present_count = 0
+
+        for attempt in range(1, self.TIMESTAMP_VALIDATION_ATTEMPTS + 1):
+            try:
+                last_error = None
+                valid_count = self._count_blocks(start_block, end_block, valid_only=True)
+
+                if valid_count >= expected_count:
+                    if attempt > 1:
+                        logger.info(
+                            f"Timestamp validation for blocks {start_block}-{end_block} "
+                            f"succeeded on attempt {attempt} (read-after-write lag)"
+                        )
+                    logger.debug(
+                        f"Timestamp validation passed: {valid_count}/{expected_count} "
+                        f"blocks have valid timestamps"
+                    )
+                    return TimestampCheck(True, 'ok', expected_count, valid_count, valid_count)
+
+                # Are the missing blocks simply not visible yet, or are they visible
+                # and carrying a bad timestamp? Same query minus the timestamp
+                # predicates tells us which.
+                present_count = self._count_blocks(start_block, end_block, valid_only=False)
+
+                if present_count >= expected_count:
+                    # Every block is readable, so this is a data problem, not a race.
+                    # Retrying cannot change the answer - fail now.
+                    self._log_timestamp_failure(
+                        start_block, end_block, expected_count, valid_count, present_count,
+                        "blocks are visible but carry missing/garbage timestamps"
+                    )
+                    return TimestampCheck(
+                        False, 'invalid', expected_count, valid_count, present_count
+                    )
+
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"Error checking timestamps for blocks {start_block}-{end_block} "
+                    f"(attempt {attempt}/{self.TIMESTAMP_VALIDATION_ATTEMPTS}): {e}"
+                )
+
+            if attempt < self.TIMESTAMP_VALIDATION_ATTEMPTS:
+                delay = self.TIMESTAMP_VALIDATION_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                logger.debug(
+                    f"Blocks {start_block}-{end_block} not fully visible yet "
+                    f"({valid_count}/{expected_count} valid, {present_count} present); "
+                    f"retrying in {delay:.1f}s"
+                )
+                time.sleep(delay)
+
+        if last_error is not None:
+            logger.error(
+                f"Timestamp validation for blocks {start_block}-{end_block} could not be "
+                f"completed: {last_error}"
+            )
+            return TimestampCheck(False, 'error', expected_count, valid_count, present_count)
+
+        self._log_timestamp_failure(
+            start_block, end_block, expected_count, valid_count, present_count,
+            f"blocks still not visible after {self.TIMESTAMP_VALIDATION_ATTEMPTS} attempts"
+        )
+        return TimestampCheck(False, 'not_visible', expected_count, valid_count, present_count)
+
     def has_valid_timestamps(self, start_block: int, end_block: int) -> bool:
         """Check if all blocks in range have valid timestamps."""
-        try:
-            client = self.db._connect()
+        return self.validate_timestamps(start_block, end_block).ok
 
-            expected_count = end_block - start_block
-
-            # CRITICAL FIX: Use FINAL to get deduplicated view from ReplacingMergeTree
-            query = f"""
-            SELECT COUNT(DISTINCT block_number)
-            FROM {self.database}.blocks FINAL
-            WHERE block_number >= {start_block}
-            AND block_number < {end_block}
+    def _count_blocks(self, start_block: int, end_block: int, valid_only: bool) -> int:
+        """
+        Count distinct blocks in [start_block, end_block), optionally restricted to
+        those with a usable timestamp. Uses FINAL for the deduplicated view.
+        """
+        timestamp_filter = ""
+        if valid_only:
+            timestamp_filter = """
             AND timestamp IS NOT NULL
             AND timestamp > 0
             AND toDateTime(timestamp) > toDateTime('1971-01-01 00:00:00')
             """
 
-            result = client.query(query)
-            actual_count = result.result_rows[0][0] if result.result_rows else 0
+        query = f"""
+        SELECT COUNT(DISTINCT block_number)
+        FROM {self.database}.blocks FINAL
+        WHERE block_number >= {start_block}
+        AND block_number < {end_block}
+        {timestamp_filter}
+        """
 
-            if actual_count != expected_count:
-                # Debug with FINAL to see actual deduplicated state
-                debug_query = f"""
-                SELECT
-                    block_number,
-                    timestamp,
-                    toDateTime(timestamp) as formatted_timestamp
-                FROM {self.database}.blocks FINAL
-                WHERE block_number >= {start_block}
-                AND block_number < {end_block}
-                ORDER BY block_number
-                LIMIT 5
-                """
+        result = self._query_sequentially_consistent(query)
+        return result.result_rows[0][0] if result.result_rows else 0
 
-                debug_result = client.query(debug_query)
-                logger.error(f"Timestamp validation failed for blocks {start_block}-{end_block}")
-                logger.error(f"Expected: {expected_count}, Found: {actual_count}")
+    def _query_sequentially_consistent(self, query: str):
+        """
+        Run a query that must observe writes this process just made.
 
-                if debug_result.result_rows:
-                    logger.error("Sample blocks (deduplicated view):")
-                    for row in debug_result.result_rows:
-                        logger.error(f"  Block {row[0]}: timestamp={row[1]}, formatted={row[2]}")
-                else:
-                    logger.error("No blocks found in deduplicated view - this indicates a serious data issue")
+        select_sequential_consistency makes the replica wait for the latest committed
+        entries before answering, which is what closes the read-after-write hole on
+        SharedMergeTree. Servers that reject the setting fall back to a plain query
+        (the retry loop above is then the only protection), and we stop asking.
+        """
+        client = self.db._connect()
 
-                return False
+        if getattr(self, '_sequential_consistency_supported', True):
+            try:
+                return client.query(query, settings={'select_sequential_consistency': 1})
+            except Exception as e:
+                self._sequential_consistency_supported = False
+                logger.warning(
+                    f"select_sequential_consistency unavailable, falling back to plain "
+                    f"reads for validation: {e}"
+                )
 
-            logger.debug(f"Timestamp validation passed: {actual_count}/{expected_count} blocks have valid timestamps")
-            return True
+        return client.query(query)
 
+    def _log_timestamp_failure(self, start_block: int, end_block: int, expected_count: int,
+                               valid_count: int, present_count: int, why: str) -> None:
+        """Log a failed timestamp validation together with a sample of the offending rows."""
+        logger.error(f"Timestamp validation failed for blocks {start_block}-{end_block}: {why}")
+        logger.error(
+            f"Expected: {expected_count}, With valid timestamp: {valid_count}, "
+            f"Present at all: {present_count}"
+        )
+
+        try:
+            debug_query = f"""
+            SELECT
+                block_number,
+                timestamp,
+                toDateTime(timestamp) as formatted_timestamp
+            FROM {self.database}.blocks FINAL
+            WHERE block_number >= {start_block}
+            AND block_number < {end_block}
+            ORDER BY block_number
+            LIMIT 5
+            """
+            debug_result = self._query_sequentially_consistent(debug_query)
+
+            if debug_result.result_rows:
+                logger.error("Sample blocks (deduplicated view):")
+                for row in debug_result.result_rows:
+                    logger.error(f"  Block {row[0]}: timestamp={row[1]}, formatted={row[2]}")
+            else:
+                logger.error("No blocks found in deduplicated view")
         except Exception as e:
-            logger.error(f"Error checking timestamps: {e}")
-            return False
+            logger.error(f"Could not sample blocks for debugging: {e}")
