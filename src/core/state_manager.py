@@ -239,6 +239,37 @@ class StateManager:
                     gaps.append((current, comp_start))
                 current = max(current, comp_end)
 
+            # Step 4b: A gap can also sit between the LAST completed range and the end of
+            # the window. The loop above only emits gaps *between* two completed ranges,
+            # so without this a scoped/chunked maintain silently leaves its final batch
+            # unindexed and still reports success.
+            if current < effective_end:
+                trailing_end = effective_end
+
+                # Never hand back a range a live indexer is part-way through. Callers
+                # (maintain and auto-maintain) DELETE a range's rows before re-extracting,
+                # and auto-maintain is designed to run alongside the continuous indexer.
+                # effective_end is derived from the highest *attempted* block, which is
+                # normally the end of an in-flight 'processing' range at the chain tip,
+                # so clamp the trailing gap below anything still processing.
+                # NOTE: uses ORDER BY/LIMIT rather than MIN() because a ClickHouse MIN()
+                # over an empty set yields 0 for UInt32, not NULL.
+                in_flight = client.query(f"""
+                SELECT start_block
+                FROM {self.database}.indexing_state
+                WHERE dataset = '{dataset}'
+                AND status = 'processing'
+                AND end_block > {current}
+                AND start_block < {effective_end}
+                ORDER BY start_block
+                LIMIT 1
+                """)
+                if in_flight.result_rows:
+                    trailing_end = min(trailing_end, in_flight.result_rows[0][0])
+
+                if current < trailing_end:
+                    gaps.append((current, trailing_end))
+
             # Step 5: Add explicitly failed ranges
             failed_query = f"""
             SELECT DISTINCT start_block, end_block
