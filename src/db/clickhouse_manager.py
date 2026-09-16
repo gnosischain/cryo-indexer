@@ -1,5 +1,6 @@
 import os
 import json
+import uuid
 import pandas as pd
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
@@ -171,7 +172,8 @@ class ClickHouseManager:
             self._validate_dataframe(df, table_name)
             
             # Insert the main data
-            result = client.insert_df(f"{self.database}.{table_name}", df)
+            result = client.insert_df(f"{self.database}.{table_name}", df,
+                                      settings={"insert_deduplication_token": uuid.uuid4().hex})
             
             # Handle the result
             if isinstance(result, QuerySummary):
@@ -283,7 +285,8 @@ class ClickHouseManager:
             self._validate_dataframe(withdrawals_df, 'withdrawals')
             
             # Insert withdrawals
-            result = client.insert_df(f"{self.database}.withdrawals", withdrawals_df)
+            result = client.insert_df(f"{self.database}.withdrawals", withdrawals_df,
+                                      settings={"insert_deduplication_token": uuid.uuid4().hex})
             
             if isinstance(result, QuerySummary):
                 withdrawals_count = result.written_rows if hasattr(result, 'written_rows') else len(withdrawals_df)
